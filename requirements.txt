@@ -1,0 +1,10 @@
+# Test platform runtime
+httpx[http2]>=0.28.1
+
+# Embedded official KVV test suite runtime
+openai>=2.14.0
+jsonschema>=4.25.1
+pytest>=8.0
+pytest-rerunfailures>=14.0
+pytest-xdist>=3.5
+Pillow>=12.1.0

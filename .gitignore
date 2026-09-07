@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+results/*
+!results/.gitkeep
+web/data/*.db
+web/data/*.db-*
+results/web-*.log
