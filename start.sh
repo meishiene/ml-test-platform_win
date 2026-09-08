@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # 一键启动测试平台：bash start.sh
-# 可选：bash start.sh --host 0.0.0.0 --port 8765
+# 可选：bash start.sh --host 0.0.0.0 --port 8085
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
@@ -39,7 +39,7 @@ fi
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 HOST="127.0.0.1"
-PORT="8765"
+PORT="8085"
 SERVER_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
