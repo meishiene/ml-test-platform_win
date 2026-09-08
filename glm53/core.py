@@ -273,5 +273,7 @@ def write_report(out,summary):
     fp=summary.get("fingerprint_assessment",{})
     lines=["# GLM 5.3 专项测试报告","",f"## 满血能力指纹结论：{fp.get('level','未执行')}",f"- 置信度：{fp.get('confidence','—')}；已测试：{fp.get('tested',0)} 项；疑似限制/异常：{fp.get('warnings',0)+fp.get('hard_failures',0)} 项","","",f"- 总计：{summary['total']}",f"- 通过：{summary['passed']}",f"- 失败：{summary['failed']}","","| 用例 | 模型 | 结果 | 说明 |","|---|---|---|---|"]
     icon={"passed":"✅ 通过","failed":"❌ 失败","error":"❌ 错误"}
-    lines += [f"| {r['case_id']} {r['name']} | {r['model']} | {icon.get(r['status'],r['status'])} | {r['details'].replace('|','\\|')} |" for r in summary['results']]
+    for r in summary["results"]:
+        details = r["details"].replace("|", "\\|")
+        lines.append(f"| {r['case_id']} {r['name']} | {r['model']} | {icon.get(r['status'], r['status'])} | {details} |")
     (out/"report.md").write_text("\n".join(lines)+"\n",encoding="utf-8")

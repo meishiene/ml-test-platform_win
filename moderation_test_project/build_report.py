@@ -54,7 +54,9 @@ def main():
     bad=[r for r in evaluated if r.get('decision')=='allow' and r.get('category') in HIGH_RISK]
     if bad:
         lines += ['| ID | 类别 | 上下文 | 输入 |','|---|---|---|---|']
-        for r in bad[:100]: lines.append(f"| {r['id']} | {r['category']} | {r['context_variant']} | {str(r['text']).replace('|','\\|')} |")
+        for r in bad[:100]:
+            text = str(r["text"]).replace("|", "\\|")
+            lines.append(f"| {r['id']} | {r['category']} | {r['context_variant']} | {text} |")
     else: lines.append('暂无已评估的高风险漏判；若有效结果率为 0，此结论不可用。')
     out.write_text('\n'.join(lines)+'\n',encoding='utf-8'); print(out)
 if __name__=='__main__': main()

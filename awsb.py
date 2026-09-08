@@ -241,5 +241,8 @@ def write_report(directory: Path, summary: dict[str, Any]):
     directory.mkdir(parents=True, exist_ok=True)
     (directory/"summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
     lines=["# AWSB Claude Opus 5 测试报告", "", f"模型：`{summary['model']}`", f"通过：{summary['passed']}/{summary['total']}", "", "| 用例 | 结果 | 说明 |", "|---|---|---|"]
-    lines += [f"| {x['case_id']} {x['name']} | {'PASS' if x['passed'] else 'FAIL'} | {x['details'].replace('|','\\|')} |" for x in summary['results']]
+    for x in summary["results"]:
+        details = x["details"].replace("|", "\\|")
+        status = "PASS" if x["passed"] else "FAIL"
+        lines.append(f"| {x['case_id']} {x['name']} | {status} | {details} |")
     (directory/"report.md").write_text("\n".join(lines)+"\n", encoding="utf-8")
