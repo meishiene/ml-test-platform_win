@@ -22,6 +22,11 @@ __pycache__/
 # Generated reports
 real_verification_report.json
 
+# Large benchmark/test datasets; keep them outside Git.
+beam/data/
+testdata/prompt_token_cases/*.jsonl
+testdata/prompt_token_cases/images/*.png
+
 # Temporary debug scripts
 retry_*.py
 show_*.py
