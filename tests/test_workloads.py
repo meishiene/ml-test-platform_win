@@ -14,7 +14,7 @@ class WorkloadTests(unittest.TestCase):
         self.assertNotIn("until the configured output limit", " ".join(m["content"] for w in workloads for m in w.messages))
 
     def test_record_variant_is_deterministic(self):
-        record=PromptRecord("P2K-00004","P2K",2048,"abc",100,0)
+        record=PromptRecord("I1-00004","I1",7500,"abc",100,0)
         self.assertEqual(record.workload().workload_type,"multi_turn")
 
     def test_protocol_preserves_multi_turn_and_provider_default_thinking(self):

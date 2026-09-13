@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from common.test_framework import HttpExecutor
 
 MODELS = ("deepseek-v4-pro", "deepseek-v4-flash")
 
@@ -135,6 +136,7 @@ class DeepSeekV4Runner:
         self.config = config
         self._external_client = client
         self.client = client
+        self.executor: HttpExecutor | None = None
 
     async def __aenter__(self) -> "DeepSeekV4Runner":
         if self.client is None:
@@ -144,63 +146,28 @@ class DeepSeekV4Runner:
                 trust_env=self.config.trust_env,
                 headers={"Authorization": f"Bearer {self.config.api_key}", "Content-Type": "application/json"},
             )
+        self.executor = HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
+        await self.executor.__aenter__()
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        if self.executor: await self.executor.__aexit__(*args)
         if self._external_client is None and self.client:
             await self.client.aclose()
 
     async def request(self, path: str, payload: dict[str, Any], *, family: str = "openai", stream: bool = False, headers: dict[str, str] | None = None) -> ApiResponse:
-        assert self.client is not None
-        started = time.perf_counter()
-        request_headers = {"X-Request-ID": f"DSV4-{uuid.uuid4().hex[:16]}"}
-        if family == "anthropic":
-            request_headers.update({"x-api-key": self.config.api_key, "anthropic-version": "2023-06-01"})
-        if headers:
-            request_headers.update(headers)
+        if self.executor is None:
+            if self.client is None: raise RuntimeError("runner is not entered")
+            self.executor = HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
+            await self.executor.__aenter__()
+        request_headers = {"X-Request-ID": f"K3-DSV4-{uuid.uuid4().hex[:16]}"}
+        if family == "anthropic": request_headers.update({"x-api-key": self.config.api_key, "anthropic-version": "2023-06-01"})
+        if headers: request_headers.update(headers)
+        record = await self.executor.execute(case_id=payload.get("_case_id", "K3-DSV4-request"), url=self.config.url(path, family), payload={k:v for k,v in payload.items() if k != "_case_id"}, headers=request_headers, stream=stream)
         if not stream:
-            response = await self.client.post(self.config.url(path, family), json=payload, headers=request_headers)
-            text = response.text
-            try:
-                body = response.json()
-            except (ValueError, json.JSONDecodeError):
-                body = None
-            return ApiResponse(response.status_code, body, text, time.perf_counter() - started, dict(response.headers))
-
-        reasoning_parts: list[str] = []
-        content_parts: list[str] = []
-        invalid_events = 0
-        done = False
-        usage: dict[str, Any] = {}
-        status = 0
-        raw_error = ""
-        async with self.client.stream("POST", self.config.url(path, family), json=payload, headers=request_headers) as response:
-            status = response.status_code
-            if status >= 300:
-                raw_error = (await response.aread()).decode("utf-8", "replace")
-            else:
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        done = True
-                        continue
-                    try:
-                        obj = json.loads(data)
-                    except json.JSONDecodeError:
-                        invalid_events += 1
-                        continue
-                    if obj.get("usage"):
-                        usage = obj["usage"]
-                    for choice in obj.get("choices") or []:
-                        delta = choice.get("delta") or {}
-                        if isinstance(delta.get("reasoning_content"), str):
-                            reasoning_parts.append(delta["reasoning_content"])
-                        if isinstance(delta.get("content"), str):
-                            content_parts.append(delta["content"])
-        info = {"reasoning_content": "".join(reasoning_parts), "content": "".join(content_parts), "usage": usage, "done": done, "invalid_events": invalid_events}
-        return ApiResponse(status, None, raw_error, time.perf_counter() - started, stream=info)
+            return ApiResponse(record.http_status or 0, record.response_body if isinstance(record.response_body, dict) else None, record.response_text, record.timing.get("e2e_ms", 0)/1000, record.response_headers, stream=None)
+        info={"reasoning_content":record.reasoning,"content":record.content,"usage":record.usage or {},"done":record.done_received,"invalid_events":record.invalid_sse_events,"raw_sse_lines":record.raw_sse_lines,"raw_sse_events":record.raw_sse_events}
+        return ApiResponse(record.http_status or 0, None, record.raw_response_body or record.response_text, record.timing.get("e2e_ms", 0)/1000, record.response_headers, stream=info)
 
     async def chat(self, model: str, messages: list[dict[str, Any]], **kwargs: Any) -> ApiResponse:
         payload = {"model": model, "messages": messages, "max_tokens": 2048, **kwargs}

@@ -11,6 +11,6 @@ class B1Tests(unittest.TestCase):
         self.assertEqual(len(prompts),16)
         counts={}
         for prompt in prompts: counts[prompt.dataset]=counts.get(prompt.dataset,0)+1
-        self.assertEqual(counts,{"P2K":4,"P8K":4,"P16K":4,"P32K":4})
+        self.assertEqual(counts,{"I1":4,"I2":4,"I3":4,"I4":4})
 
 if __name__ == "__main__": unittest.main()

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .cases import CASES
+from common.suite_runtime import finalize
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_KVV_HOME = ROOT / "vendor_verifier"
@@ -29,7 +30,10 @@ def kvv_home() -> Path:
 
 def official_python(home: Path) -> Path:
     override = os.getenv("KVV_PYTHON")
-    return Path(override).expanduser().resolve() if override else Path(os.sys.executable).resolve()
+    if override:
+        return Path(override).expanduser().resolve()
+    bundled = home / ".venv" / "bin" / "python"
+    return bundled
 
 
 def think_mode() -> str:
@@ -116,6 +120,7 @@ def execute(case_id: str, output_root: Path) -> tuple[Path, dict[str, Any]]:
              "commands":commands,"generated_at":datetime.now(timezone.utc).isoformat()}
     (out/"summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
     write_report(out,summary)
+    finalize(out)
     return out,summary
 
 

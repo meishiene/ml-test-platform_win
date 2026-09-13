@@ -20,7 +20,10 @@ class ModelProfile:
     supports_reasoning: bool
 
 def load_profile_data(family: str) -> dict[str, Any]:
+    # 每个 family 的可选覆盖文件；缺失时返回空 dict，所有调用方均以 PROFILES 默认值兜底。
     path = Path(__file__).parent / "data" / f"{family}.json"
+    if not path.exists():
+        return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
 PROFILES = {

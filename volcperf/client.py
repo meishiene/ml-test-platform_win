@@ -76,12 +76,12 @@ async def stream_chat(session: httpx.AsyncClient, config: ApiConfig, *, request_
     row: dict[str, Any] = {"case": case_name, "protocol": config.protocol, "phase": phase, "counted": counted,
         "request_id": request_id, "dataset_id": dataset_id, "planned_epoch": planned_epoch, "started_epoch": started_epoch,
         "completed_epoch": None, "send_delay_ms": max(0.0, (started_epoch-planned_epoch)*1000) if planned_epoch is not None else None,
-        "success": False, "http_status": None, "error_type": None, "error_message": None, "prompt_tokens": None,
+        "success": False, "transport_status": "unknown", "http_status": None, "error_type": None, "error_message": None, "prompt_tokens": None,
         "completion_tokens": None, "reasoning_tokens": None, "visible_completion_tokens": None, "total_tokens": None,
         "finish_reason": None, "first_sse_seconds": None, "first_reasoning_seconds": None, "ttft_seconds": None, "ttfc_seconds": None,
         "e2e_seconds": None, "response_headers_seconds": None, "tpot_ms_per_visible_token": None, "content_chunk_count": 0, "reasoning_chunk_count": 0,
         "content_char_count": 0, "sse_event_count": 0, "invalid_sse_event_count": 0, "saw_done": False,
-        "response_request_id": None, "upstream_request_id": None, "response_object_id": None, "response_headers": {}, "workload_type": workload_type,
+        "response_request_id": None, "upstream_request_id": None, "response_object_id": None, "response_headers": {}, "raw_response_body": "", "raw_sse_lines": [], "raw_sse_events": [], "workload_type": workload_type,
         "message_count": len(messages or []), "target_visible_tokens": target_visible_tokens}
     first_sse = first_reasoning = first_content = None
     response_headers_time = None
@@ -98,12 +98,15 @@ async def stream_chat(session: httpx.AsyncClient, config: ApiConfig, *, request_
             row["response_request_id"] = response.headers.get("x-request-id") or response.headers.get("request-id") or response.headers.get("x-trace-id") or response.headers.get("x-oneapi-request-id") or response.headers.get("x-tt-logid")
             row["upstream_request_id"] = row["response_request_id"]
             if not 200 <= response.status_code < 300:
-                row["error_type"] = f"http_{response.status_code}"; row["error_message"] = (await response.aread()).decode("utf-8","replace")[:2000]
+                raw_body = (await response.aread()).decode("utf-8","replace")
+                row["raw_response_body"] = raw_body
+                row["error_type"] = f"http_{response.status_code}"; row["error_message"] = raw_body[:2000]
                 return _finish(row, started_mono)
             async for line in response.aiter_lines():
                 if not line or not line.startswith("data:"): continue
                 now = time.perf_counter(); first_sse = first_sse or now; row["sse_event_count"] += 1
-                data = line[5:].strip()
+                row["raw_sse_lines"].append(line)
+                data = line[5:].strip(); row["raw_sse_events"].append(data)
                 if data == "[DONE]": row["saw_done"] = True; continue
                 try: obj = json.loads(data); event = parse_event(config.protocol, obj)
                 except json.JSONDecodeError: row["invalid_sse_event_count"] += 1; continue
@@ -119,6 +122,7 @@ async def stream_chat(session: httpx.AsyncClient, config: ApiConfig, *, request_
         if config.protocol == "gemini" and row["finish_reason"] is not None: row["saw_done"] = True
         if visible_tokens is None and completion_tokens is not None and reasoning_tokens is not None:
             visible_tokens = max(0, completion_tokens-reasoning_tokens)
+        row["transport_status"] = "completed"
         row.update(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, reasoning_tokens=reasoning_tokens,
                    visible_completion_tokens=visible_tokens, total_tokens=prompt_tokens+completion_tokens if prompt_tokens is not None and completion_tokens is not None else None,
                    first_sse_seconds=first_sse-started_mono if first_sse else None, first_reasoning_seconds=first_reasoning-started_mono if first_reasoning else None,
@@ -133,9 +137,9 @@ async def stream_chat(session: httpx.AsyncClient, config: ApiConfig, *, request_
         elif not row["saw_done"]: row["error_type"]="missing_done_marker"
         else: row["success"]=True
         return _finish(row, started_mono, True)
-    except TimeoutError as exc: row["error_type"],row["error_message"]="timeout",str(exc)
-    except httpx.HTTPError as exc: row["error_type"],row["error_message"]="client_error",str(exc)
-    except Exception as exc: row["error_type"],row["error_message"]=type(exc).__name__,str(exc)
+    except TimeoutError as exc: row["transport_status"],row["error_type"],row["error_message"]="error","timeout",str(exc)
+    except httpx.HTTPError as exc: row["transport_status"],row["error_type"],row["error_message"]="error","client_error",str(exc)
+    except Exception as exc: row["transport_status"],row["error_type"],row["error_message"]="error",type(exc).__name__,str(exc)
     return _finish(row, started_mono)
 
 

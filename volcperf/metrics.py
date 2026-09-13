@@ -130,7 +130,7 @@ def summarize(case: Any, rows: list[dict[str, Any]], baseline_p90: float | None 
         checks["capacity_windows"] = {"value": len(windows), "passed": bool(windows) and all(w["passed"] for w in windows)}
     baselines_by_dataset: dict[str, Any] = {}
     if case.name == "B1":
-        for dataset in ("P2K", "P8K", "P16K", "P32K"):
+        for dataset in ("I1", "I2", "I3", "I4"):
             dataset_rows = [r for r in measured if str(r.get("dataset_id", "")).startswith(f"{dataset}-")]
             dataset_success = [r for r in dataset_rows if r.get("success")]
             dataset_ttfc = [float(r["ttfc_seconds"]) for r in dataset_success if r.get("ttfc_seconds") is not None]

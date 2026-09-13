@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from common.test_framework import HttpExecutor
+from common.audit import AuditLog
 
 MODEL = "claude-opus-5"
 
@@ -102,8 +104,10 @@ def _cache_usage(body: dict[str, Any] | None) -> tuple[int, int, int]:
     return total, read, created
 
 class AWSBRunner:
-    def __init__(self, config: AWSBConfig, client: httpx.AsyncClient | None = None):
+    def __init__(self, config: AWSBConfig, client: httpx.AsyncClient | None = None, audit_dir: Path | None = None):
         self.config, self.client, self._external = config, client, client is not None
+        self.audit_log = AuditLog(audit_dir / "requests.jsonl") if audit_dir else None
+        self.executor: HttpExecutor | None = None
 
     async def __aenter__(self) -> "AWSBRunner":
         if self.client is None:
@@ -111,36 +115,29 @@ class AWSBRunner:
                 trust_env=self.config.trust_env, headers={"x-api-key": self.config.api_key,
                 "Authorization": f"Bearer {self.config.api_key}", "anthropic-version": "2023-06-01",
                 "Content-Type": "application/json"})
+        self.executor = HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
+        await self.executor.__aenter__()
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        if self.audit_log: self.audit_log.close()
+        if self.executor:
+            await self.executor.__aexit__(*args)
         if not self._external and self.client:
             await self.client.aclose()
 
     async def request(self, payload: dict[str, Any], stream: bool = False) -> AWSBResponse:
-        assert self.client is not None
-        headers = {"X-Request-ID": f"AWSB-{uuid.uuid4().hex[:16]}"}
-        started = time.perf_counter()
+        if self.executor is None:
+            if self.client is None:
+                self.client=httpx.AsyncClient(timeout=self.config.timeout, verify=self.config.verify_ssl, trust_env=self.config.trust_env, headers={"x-api-key":self.config.api_key,"Authorization":f"Bearer {self.config.api_key}","anthropic-version":"2023-06-01","Content-Type":"application/json"})
+            self.executor=HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
+            await self.executor.__aenter__()
+        rid=f"AWSB-{uuid.uuid4().hex[:16]}"
+        record=await self.executor.execute(case_id=payload.get("_case_id","AWSB-request"), url=self.config.base_url+self.config.messages_path, payload={k:v for k,v in payload.items() if k != "_case_id"}, headers={"x-api-key":self.config.api_key,"Authorization":f"Bearer {self.config.api_key}","anthropic-version":"2023-06-01","Content-Type":"application/json","X-Request-ID":rid}, stream=stream)
+        if self.audit_log: self.audit_log.write(record)
         if not stream:
-            r = await self.client.post(self.config.base_url + self.config.messages_path, json=payload, headers=headers)
-            try: body = r.json()
-            except (ValueError, json.JSONDecodeError): body = None
-            return AWSBResponse(r.status_code, body, r.text, time.perf_counter()-started, dict(r.headers), r.headers.get("x-request-id") or r.headers.get("request-id") or r.headers.get("x-trace-id") or r.headers.get("x-tt-logid"))
-        events: list[dict[str, Any]] = []
-        text = ""
-        async with self.client.stream("POST", self.config.base_url + self.config.messages_path, json=payload, headers=headers) as r:
-            raw = "" if r.status_code < 300 else (await r.aread()).decode("utf-8", "replace")
-            if r.status_code < 300:
-                async for line in r.aiter_lines():
-                    if line.startswith("data:"):
-                        data = line[5:].strip()
-                        if data == "[DONE]": continue
-                        try:
-                            obj = json.loads(data); events.append(obj)
-                            delta = (obj.get("delta") or {})
-                            if isinstance(delta.get("text"), str): text += delta["text"]
-                        except json.JSONDecodeError: pass
-            return AWSBResponse(r.status_code, None, raw, time.perf_counter()-started, dict(r.headers), r.headers.get("x-request-id") or r.headers.get("request-id") or r.headers.get("x-trace-id") or r.headers.get("x-tt-logid"), events)
+            return AWSBResponse(record.http_status or 0, record.response_body if isinstance(record.response_body,dict) else None, record.response_text, record.timing.get("e2e_ms",0)/1000, record.response_headers, record.provider_request_id)
+        return AWSBResponse(record.http_status or 0, None, record.raw_response_body or record.response_text, record.timing.get("e2e_ms",0)/1000, record.response_headers, record.provider_request_id, record.parsed_sse_events)
 
     def payload(self, **kwargs: Any) -> dict[str, Any]:
         p = {"model": self.config.model, "max_tokens": 128, "messages": [{"role": "user", "content": "只回复 OK"}]}

@@ -5,12 +5,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from common.result_adapter import normalize_summary
+
 SCHEMA_VERSION = "volcperf.result.v1"
 
 
 def enrich_summary(summary_path: Path, *, record_id: str, batch_id: str | None, test_kind: str,
                    case_name: str, protocol: str, base_url: str, model: str) -> dict[str, Any]:
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary = normalize_summary(json.loads(summary_path.read_text(encoding="utf-8")))
     summary.update({"schema_version": SCHEMA_VERSION, "record_id": record_id, "batch_id": batch_id,
                     "test_kind": test_kind, "case": case_name, "protocol": protocol,
                     "base_url": base_url, "model": model})
@@ -54,7 +56,7 @@ def aggregate_batch(out: Path, batch: dict[str, Any], children: list[dict[str, A
         summary={}
         path=child.get("summary_path")
         if path and Path(path).is_file():
-            summary=json.loads(Path(path).read_text(encoding="utf-8"))
+            summary=normalize_summary(json.loads(Path(path).read_text(encoding="utf-8")))
         def portable(value: str | None) -> str | None:
             if not value: return None
             path_value=Path(value)
@@ -76,7 +78,7 @@ def aggregate_batch(out: Path, batch: dict[str, Any], children: list[dict[str, A
     # Self-contained manifest is optimized for later Codex aggregation by one or many record IDs.
     (out/"aggregation_manifest.json").write_text(json.dumps(aggregate,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
     # 能力/契约专项没有压测指标，聚合报告应展示每个子用例的真实断言和错误，而不是空的吞吐列。
-    is_capability = batch.get("test_kind") in {"kvv", "deepseek", "glm", "authenticity"}
+    is_capability = batch.get("test_kind") in {"kvv", "deepseek", "glm", "authenticity", "arxivmath", "deepswe", "swe-atlas-tw", "swe-atlas-rf", "legal-agent-benchmark"}
     if is_capability:
         lines=["# 能力专项批量测试报告","",f"- 记录 ID：`{batch['id']}`",f"- 协议：`{batch['protocol']}`",f"- 模型：`{batch['model']}`",
                f"- 用例数：{len(items)}",f"- 完成：{len(completed)}/{len(items)}",f"- 通过：{passed}/{len(items)}",f"- 总结论：{'通过' if aggregate['admission_passed'] else '未通过'}","",

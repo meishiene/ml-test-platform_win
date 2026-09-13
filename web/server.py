@@ -31,11 +31,20 @@ from kvv.cases import CASES as KVV_CASES
 from dsv4.cases import CASES as DEEPSEEK_CASES
 from glm53.cases import CASES as GLM_CASES
 from authenticity import CASES as AUTH_CASES
+from gpt_detection import CASES as GPT_CASES
 from strictperf.cases import CASES as STRICT_CASES
 from awsb import CASE_SPECS as AWSB_CASE_SPECS, CACHE_CASE_SPECS as AWSB_CACHE_CASE_SPECS
+from arxivmath_cases import CASE as ARXIVMATH_CASE
+from deepswe_cases import CASE as DEEPSWE_CASE
+from sweatlas_cases import CASE as SWE_ATLAS_TW_CASE
+from sweatlas_rf_cases import CASE as SWE_ATLAS_RF_CASE
+from legal_agent_benchmark_cases import CASE as LEGAL_AGENT_BENCHMARK_CASE
+
 from web.aggregation import aggregate_batch, enrich_summary
+from common.finalizer import finalize_result_dir
 
 ROOT = Path(__file__).resolve().parent.parent
+TEMP_CASES_PATH = ROOT / "test_cases" / "kimi_k3_temp_cases.json"
 STATIC = ROOT / "web" / "static"
 DB_PATH = ROOT / "web" / "data" / "runs.db"
 RESULTS = ROOT / "results"
@@ -45,6 +54,8 @@ DEEPSEEK_SCRIPT = ROOT / "scripts" / "run_deepseek_v4.py"
 GLM_SCRIPT = ROOT / "scripts" / "run_glm53.py"
 CONTRACT_SCRIPT = ROOT / "scripts" / "run_contracts.py"
 AUTH_SCRIPT = ROOT / "scripts" / "run_authenticity.py"
+GPT_SCRIPT = ROOT / "scripts" / "run_gpt_detection.py"
+TEMP_SCRIPT = ROOT / "scripts" / "run_temp_cases.py"
 STRICT_SCRIPT = ROOT / "scripts" / "run_strict.py"
 AWSB_SCRIPT = ROOT / "scripts" / "run_awsb.py"
 MODERATION_SCRIPT = ROOT / "scripts" / "run_moderation.py"
@@ -103,6 +114,25 @@ def seconds_text(seconds: int) -> str | None:
         return None
     return f"{seconds // 60} 分钟" if seconds % 60 == 0 else f"{seconds} 秒"
 
+
+def temporary_case_payload() -> dict[str, Any]:
+    """Return the document-derived temporary suite as a display-only frontend item."""
+    try:
+        data = json.loads(TEMP_CASES_PATH.read_text(encoding="utf-8"))
+        count = len(data.get("cases") or [])
+        title = data.get("title", "Kimi-K3 临时测试案例集")
+        scope = data.get("scope", "接口兼容性、性能与缓存")
+    except (OSError, json.JSONDecodeError):
+        count, title, scope = 68, "Kimi-K3 临时测试案例集", "接口兼容性、性能与缓存"
+    return {"id": "K3_TEMP_SUITE", "test_kind": "temporary", "source": "供应商自测基线标准 0828.md + 临时案例集",
+            "executor": "test_cases/kimi_k3_temp_cases.md（展示清单）", "title": title,
+            "description": scope, "duration": "按子案例执行", "cost": "中",
+            "protocols": ["openai", "volcengine"], "concurrency": 10,
+            "concurrency_text": "按子案例", "requests": count, "case_count": count,
+            "case_count_text": f"{count} 条临时案例", "request_text": f"{count} 条子案例",
+            "input_tokens": "短请求 + 16K/64K/100K/200K + 70K 缓存前缀", "warmup": None,
+            "steady": None, "admission": "临时案例集展示项；正式执行请按清单中的接口、性能和缓存子案例分别运行。",
+            "display_only": True}
 
 def moderation_case_payload(name: str) -> dict[str, Any]:
     title, desc, duration, cost, dataset = MODERATION_CASES[name]
@@ -172,6 +202,29 @@ def capability_case_payload(name: str, kind: str, case: Any, meta: tuple[str, st
 def auth_case_payload(name: str) -> dict[str, Any]:
     meta = AUTH_META.get(name) or ("Kimi K3 满血能力指纹", "随机黑盒能力挑战", "按随机挑战执行", "中")
     return {"id": name, "test_kind": "deepseek" if name.startswith("DS_") else "kvv", "source": "专项自研代码", "executor": "authenticity.py", "title": meta[0], "description": meta[1], "duration": meta[2], "cost": meta[3], "concurrency": 1, "concurrency_text": "1", "requests": 6, "request_text": "6（每次随机挑战）", "input_tokens": "随机动态输入", "warmup": None, "steady": None, "admission": "仅表示与目标官方接口行为高度一致；存在 warning 时不能认定满血，不把单个错误直接等同于模型问题。", "protocols": ["openai", "volcengine"]}
+
+
+def gpt_case_payload(name: str) -> dict[str, Any]:
+    case = GPT_CASES[name]
+    return {
+        "id": name,
+        "test_kind": "gpt",
+        "source": "GPT 检测测试项目",
+        "executor": "scripts/run_gpt_detection.py",
+        "title": case.title,
+        "description": case.description,
+        "duration": "约1分钟",
+        "cost": case.cost,
+        "concurrency": 1,
+        "concurrency_text": "1",
+        "requests": case.request_count,
+        "request_text": str(case.request_count),
+        "input_tokens": "短探针",
+        "warmup": None,
+        "steady": None,
+        "admission": "请求模型与响应顶层 model 完全一致；缺少响应 model 或请求异常均不通过。",
+        "protocols": list(case.protocols),
+    }
 
 KVV_META = {name: (case.title, case.description, "按检查项执行", case.cost) for name, case in KVV_CASES.items()}
 DEEPSEEK_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in DEEPSEEK_CASES.items()}
@@ -268,10 +321,23 @@ def _execute_child(job: dict[str, Any]) -> None:
         env.update({"CONTRACT_CASE": job["case"], "DS_API_KEY": job["api_key"], "DS_BASE_URL": job["base_url"], "DS_MODEL": job["model"], "GLM_API_KEY": job["api_key"], "GLM_BASE_URL": job["base_url"], "GLM_MODEL": job["model"], "VOLC_API_KEY": job["api_key"], "VOLC_BASE_URL": job["base_url"], "VOLC_MODEL": job["model"]})
     if job["test_kind"] == "authenticity" or job["case"] in {"DS_V4_FINGERPRINT"}:
         env.update({"VOLC_API_KEY": job["api_key"], "VOLC_BASE_URL": job["base_url"], "VOLC_MODEL": job["model"]})
+    if job["test_kind"] == "gpt":
+        env.update({"GPT_API_KEY": job["api_key"], "GPT_BASE_URL": job["base_url"], "GPT_MODEL": job["model"], "GPT_PROTOCOL": job["protocol"]})
     if job["test_kind"] == "awsb":
         env.update({"AWSB_API_KEY": job["api_key"], "AWSB_BASE_URL": job["base_url"], "AWSB_MODEL": job["model"], "AWSB_MESSAGES_PATH": "/v1/messages"})
-    script = AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else STRICT_SCRIPT if job["test_kind"] == "strict" else RUN_SCRIPT
-    command = [sys.executable, str(script), CONTRACT_CASES[job["case"]]["family"] if job["case"] in CONTRACT_CASES else job["case"]]
+    script = TEMP_SCRIPT if job["test_kind"] == "temporary" else LEGAL_AGENT_BENCHMARK_SCRIPT if job["test_kind"] == "legal-agent-benchmark" else SWE_ATLAS_RF_SCRIPT if job["test_kind"] == "swe-atlas-rf" else SWE_ATLAS_TW_SCRIPT if job["test_kind"] == "swe-atlas-tw" else DEEPSWE_SCRIPT if job["test_kind"] == "deepswe" else ARXIVMATH_SCRIPT if job["test_kind"] == "arxivmath" else AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else GPT_SCRIPT if job["test_kind"] == "gpt" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else STRICT_SCRIPT if job["test_kind"] == "strict" else RUN_SCRIPT
+    # Most runners historically accept the case as a positional argument, but
+    # the AWSB runner intentionally exposes it as a repeatable --case option.
+    # Passing an AWSB case positionally makes argparse abort before any request
+    # reaches the upstream endpoint (the original batch failure mode).
+    if job["test_kind"] == "temporary":
+        command = [sys.executable, str(script)]
+    elif job["test_kind"] in {"arxivmath", "deepswe", "swe-atlas-tw", "swe-atlas-rf", "legal-agent-benchmark"}:
+        command = [sys.executable, str(script), "--case", job["case"]]
+    elif job["test_kind"] == "awsb":
+        command = [sys.executable, str(script), "--case", job["case"]]
+    else:
+        command = [sys.executable, str(script), CONTRACT_CASES[job["case"]]["family"] if job["case"] in CONTRACT_CASES else job["case"]]
     command += ["--output-root", str(RESULTS)]
     if job["quick"] and job["test_kind"] == "load": command.append("--quick")
     if job["test_kind"] == "moderation":
@@ -307,6 +373,8 @@ def _execute_child(job: dict[str, Any]) -> None:
         report_path = result / "report.md" if result else None
         summary = enrich_summary(summary_path, record_id=run_id, batch_id=job.get("batch_id"), test_kind=job["test_kind"],
                                  case_name=job["case"], protocol=job["protocol"], base_url=job["base_url"], model=job["model"]) if summary_path and summary_path.exists() else {}
+        if summary and result:
+            summary = finalize_result_dir(result)
         cancelled = run_id in CANCELLED_RUNS
         passed = bool(summary.get("admission_passed")); status = "interrupted" if cancelled else ("completed" if summary else "failed")
         failure_detail = None
@@ -343,7 +411,9 @@ def _finalize_batch(job: dict[str, Any]) -> None:
         if child.get("summary_path"): child["summary_path"] = str((ROOT / child["summary_path"]).resolve())
     out=RESULTS/f"BATCH-{batch_id}"
     aggregate=aggregate_batch(out,batch,children)
-    update(batch_id,status="completed",finished_at=now_iso(),exit_code=0 if aggregate["admission_passed"] else 2,
+    child_statuses = {child.get("status") for child in children}
+    batch_status = "interrupted" if "interrupted" in child_statuses else ("failed" if "failed" in child_statuses else "completed")
+    update(batch_id,status=batch_status,finished_at=now_iso(),exit_code=0 if aggregate["admission_passed"] else 2,
            result_dir=str(out.relative_to(ROOT)),report_path=str((out/"report.md").relative_to(ROOT)),
            summary_path=str((out/"summary.json").relative_to(ROOT)),manifest_path=str((out/"aggregation_manifest.json").relative_to(ROOT)),
            passed=int(aggregate["admission_passed"]))
@@ -430,6 +500,7 @@ class Handler(BaseHTTPRequestHandler):
             kvv_cases = [capability_case_payload(name, "kvv", KVV_CASES[name], KVV_META[name]) for name in KVV_CASES]
             deepseek_cases = [auth_case_payload(name) if name == "DS_V4_FINGERPRINT" else capability_case_payload(name, "deepseek", DEEPSEEK_CASES[name], DEEPSEEK_META[name]) for name in DEEPSEEK_CASES]
             glm_cases = [capability_case_payload(name, "glm", GLM_CASES[name], GLM_META[name]) for name in GLM_CASES]
+            gpt_cases = [gpt_case_payload(name) for name in GPT_CASES]
             contract_cases = [contract_case_payload(name) for name in CONTRACT_CASES]
             kvv_cases += [x for x in contract_cases if x["test_kind"] == "kvv"]
             deepseek_cases += [x for x in contract_cases if x["test_kind"] == "deepseek"]
@@ -437,7 +508,13 @@ class Handler(BaseHTTPRequestHandler):
             strict_cases = [strict_case_payload(name, case) for name, case in STRICT_CASES.items()]
             awsb_cases = [awsb_case_payload(spec) for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)]
             moderation_cases = [moderation_case_payload(name) for name in MODERATION_CASES]
-            return self.json_response(load_cases + strict_cases + kvv_cases + deepseek_cases + glm_cases + awsb_cases + moderation_cases)
+            temporary_cases = [temporary_case_payload()]
+            arxivmath_case = {"id": "ARXIVMATH", "test_kind": "arxivmath", "source": "MathArena 官方开源数据集", "executor": "scripts/run_arxivmath.py（Hugging Face）", "title": ARXIVMATH_CASE.title, "description": ARXIVMATH_CASE.description, "duration": "按题目数量执行", "cost": ARXIVMATH_CASE.cost, "protocols": list(ARXIVMATH_CASE.protocols), "concurrency": 1, "concurrency_text": "1（按题目串行）", "requests": None, "request_text": "数据集全量题目", "case_count": None, "case_count_text": "全量题目（运行时确定）", "input_tokens": "研究级数学问题", "warmup": None, "steady": None, "admission": "使用官方 answer 字段评分；题目和答案不在本项目中改写。"}
+            deepswe_case = {"id": "DEEPSWE", "test_kind": "deepswe", "source": "DataCurve 官方开源数据集", "executor": "scripts/run_deepswe.py（Pier）", "title": DEEPSWE_CASE.title, "description": DEEPSWE_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": DEEPSWE_CASE.cost, "protocols": list(DEEPSWE_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Pier 管理隔离任务", "requests": None, "request_text": "官方任务集（默认全量）", "case_count": 113, "case_count_text": "113 个官方任务", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
+            sweatlas_case = {"id": "SWE_ATLAS_TW", "test_kind": "swe-atlas-tw", "source": "Scale AI 官方开源数据集", "executor": "scripts/run_sweatlas_tw.py（Harbor）", "title": SWE_ATLAS_TW_CASE.title, "description": SWE_ATLAS_TW_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": SWE_ATLAS_TW_CASE.cost, "protocols": list(SWE_ATLAS_TW_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Harbor 管理隔离任务", "requests": None, "request_text": "官方 TW 任务集", "case_count": 66, "case_count_text": "66 个官方任务（默认）", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
+            sweatlas_rf_case = {"id": "SWE_ATLAS_RF", "test_kind": "swe-atlas-rf", "source": "Scale AI 官方开源数据集", "executor": "scripts/run_sweatlas_rf.py（Harbor）", "title": SWE_ATLAS_RF_CASE.title, "description": SWE_ATLAS_RF_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": SWE_ATLAS_RF_CASE.cost, "protocols": list(SWE_ATLAS_RF_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Harbor 管理隔离任务", "requests": None, "request_text": "官方 RF 任务集", "case_count": 66, "case_count_text": "66 个官方任务（默认）", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
+            legal_case = {"id": "LEGAL_AGENT_BENCHMARK", "test_kind": "legal-agent-benchmark", "source": "Harvey Labs v1.0 官方开源数据集", "executor": "scripts/run_legal_agent_benchmark.py（官方 harness + evaluator）", "title": LEGAL_AGENT_BENCHMARK_CASE.title, "description": LEGAL_AGENT_BENCHMARK_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": LEGAL_AGENT_BENCHMARK_CASE.cost, "protocols": list(LEGAL_AGENT_BENCHMARK_CASE.protocols), "concurrency": 1, "concurrency_text": "由官方 harness 管理 Agent 工具循环", "requests": None, "request_text": "官方 v1.0 Legal Agent 任务集", "case_count": 1, "case_count_text": "1 个任务（默认抽样）", "input_tokens": "法律材料 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 evaluator 完成评分；使用官方任务、材料、rubric 和 harness，不在本项目重写。"}
+            return self.json_response(load_cases + strict_cases + kvv_cases + deepseek_cases + glm_cases + gpt_cases + awsb_cases + moderation_cases + temporary_cases + [arxivmath_case, deepswe_case, sweatlas_case, sweatlas_rf_case, legal_case])
         if path == "/api/runs":
             with db() as connection:
                 rows = connection.execute("SELECT * FROM runs WHERE batch_id IS NULL ORDER BY created_at DESC LIMIT 200").fetchall()
@@ -653,7 +730,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("api_key 不能为空")
             if not model:
                 raise ValueError("model 不能为空")
-            available = CASES if test_kind == "load" else MODERATION_CASES if test_kind == "moderation" else STRICT_CASES if test_kind == "strict" else KVV_CASES if test_kind == "kvv" else DEEPSEEK_CASES if test_kind == "deepseek" else GLM_CASES if test_kind == "glm" else AUTH_CASES if test_kind == "authenticity" else {spec.case_id: spec for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)} if test_kind == "awsb" else {}
+            available = {"LEGAL_AGENT_BENCHMARK": LEGAL_AGENT_BENCHMARK_CASE} if test_kind == "legal-agent-benchmark" else {"SWE_ATLAS_RF": SWE_ATLAS_RF_CASE} if test_kind == "swe-atlas-rf" else {"SWE_ATLAS_TW": SWE_ATLAS_TW_CASE} if test_kind == "swe-atlas-tw" else {"DEEPSWE": DEEPSWE_CASE} if test_kind == "deepswe" else {"ARXIVMATH": ARXIVMATH_CASE} if test_kind == "arxivmath" else {"K3_TEMP_SUITE": temporary_case_payload()} if test_kind == "temporary" else CASES if test_kind == "load" else MODERATION_CASES if test_kind == "moderation" else STRICT_CASES if test_kind == "strict" else KVV_CASES if test_kind == "kvv" else DEEPSEEK_CASES if test_kind == "deepseek" else GLM_CASES if test_kind == "glm" else GPT_CASES if test_kind == "gpt" else AUTH_CASES if test_kind == "authenticity" else {spec.case_id: spec for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)} if test_kind == "awsb" else {}
             if test_kind in {"kvv", "deepseek", "glm"}:
                 available = dict(available)
                 available.update({name: item for name, item in CONTRACT_CASES.items() if item["test_kind"] == test_kind})
@@ -662,9 +739,21 @@ class Handler(BaseHTTPRequestHandler):
             if protocol not in PROTOCOLS:
                 raise ValueError("未知模型协议")
             def protocols_for(name: str) -> tuple[str, ...]:
+                if test_kind == "temporary":
+                    return ("openai", "volcengine")
+                if test_kind == "legal-agent-benchmark":
+                    return LEGAL_AGENT_BENCHMARK_CASE.protocols
+                if test_kind == "swe-atlas-rf":
+                    return SWE_ATLAS_RF_CASE.protocols
+                if test_kind == "swe-atlas-tw":
+                    return SWE_ATLAS_TW_CASE.protocols
+                if test_kind == "deepswe":
+                    return DEEPSWE_CASE.protocols
+                if test_kind == "arxivmath":
+                    return ARXIVMATH_CASE.protocols
                 if name in CONTRACT_CASES:
                     return CONTRACT_CASES[name]["protocols"]
-                return KVV_CASES[name].protocols if test_kind == "kvv" else DEEPSEEK_CASES[name].protocols if test_kind == "deepseek" else GLM_CASES[name].protocols if test_kind == "glm" else ("openai", "volcengine") if test_kind == "authenticity" else ("openai", "volcengine") if test_kind == "moderation" else ("anthropic",) if test_kind == "awsb" else STRICT_CASES[name].protocols if test_kind == "strict" else tuple(PROTOCOLS)
+                return KVV_CASES[name].protocols if test_kind == "kvv" else DEEPSEEK_CASES[name].protocols if test_kind == "deepseek" else GLM_CASES[name].protocols if test_kind == "glm" else GPT_CASES[name].protocols if test_kind == "gpt" else ("openai", "volcengine") if test_kind == "authenticity" else ("openai", "volcengine") if test_kind == "moderation" else ("anthropic",) if test_kind == "awsb" else STRICT_CASES[name].protocols if test_kind == "strict" else tuple(PROTOCOLS)
             unsupported = [name for name in case_names if protocol not in protocols_for(name)]
             if unsupported:
                 raise ValueError(f"{', '.join(unsupported)} 不支持 {protocol} 协议")

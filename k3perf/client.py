@@ -42,6 +42,7 @@ async def stream_chat(
         "started_epoch": started_epoch,
         "queue_delay_ms": max(0.0, (started_epoch - planned_epoch) * 1000) if planned_epoch else None,
         "success": False,
+        "transport_status": "unknown",
         "http_status": None,
         "error_type": None,
         "error_message": None,
@@ -58,6 +59,7 @@ async def stream_chat(
         "invalid_sse_event_count": 0,
         "response_request_id": None,
         "response_headers": {},
+        "raw_response_body": "", "raw_sse_lines": [], "raw_sse_events": [],
     }
     payload = {
         "model": config.model,
@@ -88,13 +90,15 @@ async def stream_chat(
             result["response_request_id"] = response.headers.get("x-request-id") or response.headers.get("x-trace-id")
             if response.status_code < 200 or response.status_code >= 300:
                 result["error_type"] = "http_error"
-                result["error_message"] = (await response.aread()).decode("utf-8", errors="replace")[:2000]
+                result["raw_response_body"] = (await response.aread()).decode("utf-8", errors="replace")
+                result["error_message"] = result["raw_response_body"][:2000]
                 return result
             async for line in response.aiter_lines():
                 line = line.strip()
                 if not line or line.startswith(":") or not line.startswith("data:"):
                     continue
-                data = line[5:].strip()
+                result["raw_sse_lines"].append(line)
+                data = line[5:].strip(); result["raw_sse_events"].append(data)
                 if data == "[DONE]":
                     saw_done = True
                     continue
@@ -117,6 +121,7 @@ async def stream_chat(
                         result["content_char_count"] += len(text)
                         if first_content_mono is None:
                             first_content_mono = time.perf_counter()
+            result["transport_status"] = "completed"
             ended_mono = time.perf_counter()
             result["completed_epoch"] = time.time()
             result["prompt_tokens"] = prompt_tokens
@@ -137,12 +142,15 @@ async def stream_chat(
                 result["success"] = True
             return result
     except TimeoutError as exc:
+        result["transport_status"] = "error"
         result["error_type"] = "timeout"
         result["error_message"] = str(exc)
     except httpx.HTTPError as exc:
+        result["transport_status"] = "error"
         result["error_type"] = "client_error"
         result["error_message"] = str(exc)
-    except Exception as exc:  # preserve unexpected errors in raw output
+    except Exception as exc:
+        result["transport_status"] = "error"  # preserve unexpected errors in raw output
         result["error_type"] = type(exc).__name__
         result["error_message"] = str(exc)
     result["completed_epoch"] = time.time()

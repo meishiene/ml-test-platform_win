@@ -8,3 +8,6 @@ pytest>=8.0
 pytest-rerunfailures>=14.0
 pytest-xdist>=3.5
 Pillow>=12.1.0
+
+# MathArena official ArXivMath dataset loader
+datasets>=3.5.0

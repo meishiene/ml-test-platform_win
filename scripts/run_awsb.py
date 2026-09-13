@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse, asyncio, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from k3perf.awsb import AWSBConfig, AWSBRunner, CASE_SPECS, summarize, write_report
+from awsb import AWSBConfig, AWSBRunner, CASE_SPECS, CACHE_CASE_SPECS, summarize, write_report
+from common.suite_runtime import finalize
 
 async def main():
     ap=argparse.ArgumentParser(description="AWS Bedrock Claude Opus 5 上游/网关自检")
@@ -11,15 +12,17 @@ async def main():
     ap.add_argument("--priority", action="append", choices=("P0","P1")); ap.add_argument("--output-root", type=Path, default=Path("results"))
     args=ap.parse_args()
     if args.list:
-        for x in CASE_SPECS: print(f"{x.case_id}\t{x.priority}\t{x.name}")
+        for x in (*CASE_SPECS, *CACHE_CASE_SPECS): print(f"{x.case_id}\t{x.priority}\t{x.name}")
         return 0
     try: cfg=AWSBConfig.from_env()
     except ValueError as e: print(f"配置错误：{e}", file=sys.stderr); return 1
     ids=set(args.cases) if args.cases else None
-    known={x.case_id for x in CASE_SPECS}
+    known={x.case_id for x in (*CASE_SPECS, *CACHE_CASE_SPECS)}
     if ids and ids-known: print("未知用例："+", ".join(sorted(ids-known)), file=sys.stderr); return 1
-    async with AWSBRunner(cfg) as runner: results=await runner.run(tuple(args.priority or ("P0","P1")), ids)
-    summary=summarize(results); out=args.output_root/f"AWSB-O5-{time.strftime('%Y%m%d-%H%M%S')}"; write_report(out,summary)
+    out=args.output_root/f"AWSB-O5-{time.strftime('%Y%m%d-%H%M%S')}"
+    async with AWSBRunner(cfg, audit_dir=out) as runner: results=await runner.run(tuple(args.priority or ("P0","P1")), ids)
+    summary=summarize(results); write_report(out,summary)
+    finalize(out)
     for x in results: print(f"{'PASS' if x.passed else 'FAIL'} {x.case_id}: {x.details}")
     print(f"结果：{out.resolve()}"); return 0 if summary["all_passed"] else 2
 if __name__ == "__main__": raise SystemExit(asyncio.run(main()))

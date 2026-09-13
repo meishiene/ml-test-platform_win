@@ -6,6 +6,7 @@ import json
 import os
 import time
 from pathlib import Path
+from common.suite_runtime import finalize
 
 from .cases import CASES
 from .core import DeepSeekConfig, DeepSeekV4Runner, summarize_results, write_report
@@ -52,6 +53,7 @@ async def main_async(argv: list[str] | None = None) -> int:
     write_report(out, summary)
     # write_report 已写入结果；补写 Web 聚合需要的扩展字段。
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    finalize(out)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"结果目录: {out.resolve()}")
     return 0 if summary["admission_passed"] else 2

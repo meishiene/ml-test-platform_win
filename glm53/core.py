@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 import httpx
+from common.test_framework import HttpExecutor, ResultLog
 
 @dataclass(frozen=True)
 class GLMConfig:
@@ -74,61 +75,33 @@ class GLM53Runner:
             audit_dir.mkdir(parents=True, exist_ok=True)
             self.audit_path=audit_dir / "requests.jsonl"
     async def __aenter__(self):
-        self.client=httpx.AsyncClient(timeout=self.config.timeout, verify=self.config.verify_ssl, trust_env=self.config.trust_env, headers={"Authorization":f"Bearer {self.config.api_key}","Content-Type":"application/json"}); return self
-    async def __aexit__(self,*_): await self.client.aclose()
+        self.client=httpx.AsyncClient(timeout=self.config.timeout, verify=self.config.verify_ssl, trust_env=self.config.trust_env, headers={"Authorization":f"Bearer {self.config.api_key}","Content-Type":"application/json"})
+        self.executor=HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
+        await self.executor.__aenter__()
+        if self.audit_dir: self.log=ResultLog(self.audit_dir / "requests.jsonl")
+        return self
+    async def __aexit__(self,*args):
+        if self.log: self.log.close()
+        if self.executor: await self.executor.__aexit__(*args)
+        if self.client: await self.client.aclose()
     def _audit(self, record: dict[str, Any]):
         if not self.audit_path: return
         with self.audit_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
     async def request(self, model, messages, *, stream=False, **kwargs):
+        if self.executor is None:
+            self.client=httpx.AsyncClient(timeout=self.config.timeout, verify=self.config.verify_ssl, trust_env=self.config.trust_env, headers={"Authorization":f"Bearer {self.config.api_key}","Content-Type":"application/json"})
+            self.executor=HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
+            await self.executor.__aenter__()
         payload={"model":model,"messages":messages,"max_tokens":kwargs.pop("max_tokens",2048),"stream":stream,**kwargs}
-        self.request_seq += 1
-        request_id="GLM53-"+uuid.uuid4().hex[:12]
-        started=time.time(); start=time.perf_counter()
-        record={"sequence":self.request_seq,"case_id":self.current_case_id,"request_id":request_id,
-                "started_at":time.strftime("%Y-%m-%dT%H:%M:%S%z"),"endpoint":self.config.base_url.rstrip("/")+"/chat/completions",
-                "method":"POST","model":model,"stream":stream,"timeout_seconds":self.config.timeout,
-                "request_headers":{"Content-Type":"application/json","X-Request-ID":request_id},
-                "request":payload}
+        request_id=f"GLM53-{uuid.uuid4().hex[:12]}"
+        record=await self.executor.execute(case_id=self.current_case_id or "GLM53-request", url=self.config.base_url.rstrip("/")+"/chat/completions", payload=payload, headers={"Authorization":f"Bearer {self.config.api_key}","Content-Type":"application/json","X-Request-ID":request_id}, stream=stream)
+        if self.log: await self.log.write(record)
         if not stream:
-            r=await self.client.post(self.config.base_url.rstrip("/")+"/chat/completions",json=payload,
-                                     headers={"X-Request-ID":request_id})
-            try: body=r.json()
-            except ValueError: body=None
-            record.update({"http_status":r.status_code,"response_headers":dict(r.headers),"upstream_request_id":r.headers.get("x-request-id") or r.headers.get("request-id") or r.headers.get("x-trace-id"),"response_object_id":(body or {}).get("id") if isinstance(body,dict) else None,"response":body,
-                           "elapsed_seconds":time.perf_counter()-start})
-            self._audit(record)
-            return r.status_code,body,time.perf_counter()-start,{}
-        chunks=[]; reasoning=[]; done=False; invalid=0; raw_events=[]; raw_lines=[]; finish_reasons=[]
-        try:
-            async with self.client.stream("POST",self.config.base_url.rstrip("/")+"/chat/completions",json=payload,
-                                          headers={"X-Request-ID":request_id}) as r:
-                record["http_status"]=r.status_code; record["response_headers"]=dict(r.headers); record["upstream_request_id"]=r.headers.get("x-request-id") or r.headers.get("request-id") or r.headers.get("x-trace-id")
-                if r.status_code >= 300:
-                    raw=await r.aread(); record.update({"raw_response":raw.decode(errors="replace"),"elapsed_seconds":time.perf_counter()-start}); self._audit(record)
-                    return r.status_code,None,time.perf_counter()-start,{"error":record["raw_response"][:300]}
-                async for line in r.aiter_lines():
-                    raw_lines.append(line)
-                    if not line.startswith("data:"): continue
-                    raw=line[5:].strip(); raw_events.append(raw)
-                    if raw=="[DONE]": done=True; continue
-                    try: obj=json.loads(raw)
-                    except json.JSONDecodeError: invalid+=1; continue
-                    for choice in obj.get("choices") or []:
-                        delta=choice.get("delta") or {}; chunks.append(delta.get("content") or ""); reasoning.append(delta.get("reasoning_content") or "")
-                        if "finish_reason" in choice: finish_reasons.append(choice.get("finish_reason"))
-                status=r.status_code
-        except Exception as exc:
-            record.update({"exception":{"type":type(exc).__name__,"message":str(exc)},
-                           "raw_sse_lines":raw_lines,"raw_sse_events":raw_events,
-                           "elapsed_seconds":time.perf_counter()-start})
-            self._audit(record)
-            raise
-        parsed={"content":"".join(chunks),"reasoning_content":"".join(reasoning),"done":done,"invalid_events":invalid,"finish_reasons":finish_reasons}
-        record.update({"raw_sse_lines":raw_lines,"raw_sse_events":raw_events,"parsed":parsed,"elapsed_seconds":time.perf_counter()-start})
-        self._audit(record)
-        return status,None,time.perf_counter()-start,parsed
+            return record.http_status or 0, record.response_body if isinstance(record.response_body,dict) else None, record.timing.get("e2e_ms",0)/1000, {}
+        parsed={"content":record.content,"reasoning_content":record.reasoning,"done":record.done_received,"invalid_events":record.invalid_sse_events,"finish_reasons":record.finish_reasons,"raw_sse_lines":record.raw_sse_lines,"raw_sse_events":record.raw_sse_events,"usage":record.usage or {}}
+        return record.http_status or 0, None, record.timing.get("e2e_ms",0)/1000, parsed
 
     def tools(self): return [{"type":"function","function":{"name":"get_weather","description":"查询天气","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":False}}}]
     async def run(self, model, priorities):

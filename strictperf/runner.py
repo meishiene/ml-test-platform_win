@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .cases import CASES
+from common.suite_runtime import finalize
 
 DEFAULT_HOME = Path(__file__).resolve().parent.parent
 
@@ -85,6 +86,8 @@ def execute(case_id: str, output_root: Path) -> tuple[Path | None, dict, int]:
             "embedded_runtime": True,
         })
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if summary and target:
+        finalize(target)
     return target, summary, process.returncode
 
 

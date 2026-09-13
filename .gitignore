@@ -1,4 +1,6 @@
 .venv/
+# vendor_verifier 的 venv 现为指向 ./.venv 的软链（上面的 .venv/ 只匹配目录，软链需单独忽略）
+vendor_verifier/.venv
 __pycache__/
 *.pyc
 .env

@@ -4,7 +4,7 @@ from volcperf.metrics import percentile, summarize
 
 
 def row(**changes):
-    value = {"counted": True, "success": True, "prompt_tokens": 2048, "completion_tokens": 500,
+    value = {"counted": True, "success": True, "prompt_tokens": 7500, "completion_tokens": 500,
              "visible_completion_tokens": 500, "finish_reason": "stop", "ttfc_seconds": 1,
              "first_sse_seconds": .1, "first_reasoning_seconds": .2, "ttft_seconds": .2, "e2e_seconds": 5,
              "tpot_ms_per_visible_token": 8, "tpot_token_basis": "visible", "send_delay_ms": None}
@@ -28,11 +28,11 @@ class MetricTests(unittest.TestCase):
 
     def test_b1_has_four_requests_per_size(self):
         rows=[]
-        for dataset,tokens in (("P2K",2048),("P8K",8192),("P16K",16384),("P32K",32768)):
+        for dataset,tokens in (("I1",7500),("I2",12000),("I3",24000),("I4",48000)):
             rows += [row(dataset_id=f"{dataset}-{i:05d}", prompt_tokens=tokens) for i in range(4)]
         result=summarize(CASES["B1"], rows)
         self.assertTrue(result["admission_passed"])
-        self.assertEqual({k:v["sent"] for k,v in result["baselines_by_dataset"].items()}, {"P2K":4,"P8K":4,"P16K":4,"P32K":4})
+        self.assertEqual({k:v["sent"] for k,v in result["baselines_by_dataset"].items()}, {"I1":4,"I2":4,"I3":4,"I4":4})
 
     def test_l1_all_requirements(self):
         self.assertTrue(summarize(CASES["L1"], [row() for _ in range(100)], baseline_p90=1)["admission_passed"])

@@ -8,6 +8,9 @@ import time
 import uuid
 from itertools import cycle
 from pathlib import Path
+
+from common.audit import AuditLog
+from common.suite_runtime import finalize
 from typing import Any
 
 import httpx
@@ -21,7 +24,7 @@ from .metrics import summarize
 from .reporting import write_artifacts
 
 
-B1_DATASETS = ("P2K", "P8K", "P16K", "P32K")
+B1_DATASETS = ("I1", "I2", "I3", "I4")
 
 
 def load_case_prompts(case: Case, data_override: Path | None = None, *, quick: bool = False) -> list[PromptRecord]:
@@ -37,13 +40,13 @@ def load_case_prompts(case: Case, data_override: Path | None = None, *, quick: b
 class ResultWriter:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.stream = path.open("w", encoding="utf-8", buffering=1)
+        self.audit = AuditLog(path)
 
     def write(self, row: dict[str, Any]) -> None:
-        self.stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self.audit.write(row)
 
     def close(self) -> None:
-        self.stream.close()
+        self.audit.close()
 
 
 def session(config: ApiConfig, *, connection_limit: int | None = None) -> httpx.AsyncClient:
@@ -161,6 +164,7 @@ async def main_async(argv: list[str] | None = None) -> int:
                    "scope_note": "前置连通性测试失败，正式测试未启动。"}
         (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         write_artifacts(out, [], summary)
+        finalize(out)
         print(json.dumps(summary, ensure_ascii=False, indent=2)); print(f"结果目录: {out.resolve()}")
         return 2
     writer = ResultWriter(out / "requests.jsonl")
@@ -201,6 +205,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         summary["quick_run"] = True; summary["admission_passed"] = False; summary["scope_note"] = "quick 模式仅验证脚本，不得作为准入结论。"
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     write_artifacts(out, rows, summary)
+    finalize(out)
     print(json.dumps(summary, ensure_ascii=False, indent=2)); print(f"结果目录: {out.resolve()}")
     return 0 if summary["admission_passed"] else 2
 

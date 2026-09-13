@@ -38,7 +38,7 @@ async function api(path, options={}) {
 }
 function toast(message) { const el=$('#toast'); el.textContent=message; el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),2600); }
 function caseLabel(id) { return state.cases.find(item=>item.id===id)?.title || id; }
-function kindLabel(kind){return kind==='kvv'?'KVV':kind==='deepseek'?'DeepSeek V4':kind==='glm'?'GLM 5.3':kind==='glm_stream_retest'?'GLM 流式复测':kind==='awsb'?'AWSB / Opus 5':kind==='moderation'?'内容审核':kind==='authenticity'?'满血真实性校验':kind==='strict'?'多轮压测（严格）':'多轮压测'}
+function kindLabel(kind){return kind==='open-source'?'开源测试集':kind==='kvv'?'KVV':kind==='deepseek'?'DeepSeek V4':kind==='glm'?'GLM 5.3':kind==='gpt'?'GPT 检测':kind==='glm_stream_retest'?'GLM 流式复测':kind==='awsb'?'AWSB / Opus 5':kind==='moderation'?'内容审核':kind==='authenticity'?'满血真实性校验':kind==='arxivmath'?'ArXivMath':kind==='deepswe'?'DeepSWE':kind==='swe-atlas-tw'?'SWE-Atlas TW':kind==='swe-atlas-rf'?'SWE-Atlas RF':kind==='legal-agent-benchmark'?'Legal Agent Benchmark':kind==='temporary'?'临时测试案例集':kind==='strict'?'多轮压测（严格）':'多轮压测'}
 
 
 function renderProtocols() {
@@ -48,18 +48,18 @@ function renderProtocols() {
 function selectProtocol(id) {
   const previous=state.protocols.find(x=>x.id===state.protocol); const item=state.protocols.find(x=>x.id===id); state.protocol=id; renderProtocols();
   const base=$('#baseUrl'); if(!base.value || (previous && base.value===previous.default_base_url)) base.value=item.default_base_url;
-  $('#model').placeholder=state.testKind==='deepseek'?'输入任意 DeepSeek 模型名或网关模型 ID':state.testKind==='glm'?'输入 GLM 5.3 模型名或网关模型 ID':state.testKind==='awsb'?'输入 claude-opus-5 或网关模型别名':item.model_hint; renderCases(); state.selected=state.selected.filter(caseId=>state.cases.find(x=>x.id===caseId)?.protocols.includes(id)); if(!state.selected.length){const first=state.cases.find(x=>x.test_kind===state.testKind&&x.protocols.includes(id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint';
+  $('#model').placeholder=state.testKind==='deepseek'?'输入任意 DeepSeek 模型名或网关模型 ID':state.testKind==='glm'?'输入 GLM 5.3 模型名或网关模型 ID':state.testKind==='gpt'?'输入 GPT 模型名或网关模型 ID':state.testKind==='awsb'?'输入 claude-opus-5 或网关模型别名':item.model_hint; renderCases(); state.selected=state.selected.filter(caseId=>state.cases.find(x=>x.id===caseId)?.protocols.includes(id)); if(!state.selected.length){const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&x.protocols.includes(id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint';
 }
 
 function caseFacts(item){
-  const facts=[['并发 / 速率',item.concurrency_text],['输入 Token',item.input_tokens],['总请求数',item.request_text]];
+  const facts=[['测试案例数',item.case_count_text || (item.case_count != null ? `${item.case_count} 条` : null)],['并发 / 速率',item.concurrency_text],['输入 Token',item.input_tokens],['总请求数',item.request_text]];
   if(item.warmup)facts.push(['预热时间',item.warmup]);
   if(item.steady)facts.push(['稳定运行',item.steady]);
   if(item.workload_profile)facts.push(['负载画像',item.workload_profile]);
   return facts;
 }
 function renderCases() {
-  const cases=state.cases.filter(item=>item.test_kind===state.testKind);
+  const cases=state.cases.filter(item=>state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(item.test_kind):item.test_kind===state.testKind);
   $('#caseGrid').innerHTML = cases.map(item => {const supported=item.protocols.includes(state.protocol);return `<button type="button" class="case-card ${state.selected.includes(item.id)?'selected':''} ${supported?'':'unsupported'}" data-case="${item.id}" ${supported?'':'disabled'}>
     <div class="case-head"><b>${item.id}</b><span class="cost">${supported?'成本 '+escapeHtml(item.cost):'当前协议不支持'}</span></div><div class="case-source">${escapeHtml(item.source||'专项自研代码')} · ${escapeHtml(item.executor||'')}</div><h3>${escapeHtml(item.title)}</h3>
     <dl class="case-facts">${caseFacts(item).map(([label,value])=>`<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value||'—')}</dd></div>`).join('')}</dl>
@@ -77,10 +77,11 @@ function updateSelectionUI(){
   updateCustomDefaults();
   const selected=state.cases.filter(x=>state.selected.includes(x.id));
   $('#selectedName').textContent=selected.length?selected.map(x=>x.id).join(' + '):'请选择测试';
-  $('#selectedMeta').textContent=selected.length===1?`${caseFacts(selected[0]).map(x=>x.join(' ')).join(' · ')} · 成本 ${selected[0].cost}`:selected.length?`已选择 ${selected.length} 项 · 标称请求共 ${selected.reduce((n,x)=>n+Number(x.requests||0),0)} 个；将串行执行并生成聚合报告`:'—';
+  $('#selectedMeta').textContent=selected.length===1?`${caseFacts(selected[0]).map(x=>x.join(' ')).join(' · ')} · 成本 ${selected[0].cost}${selected[0].display_only?' · 仅展示':''}`:selected.length?`已选择 ${selected.length} 项 · 标称请求共 ${selected.reduce((n,x)=>n+Number(x.requests||0),0)} 个；将串行执行并生成聚合报告`:'—';
 }
 function selectCase(id) {
-  state.selected=state.selected.includes(id)?state.selected.filter(x=>x!==id):[...state.selected,id];
+  if(state.testKind==='open-source') state.selected=[id];
+  else state.selected=state.selected.includes(id)?state.selected.filter(x=>x!==id):[...state.selected,id];
   if(state.selected.length!==1){$('#customRequests').dataset.edited='';$('#customConcurrency').dataset.edited='';}
   renderCases();updateSelectionUI();
 }
@@ -157,10 +158,12 @@ $('#runForm').addEventListener('submit', async event => {
   event.preventDefault(); const message=$('#formMessage'); message.textContent='';
   if(!state.selected.length){message.textContent='请先选择一个测试场景';return}
   const quick=$('#quick').checked;
-  if(((state.testKind==='load' && !quick && state.selected.some(id=>['C1','L4','L5'].includes(id))) || (state.testKind==='strict' && state.selected.some(id=>['STRICT_L2','STRICT_L3','STRICT_L4','STRICT_C1'].includes(id)))) && !confirm(`${state.selected.join('、')} 包含高成本测试，会产生较高 Token 成本，确认立即排队执行？`)) return;
+  const selectedItem=state.cases.find(x=>x.id===state.selected[0]);
+  const effectiveTestKind=state.testKind==='open-source'?(selectedItem?.test_kind||''):state.testKind;
+  if(((effectiveTestKind==='load' && !quick && state.selected.some(id=>['C1','L4','L5'].includes(id))) || (effectiveTestKind==='strict' && state.selected.some(id=>['STRICT_L2','STRICT_L3','STRICT_L4','STRICT_C1'].includes(id)))) && !confirm(`${state.selected.join('、')} 包含高成本测试，会产生较高 Token 成本，确认立即排队执行？`)) return;
   const button=$('#submitBtn'); button.disabled=true;
   try {
-    const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:state.testKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,quick,requests:(state.testKind==='load'||state.testKind==='strict')&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:state.testKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||state.testKind==='strict')&&$('#customEnabled').checked?Number($('#customConcurrency').value):null)})});
+    const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:effectiveTestKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,quick,requests:(effectiveTestKind==='load'||effectiveTestKind==='strict')&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:effectiveTestKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||state.testKind==='strict')&&$('#customEnabled').checked?Number($('#customConcurrency').value):null)})});
     state.runs.unshift(run); renderRuns(); toast(`${state.selected.join('、')} 已加入执行队列`);
     document.querySelector('.history').scrollIntoView({behavior:'smooth'});
   } catch(e){message.textContent=e.message} finally {button.disabled=false}
@@ -225,12 +228,14 @@ document.querySelectorAll('.kind-tab').forEach(button=>button.onclick=()=>{
   $('#quick').closest('.mode-toggle').style.display=state.testKind==='load'?'flex':'none';
   if(state.testKind==='deepseek')$('#model').placeholder='输入任意 DeepSeek 模型名或网关模型 ID';
   if(state.testKind==='glm')$('#model').placeholder='输入 GLM 5.3 模型名或网关模型 ID';
+  if(state.testKind==='gpt')$('#model').placeholder='输入 GPT 模型名或网关模型 ID';
   if(state.testKind==='authenticity')$('#model').placeholder='输入 DeepSeek 或 Kimi K3 模型名/网关模型 ID';
   if(state.testKind==='awsb')$('#model').placeholder='输入 claude-opus-5 或网关模型别名';
   if(state.testKind==='moderation')$('#model').placeholder='输入审核模型或网关模型 ID';
+  if(state.testKind==='open-source')$('#model').placeholder='输入用于运行开源测试集的模型或网关模型 ID';
   else $('#model').placeholder=state.protocols.find(x=>x.id===state.protocol)?.model_hint||'';
   renderCases();
-  const first=state.cases.find(x=>x.test_kind===state.testKind&&x.protocols.includes(state.protocol));if(first)state.selected=[first.id];renderCases();updateSelectionUI();
+  const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&x.protocols.includes(state.protocol));if(first)state.selected=[first.id];renderCases();updateSelectionUI();
 });
 document.querySelectorAll('.filter').forEach(button=>button.onclick=()=>{
   document.querySelectorAll('.filter').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.filter=button.dataset.filter;renderRuns();
