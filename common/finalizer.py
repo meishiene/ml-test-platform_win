@@ -40,7 +40,7 @@ def finalize_result_dir(result_dir: Path) -> dict[str, Any]:
     summary=normalize_summary(json.loads(path.read_text(encoding="utf-8")))
     checks=_suite_checks(summary)
     evidence=[]
-    for name in ("execution.jsonl","requests.jsonl","requests.csv","pytest.log","run.log","connectivity.json","metadata.json"):
+    for name in ("execution.jsonl","requests.jsonl","generated_requests.jsonl","requests.csv","pytest.log","run.log","connectivity.json","metadata.json"):
         p=result_dir/name
         if p.is_file(): evidence.append({"path":name,"bytes":p.stat().st_size,"nonempty":p.stat().st_size>0})
     evidence_ok=bool(evidence) and any(x["nonempty"] for x in evidence)

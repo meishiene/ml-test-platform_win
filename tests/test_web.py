@@ -33,24 +33,26 @@ class WebTests(unittest.TestCase):
 
     def test_cases_and_index(self):
         cases=self.get_json("/api/cases")
-        self.assertGreaterEqual(len(cases), 36)
+        self.assertGreaterEqual(len(cases), 30)
         self.assertEqual({x["id"] for x in cases if x["id"].endswith("CONTRACT")}, {"KVV_CONTRACT", "DS_CONTRACT", "GLM_CONTRACT"})
         self.assertEqual(next(x for x in cases if x["id"]=="KVV_CONTRACT")["test_kind"], "kvv")
         self.assertEqual(next(x for x in cases if x["id"]=="DS_CONTRACT")["test_kind"], "deepseek")
-        strict=next(x for x in cases if x["id"]=="STRICT_C1")
-        self.assertEqual((strict["concurrency"],strict["requests"]),(10,7200))
-        self.assertEqual(strict["protocols"],["openai","volcengine"])
+        self.assertFalse(any(x["test_kind"] == "strict" for x in cases))
+        load_ids={x["id"] for x in cases if x["test_kind"] == "load"}
+        self.assertEqual(load_ids,{"T0","B1","SIMPLE_LOAD","FULL_LOAD","C0","C1"})
+        simple=next(x for x in cases if x["id"]=="SIMPLE_LOAD")
+        full=next(x for x in cases if x["id"]=="FULL_LOAD")
+        self.assertEqual((simple["concurrency"],simple["requests"]),(30,300))
+        self.assertEqual((full["concurrency"],full["requests"]),(50,550))
+        self.assertIn("L1–L5 各 50",simple["request_text"])
+        self.assertIn("O1 50",full["request_text"])
         required={"concurrency_text","input_tokens","request_text","warmup","steady","admission"}
         self.assertTrue(all(required.issubset(item) for item in cases))
         b1=next(x for x in cases if x["id"]=="B1")
         self.assertEqual((b1["concurrency_text"],b1["request_text"]),("2","成功目标 16；最多尝试 16"))
         self.assertIn("2K / 8K / 16K / 32K",b1["input_tokens"])
-        l1=next(x for x in cases if x["id"]=="L1")
-        self.assertEqual((l1["warmup"],l1["steady"]),("1 分钟","3 分钟"))
-        self.assertIn("成功目标 100；最多尝试 200",l1["request_text"])
-        self.assertIn("多轮对话",l1["workload_profile"])
-        self.assertIn("TTFC P50≤5s",l1["admission"])
-        self.assertIn("成功 RPM≥600",strict["admission"])
+        self.assertIn("L1–L5",simple["workload_profile"])
+        self.assertTrue(simple["fixed_parameters"])
         self.assertEqual(len(self.get_json("/api/protocols")), 4)
         with urlopen(self.base + "/") as response:
             self.assertIn("性能测试台", response.read().decode())
@@ -67,15 +69,27 @@ class WebTests(unittest.TestCase):
             self.assertEqual(put.call_args.args[0]["api_key"], "super-secret")
         self.assertNotIn("super-secret", self.db_path.read_bytes().decode("utf-8", "ignore"))
 
-    def test_create_strict_run(self):
-        payload=json.dumps({"protocol":"volcengine", "test_kind":"strict", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"STRICT_T0", "quick":True}).encode()
+    def test_create_load_presets(self):
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"SIMPLE_LOAD", "quick":True}).encode()
         with patch.object(server.JOB_QUEUE, "put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 result=json.load(response)
-        self.assertEqual(result["test_kind"], "strict")
-        self.assertEqual(put.call_args.args[0]["case"], "STRICT_T0")
+        self.assertEqual(result["case_ids"], ["SIMPLE_LOAD"])
+        self.assertTrue(result["is_batch"])
+        children=put.call_args.args[0]["children"]
+        self.assertEqual([child["case"] for child in children], ["L1","L2","L3","L4","L5","O1"])
+        self.assertEqual([(child["requests"],child["concurrency"]) for child in children], [(50,30)]*5+[(50,10)])
+        self.assertTrue(all(child["warmup_seconds"] == 0 for child in children))
+        self.assertTrue(all(not child["quick"] for child in children))
 
-    def test_reject_unsupported_strict_protocol(self):
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"FULL_LOAD"}).encode()
+        with patch.object(server.JOB_QUEUE, "put") as put:
+            with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})):
+                pass
+        children=put.call_args.args[0]["children"]
+        self.assertEqual([(child["requests"],child["concurrency"]) for child in children], [(100,50)]*5+[(50,10)])
+
+    def test_reject_removed_strict_suite(self):
         payload=json.dumps({"protocol":"anthropic", "test_kind":"strict", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"STRICT_T0"}).encode()
         with self.assertRaises(HTTPError) as caught:
             urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"}))
@@ -88,6 +102,29 @@ class WebTests(unittest.TestCase):
                 result=json.load(response)
         self.assertEqual(result["test_kind"], "kvv")
         self.assertEqual(put.call_args.args[0]["case"], "KVV_K3_FEATURES")
+
+    def test_create_gpt_image_run_keeps_randomization_choices(self):
+        payload=json.dumps({
+            "protocol":"openai",
+            "test_kind":"gpt-image",
+            "base_url":"https://api.openai.com/v1",
+            "api_key":"secret",
+            "model":"gpt-image-2",
+            "case":"GPT_IMAGE_2",
+            "requests":7,
+            "concurrency":3,
+            "image_quality":["low","high"],
+            "image_models":["gpt-image-2"],
+            "image_sizes":["1024x1024","1536x1024"],
+        }).encode()
+        with patch.object(server.JOB_QUEUE, "put") as put:
+            with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
+                result=json.load(response)
+        self.assertEqual(result["test_kind"], "gpt-image")
+        job=put.call_args.args[0]
+        self.assertEqual((job["requests"],job["concurrency"]),(7,3))
+        self.assertEqual(job["image_quality"],["low","high"])
+        self.assertEqual(job["image_sizes"],["1024x1024","1536x1024"])
 
     def test_create_deepseek_run(self):
         payload=json.dumps({"protocol":"openai", "test_kind":"deepseek", "base_url":"https://api.deepseek.com", "api_key":"secret", "model":"deepseek-v4-pro", "case":"DS_V4_P0"}).encode()
