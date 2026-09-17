@@ -31,6 +31,39 @@ class WebTests(unittest.TestCase):
         with urlopen(self.base + path) as response:
             return json.load(response)
 
+    def test_interrupted_image_summary_keeps_partial_request_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory)
+            rows = [
+                {"success": True, "error_type": None},
+                {"success": False, "error_type": "http_503"},
+                {"success": False, "error_type": "request_timeout"},
+            ]
+            (result / "requests.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            summary = server.interrupted_request_summary(
+                {
+                    "test_kind": "gpt-image",
+                    "case": "GPT_IMAGE_2",
+                    "protocol": "openai",
+                    "base_url": "https://example.test/v1",
+                    "model": "gpt-image-2",
+                    "requests": 5,
+                },
+                "run-id",
+                result,
+            )
+        self.assertEqual(summary["completed"], 3)
+        self.assertEqual(summary["successful"], 1)
+        self.assertEqual(summary["failed"], 2)
+        self.assertEqual(summary["unfinished"], 2)
+        self.assertEqual(
+            summary["error_distribution"],
+            {"http_503": 1, "request_timeout": 1},
+        )
+
     def test_cases_and_index(self):
         cases=self.get_json("/api/cases")
         self.assertGreaterEqual(len(cases), 30)
@@ -39,7 +72,11 @@ class WebTests(unittest.TestCase):
         self.assertEqual(next(x for x in cases if x["id"]=="DS_CONTRACT")["test_kind"], "deepseek")
         self.assertFalse(any(x["test_kind"] == "strict" for x in cases))
         load_ids={x["id"] for x in cases if x["test_kind"] == "load"}
-        self.assertEqual(load_ids,{"T0","B1","SIMPLE_LOAD","FULL_LOAD","C0","C1"})
+        self.assertEqual(load_ids,{"T0","RANDOM_LOAD","B1","SIMPLE_LOAD","FULL_LOAD","C0","C1"})
+        random_load=next(x for x in cases if x["id"]=="RANDOM_LOAD")
+        self.assertEqual((random_load["concurrency"],random_load["requests"]),(10,100))
+        self.assertEqual(random_load["output_tokens"],"2048")
+        self.assertTrue(random_load["manual_parameters"])
         simple=next(x for x in cases if x["id"]=="SIMPLE_LOAD")
         full=next(x for x in cases if x["id"]=="FULL_LOAD")
         self.assertEqual((simple["concurrency"],simple["requests"]),(30,300))
@@ -89,6 +126,16 @@ class WebTests(unittest.TestCase):
         children=put.call_args.args[0]["children"]
         self.assertEqual([(child["requests"],child["concurrency"]) for child in children], [(100,50)]*5+[(50,10)])
 
+    def test_create_random_load_uses_exact_manual_request_and_concurrency_values(self):
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"RANDOM_LOAD", "quick":True, "requests":37, "concurrency":6}).encode()
+        with patch.object(server.JOB_QUEUE, "put") as put:
+            with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
+                result=json.load(response)
+        job=put.call_args.args[0]
+        self.assertEqual(result["case_ids"], ["RANDOM_LOAD"])
+        self.assertEqual((job["requests"],job["concurrency"]),(37,6))
+        self.assertFalse(job["quick"])
+
     def test_reject_removed_strict_suite(self):
         payload=json.dumps({"protocol":"anthropic", "test_kind":"strict", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"STRICT_T0"}).encode()
         with self.assertRaises(HTTPError) as caught:
@@ -125,6 +172,25 @@ class WebTests(unittest.TestCase):
         self.assertEqual((job["requests"],job["concurrency"]),(7,3))
         self.assertEqual(job["image_quality"],["low","high"])
         self.assertEqual(job["image_sizes"],["1024x1024","1536x1024"])
+
+    def test_create_fixed_gpt_image_4k_token_verification(self):
+        payload=json.dumps({
+            "protocol":"openai",
+            "test_kind":"gpt-image",
+            "base_url":"https://api.openai.com/v1",
+            "api_key":"secret",
+            "model":"gpt-image-2",
+            "case":"GPT_IMAGE_4K_TOKEN_VERIFY",
+        }).encode()
+        with patch.object(server.JOB_QUEUE, "put") as put:
+            with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
+                result=json.load(response)
+        self.assertEqual(result["test_kind"], "gpt-image")
+        job=put.call_args.args[0]
+        self.assertEqual((job["requests"],job["concurrency"]),(3,1))
+        self.assertEqual(job["image_quality"],["high","max"])
+        self.assertEqual(job["image_models"],["gpt-image-2","gpt-image-2.5-flare","gpt-image-2.5-sunburst"])
+        self.assertEqual(job["image_sizes"],["3840x2160"])
 
     def test_create_deepseek_run(self):
         payload=json.dumps({"protocol":"openai", "test_kind":"deepseek", "base_url":"https://api.deepseek.com", "api_key":"secret", "model":"deepseek-v4-pro", "case":"DS_V4_P0"}).encode()

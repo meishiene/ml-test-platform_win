@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 REQUEST_COLUMNS = [
-    "case", "protocol", "phase", "counted", "request_id", "dataset_id", "planned_epoch", "started_epoch", "completed_epoch",
+    "case", "protocol", "phase", "counted", "request_id", "dataset_id", "target_prompt_tokens", "max_tokens", "planned_epoch", "started_epoch", "completed_epoch",
     "send_delay_ms", "success", "http_status", "error_type", "error_message", "prompt_tokens", "completion_tokens",
     "reasoning_tokens", "visible_completion_tokens", "total_tokens", "finish_reason", "first_sse_seconds",
     "first_reasoning_seconds", "ttft_seconds", "ttfc_seconds", "e2e_seconds", "tpot_ms_per_visible_token", "tpot_token_basis",

@@ -16,6 +16,7 @@ import httpx
 import threading
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -54,6 +55,8 @@ GLM_SCRIPT = ROOT / "scripts" / "run_glm53.py"
 CONTRACT_SCRIPT = ROOT / "scripts" / "run_contracts.py"
 AUTH_SCRIPT = ROOT / "scripts" / "run_authenticity.py"
 GPT_IMAGE_SCRIPT = ROOT / "scripts" / "run_gpt_image.py"
+GPT_IMAGE_TOKEN_SCRIPT = ROOT / "scripts" / "run_gpt_image_4k_token.py"
+GPT_IMAGE_TOKEN_CASE = "GPT_IMAGE_4K_TOKEN_VERIFY"
 TEMP_SCRIPT = ROOT / "scripts" / "run_temp_cases.py"
 AWSB_SCRIPT = ROOT / "scripts" / "run_awsb.py"
 MODERATION_SCRIPT = ROOT / "scripts" / "run_moderation.py"
@@ -62,7 +65,7 @@ CONTRACT_CASES = {
     "DS_CONTRACT": {"family": "deepseek", "test_kind": "deepseek", "title": "公共契约探针（DeepSeek）", "description": "身份路由、参数错误、SSE、工具闭环与 DeepSeek Thinking 对照", "cost": "中", "protocols": ("openai", "volcengine")},
     "GLM_CONTRACT": {"family": "glm", "test_kind": "glm", "title": "公共契约探针（GLM）", "description": "身份路由、参数错误、SSE、工具闭环与 GLM 深度思考（仅开启）及 reasoning_effort", "cost": "中", "protocols": ("openai", "volcengine")},
 }
-CASES = ["T0", "B1", "SIMPLE_LOAD", "FULL_LOAD", "C0", "C1"]
+CASES = ["T0", "RANDOM_LOAD", "B1", "SIMPLE_LOAD", "FULL_LOAD", "C0", "C1"]
 LOAD_PRESETS = {
     "SIMPLE_LOAD": {
         "title": "简单压测",
@@ -88,6 +91,7 @@ MODERATION_CASES = {
 
 CASE_META = {
     "T0": ("冒烟测试", "约2分钟", "低"),
+    "RANDOM_LOAD": ("1K–20K 随机输入压测", "按请求完成时间", "按输入规模"),
     "B1": ("多规格基线", "约2-5分钟", "中"),
     "L1": ("日常短上下文", "至少4分钟", "中"),
     "L2": ("日常长上下文", "至少4分钟", "高"),
@@ -103,6 +107,7 @@ CASE_META = {
 
 LOAD_ADMISSION = {
     "T0": "前置连通性通过，且正式段恰好 10/10 请求成功。",
+    "RANDOM_LOAD": "严格完成输入的请求数；成功率≥99%；usage 完整率100%；至少95%的实际输入 Token 位于 1000–20000；截断率≤5%。",
     "B1": "2K、8K、16K、32K 每档均完成 4 个请求，合计 16 个请求零失败。",
     "L1": "成功率≥99%；TTFC P50≤5s、P90≤15s；TPOT P90≤60ms/token；TTFC P90≤同档 B1 的3倍；usage完整率100%、输入范围命中率≥95%、截断率≤5%。",
     "L2": "成功率≥99%；TTFC P50≤7s、P90≤20s；TPOT P90≤65ms/token；TTFC P90≤同档 B1 的3倍；usage完整率100%、输入范围命中率≥95%、截断率≤5%。",
@@ -172,6 +177,8 @@ def load_case_payload(name: str) -> dict[str, Any]:
     case = LOAD_CASES[name]
     if name == "B1":
         input_tokens, requests = "2K / 8K / 16K / 32K（每档4次）", 16
+    elif name == "RANDOM_LOAD":
+        input_tokens, requests = "每个请求随机 1,000–20,000", case.samples
     else:
         input_tokens = f"约 {case.target_prompt_tokens // 1024}K（{case.prompt_min}–{case.prompt_max}）"
         requests = case.samples if case.mode == "closed" else round(sum(rps * duration for _, rps, duration, counted in case.rps_stages if counted))
@@ -185,13 +192,16 @@ def load_case_payload(name: str) -> dict[str, Any]:
         request_text = f"成功目标 {requests}；最多尝试 {max_requests}"
     if case.mode == "closed" and case.measured_seconds:
         request_text += "（稳定期内受上限约束）"
-    return {"id": name, "test_kind": "load", "title": CASE_META[name][0], "description": "",
+    if name == "RANDOM_LOAD":
+        concurrency = f"手动输入（默认 {case.concurrency}）"
+        request_text = f"手动输入（默认 {requests}）"
+    return {"id": name, "test_kind": "load", "title": CASE_META[name][0], "description": ("逐请求随机生成合成业务输入，所有请求共享同一并发池。" if name == "RANDOM_LOAD" else ""),
             "duration": CASE_META[name][1], "cost": CASE_META[name][2], "protocols": list(PROTOCOLS),
             "concurrency": case.concurrency, "concurrency_text": concurrency, "requests": requests, "max_requests": (requests * 2 if name in {"T0", "L1", "L2", "L3", "L4", "L5", "O1"} else requests),
-            "request_text": request_text, "input_tokens": input_tokens,
+            "request_text": request_text, "input_tokens": input_tokens, "output_tokens": str(case.max_tokens),
             "warmup": seconds_text(case.warmup_seconds), "steady": seconds_text(case.measured_seconds) if case.mode == "closed" else seconds_text(sum(duration for _, _, duration, counted in case.rps_stages if counted)),
             "workload_profile": "混合业务：问答 / 总结 / 代码 / JSON / 多轮对话",
-            "admission": LOAD_ADMISSION[name]}
+            "admission": LOAD_ADMISSION[name], "manual_parameters": name == "RANDOM_LOAD"}
 
 def contract_case_payload(name: str) -> dict[str, Any]:
     item = CONTRACT_CASES[name]
@@ -221,6 +231,30 @@ def auth_case_payload(name: str) -> dict[str, Any]:
 
 def gpt_image_case_payload(name: str) -> dict[str, Any]:
     case = GPT_IMAGE_CASES[name]
+    if name == GPT_IMAGE_TOKEN_CASE:
+        return {
+            "id": name,
+            "test_kind": "gpt-image",
+            "source": "OpenAI 官方图片生成接口",
+            "executor": "scripts/run_gpt_image_4k_token.py",
+            "title": case.title,
+            "description": case.description,
+            "duration": "一次性执行（三个模型串行）",
+            "cost": case.cost,
+            "fixed_parameters": True,
+            "concurrency": 1,
+            "concurrency_text": "1（串行）",
+            "requests": 3,
+            "request_text": "3 次（每模型 1 次，每次 n=10）",
+            "input_tokens": "固定提示词；按 UTF-8 字节换算核验",
+            "warmup": None,
+            "steady": None,
+            "image_qualities": list(case.qualities),
+            "image_sizes": list(case.sizes),
+            "image_models": list(case.model_choices),
+            "admission": "三个模型均返回 10 张 3840×2160 图片；gpt-image-2 使用 high，两种 gpt-image-2.5 使用 max；每张 8–12 MiB；usage 输入、输出及明细 token 与提示词/图片字节换算值完全一致。",
+            "protocols": list(case.protocols),
+        }
     return {
         "id": name,
         "test_kind": "gpt-image",
@@ -318,6 +352,57 @@ def latest_result(case_name: str, since: float) -> Path | None:
     return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
 
 
+def interrupted_request_summary(
+    job: dict[str, Any], run_id: str, result: Path | None
+) -> dict[str, Any]:
+    """Summarize request rows already flushed before a child was interrupted."""
+    rows: list[dict[str, Any]] = []
+    requests_path = result / "requests.jsonl" if result else None
+    if requests_path and requests_path.is_file():
+        with requests_path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+    requested = int(job.get("requests") or len(rows))
+    completed = len(rows)
+    successful = sum(bool(row.get("success")) for row in rows)
+    error_distribution = dict(
+        Counter(
+            str(row.get("error_type") or "unknown_error")
+            for row in rows
+            if not row.get("success")
+        )
+    )
+    return {
+        "schema_version": "mltest.gpt-image.v1",
+        "record_id": run_id,
+        "batch_id": job.get("batch_id"),
+        "test_kind": job["test_kind"],
+        "case": job["case"],
+        "protocol": job["protocol"],
+        "base_url": job["base_url"],
+        "model": job["model"],
+        "status": "interrupted",
+        "requested": requested,
+        # Only completed rows are provable after SIGTERM. Unfinished requests
+        # may already have reached the gateway, so do not present this as an
+        # exact upstream-received count.
+        "sent": completed,
+        "completed": completed,
+        "successful": successful,
+        "failed": completed - successful,
+        "unfinished": max(0, requested - completed),
+        "error_distribution": error_distribution,
+        "admission_passed": False,
+        "error": "用户主动停止测试",
+        "results": [],
+    }
+
+
 def _execute_child(job: dict[str, Any]) -> None:
     run_id = job["id"]
     started_epoch = time.time()
@@ -349,7 +434,7 @@ def _execute_child(job: dict[str, Any]) -> None:
         })
     if job["test_kind"] == "awsb":
         env.update({"AWSB_API_KEY": job["api_key"], "AWSB_BASE_URL": job["base_url"], "AWSB_MODEL": job["model"], "AWSB_MESSAGES_PATH": "/v1/messages"})
-    script = TEMP_SCRIPT if job["test_kind"] == "temporary" else GPT_IMAGE_SCRIPT if job["test_kind"] == "gpt-image" else LEGAL_AGENT_BENCHMARK_SCRIPT if job["test_kind"] == "legal-agent-benchmark" else SWE_ATLAS_RF_SCRIPT if job["test_kind"] == "swe-atlas-rf" else SWE_ATLAS_TW_SCRIPT if job["test_kind"] == "swe-atlas-tw" else DEEPSWE_SCRIPT if job["test_kind"] == "deepswe" else ARXIVMATH_SCRIPT if job["test_kind"] == "arxivmath" else AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else RUN_SCRIPT
+    script = TEMP_SCRIPT if job["test_kind"] == "temporary" else GPT_IMAGE_TOKEN_SCRIPT if job["case"] == GPT_IMAGE_TOKEN_CASE else GPT_IMAGE_SCRIPT if job["test_kind"] == "gpt-image" else LEGAL_AGENT_BENCHMARK_SCRIPT if job["test_kind"] == "legal-agent-benchmark" else SWE_ATLAS_RF_SCRIPT if job["test_kind"] == "swe-atlas-rf" else SWE_ATLAS_TW_SCRIPT if job["test_kind"] == "swe-atlas-tw" else DEEPSWE_SCRIPT if job["test_kind"] == "deepswe" else ARXIVMATH_SCRIPT if job["test_kind"] == "arxivmath" else AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else RUN_SCRIPT
     # Most runners historically accept the case as a positional argument, but
     # the AWSB runner intentionally exposes it as a repeatable --case option.
     # Passing an AWSB case positionally makes argparse abort before any request
@@ -370,7 +455,7 @@ def _execute_child(job: dict[str, Any]) -> None:
         if job.get("requests") is not None: command.extend(["--samples", str(job["requests"])])
         if job.get("concurrency") is not None: command.extend(["--concurrency", str(job["concurrency"])])
         if job.get("warmup_seconds") is not None: command.extend(["--warmup-seconds", str(job["warmup_seconds"])])
-    if job["test_kind"] == "gpt-image":
+    if job["test_kind"] == "gpt-image" and job["case"] != GPT_IMAGE_TOKEN_CASE:
         command.extend(["--requests", str(job["requests"]), "--concurrency", str(job["concurrency"])])
     try:
         with log_path.open("w", encoding="utf-8", buffering=1) as stream:
@@ -397,14 +482,50 @@ def _execute_child(job: dict[str, Any]) -> None:
             except OSError:
                 failure_detail = f"测试未生成 summary.json，退出码 {returncode}"
         if cancelled and not summary:
-            summary = {"schema_version": "volcperf.result.v1", "record_id": run_id, "batch_id": job.get("batch_id"), "test_kind": job["test_kind"], "case": job["case"], "protocol": job["protocol"], "base_url": job["base_url"], "model": job["model"], "status": "interrupted", "admission_passed": False, "error": "用户主动停止测试", "results": []}
-            result_dir = RESULTS / f"{job['case']}-{time.strftime('%Y%m%d-%H%M%S')}"
+            if job["test_kind"] == "gpt-image":
+                summary = interrupted_request_summary(job, run_id, result)
+            else:
+                summary = {
+                    "schema_version": "volcperf.result.v1",
+                    "record_id": run_id,
+                    "batch_id": job.get("batch_id"),
+                    "test_kind": job["test_kind"],
+                    "case": job["case"],
+                    "protocol": job["protocol"],
+                    "base_url": job["base_url"],
+                    "model": job["model"],
+                    "status": "interrupted",
+                    "admission_passed": False,
+                    "error": "用户主动停止测试",
+                    "results": [],
+                }
+            result_dir = result or RESULTS / f"{job['case']}-{time.strftime('%Y%m%d-%H%M%S')}"
             result_dir.mkdir(parents=True, exist_ok=True)
             summary_path = result_dir / "summary.json"; report_path = result_dir / "report.md"
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            request_detail = result / "requests.jsonl" if result and (result / "requests.jsonl").exists() else None
+            request_detail = result_dir / "requests.jsonl" if (result_dir / "requests.jsonl").exists() else None
             detail_line = f"- 请求级明细：`{request_detail.relative_to(ROOT)}`\n" if request_detail else f"- 请求明细未找到；执行日志：`{log_path.relative_to(ROOT)}`\n"
-            report_path.write_text(f"# 测试中断报告\n\n- 用例：`{job['case']}`\n- 记录 ID：`{run_id}`\n- 模型：`{job['model']}`\n- 状态：用户主动停止\n- 子进程退出码：`{returncode}`\n" + detail_line, encoding="utf-8")
+            count_lines = ""
+            if job["test_kind"] == "gpt-image":
+                count_lines = (
+                    f"- 计划请求：{summary['requested']}\n"
+                    f"- 已完成：{summary['completed']}\n"
+                    f"- 成功：{summary['successful']}\n"
+                    f"- 失败：{summary['failed']}\n"
+                    f"- 未完成：{summary['unfinished']}\n"
+                    f"- 错误分布：`{json.dumps(summary['error_distribution'], ensure_ascii=False)}`\n"
+                )
+            report_path.write_text(
+                f"# 测试中断报告\n\n"
+                f"- 用例：`{job['case']}`\n"
+                f"- 记录 ID：`{run_id}`\n"
+                f"- 模型：`{job['model']}`\n"
+                f"- 状态：用户主动停止\n"
+                f"- 子进程退出码：`{returncode}`\n"
+                + count_lines
+                + detail_line,
+                encoding="utf-8",
+            )
             result = result_dir
         update(run_id, status=status, finished_at=now_iso(), exit_code=returncode,
                result_dir=str(result.relative_to(ROOT)) if result else None,
@@ -739,10 +860,19 @@ class Handler(BaseHTTPRequestHandler):
             if custom_concurrency is not None and (not isinstance(custom_concurrency, int) or not 1 <= custom_concurrency <= 1000): raise ValueError("并发数必须是 1～1000 的整数")
             if test_kind == "moderation" and custom_concurrency is None: custom_concurrency = 4
             if test_kind == "gpt-image":
-                if custom_requests is None or custom_concurrency is None:
-                    raise ValueError("图片压测必须填写总请求数和并发数")
                 if len(case_names) != 1:
                     raise ValueError("图片压测一次只能选择一个子项目")
+                if case_name == GPT_IMAGE_TOKEN_CASE:
+                    custom_requests, custom_concurrency = 3, 1
+                    image_quality, image_models, image_sizes = None, None, None
+                elif custom_requests is None or custom_concurrency is None:
+                    raise ValueError("图片压测必须填写总请求数和并发数")
+            if test_kind == "load" and "RANDOM_LOAD" in case_names:
+                if len(case_names) != 1:
+                    raise ValueError("随机输入压测一次只能单独运行")
+                if custom_requests is None or custom_concurrency is None:
+                    raise ValueError("随机输入压测必须填写请求数和并发数")
+                quick = False
             parsed = urlparse(base_url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError("base_url 必须是有效的 HTTP(S) 地址")

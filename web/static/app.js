@@ -64,7 +64,7 @@ function setModelPlaceholder(protocol){
 }
 
 function caseFacts(item){
-  const facts=[['测试案例数',item.case_count_text || (item.case_count != null ? `${item.case_count} 条` : null)],['并发 / 速率',item.concurrency_text],['输入 Token',item.input_tokens],['总请求数',item.request_text]];
+  const facts=[['测试案例数',item.case_count_text || (item.case_count != null ? `${item.case_count} 条` : null)],['并发 / 速率',item.concurrency_text],['输入 Token',item.input_tokens],['输出 Token 上限',item.output_tokens],['总请求数',item.request_text]];
   if(item.warmup)facts.push(['预热时间',item.warmup]);
   if(item.steady)facts.push(['稳定运行',item.steady]);
   if(item.workload_profile)facts.push(['负载画像',item.workload_profile]);
@@ -85,7 +85,7 @@ function selectedValues(selector){
 function renderImageConfig(){
   const box=$('#imageConfig'), item=state.cases.find(x=>state.selected.includes(x.id));
   if(!box) return;
-  const visible=state.testKind==='gpt-image' && item;
+  const visible=state.testKind==='gpt-image' && item && !item.fixed_parameters;
   box.style.display=visible?'flex':'none';
   if(!visible) return;
   const renderSelect=(id, values, selected)=>{const el=$(id);el.innerHTML=(values||[]).map(value=>`<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join('');[...el.options].forEach(option=>option.selected=selected.includes(option.value));};
@@ -98,11 +98,11 @@ function renderImageConfig(){
 }
 function updateCustomDefaults(){
   const item=state.cases.find(x=>x.id===state.selected[0]); const box=$('#customLoad');
-  if(!box) return; const fixedLoad=Boolean(item?.fixed_parameters); const enabled=item && ((state.testKind==='load' && !fixedLoad) || state.testKind==='gpt-image'); box.style.display=enabled?'flex':'none'; const moderationBox=$('#moderationConfig'); if(moderationBox) moderationBox.style.display=state.testKind==='moderation'?'flex':'none';
+  if(!box) return; const fixedLoad=Boolean(item?.fixed_parameters); const manualLoad=Boolean(item?.manual_parameters); const enabled=item && ((state.testKind==='load' && !fixedLoad) || (state.testKind==='gpt-image' && !fixedLoad)); box.style.display=enabled?'flex':'none'; const moderationBox=$('#moderationConfig'); if(moderationBox) moderationBox.style.display=state.testKind==='moderation'?'flex':'none';
   const isImage=state.testKind==='gpt-image';
-  const quickToggle=$('#quick').closest('.mode-toggle'); quickToggle.style.display=state.testKind==='load'&&!fixedLoad?'flex':'none'; if(fixedLoad)$('#quick').checked=false;
-  $('#customEnabled').disabled=isImage;
-  if(isImage){ $('#customEnabled').checked=true; $('#customEnabled').closest('.custom-toggle').querySelector('span').textContent='图片压测参数'; box.querySelector('small').textContent='图片压测严格使用下方手动输入的总请求数和并发数。'; }
+  const quickToggle=$('#quick').closest('.mode-toggle'); quickToggle.style.display=state.testKind==='load'&&!fixedLoad&&!manualLoad?'flex':'none'; if(fixedLoad||manualLoad)$('#quick').checked=false;
+  $('#customEnabled').disabled=isImage||manualLoad;
+  if(isImage||manualLoad){ $('#customEnabled').checked=true; $('#customEnabled').closest('.custom-toggle').querySelector('span').textContent=isImage?'图片压测参数':'随机压测参数'; box.querySelector('small').textContent=isImage?'图片压测严格使用下方手动输入的总请求数和并发数。':'随机输入压测严格使用下方手动输入的总请求数和并发数。'; }
   else { $('#customEnabled').checked=state.testKind==='load'?$('#customEnabled').checked:false; $('#customEnabled').closest('.custom-toggle').querySelector('span').textContent='启用自定义性能参数'; box.querySelector('small').textContent='关闭时使用测试项原有默认配置；开启后应用下方参数'; }
   if(enabled && !$('#customRequests').dataset.edited){ $('#customRequests').value=item.requests||1; $('#customConcurrency').value=item.concurrency||1; }
   if(enabled){ $('#customRequests').disabled=!$('#customEnabled').checked; $('#customConcurrency').disabled=!$('#customEnabled').checked; }
@@ -117,7 +117,7 @@ function updateSelectionUI(){
 function selectCase(id) {
   const item=state.cases.find(x=>x.id===id);
   const hasFixedLoad=state.selected.some(selectedId=>state.cases.find(x=>x.id===selectedId)?.fixed_parameters);
-  if(state.testKind==='open-source' || state.testKind==='gpt-image' || item?.fixed_parameters || hasFixedLoad) state.selected=[id];
+  if(state.testKind==='open-source' || state.testKind==='gpt-image' || item?.fixed_parameters || item?.manual_parameters || hasFixedLoad) state.selected=[id];
   else state.selected=state.selected.includes(id)?state.selected.filter(x=>x!==id):[...state.selected,id];
   if(state.selected.length!==1){$('#customRequests').dataset.edited='';$('#customConcurrency').dataset.edited='';}
   renderCases();updateSelectionUI(); if(state.testKind==='gpt-image') renderImageConfig();
@@ -199,7 +199,7 @@ $('#runForm').addEventListener('submit', async event => {
   const effectiveTestKind=state.testKind==='open-source'?(selectedItem?.test_kind||''):state.testKind;
   const isImage=effectiveTestKind==='gpt-image';
   if(effectiveTestKind==='load' && !quick && state.selected.some(id=>['C1','SIMPLE_LOAD','FULL_LOAD'].includes(id)) && !confirm(`${state.selected.join('、')} 包含高成本测试，会产生较高 Token 成本，确认立即排队执行？`)) return;
-  if(isImage && (!Number($('#customRequests').value) || !Number($('#customConcurrency').value))){message.textContent='图片压测请填写总请求数和并发数';return}
+  if((isImage && !selectedItem?.fixed_parameters || selectedItem?.manual_parameters) && (!Number($('#customRequests').value) || !Number($('#customConcurrency').value))){message.textContent='请填写总请求数和并发数';return}
   const button=$('#submitBtn'); button.disabled=true;
   try {
     const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:effectiveTestKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,quick,requests:(effectiveTestKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:effectiveTestKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customConcurrency').value):null),image_quality:isImage?selectedValues('#imageQuality'):null,image_models:isImage?selectedValues('#imageModels'):null,image_sizes:isImage?selectedValues('#imageSizes'):null})});

@@ -70,7 +70,23 @@ GPT_IMAGE_25 = Case(
     model_choices=("gpt-image-2.5-flare", "gpt-image-2.5-sunburst"),
 )
 
-CASES: dict[str, Case] = {
+GPT_IMAGE_4K_TOKEN_VERIFY = Case(
+    case_id="GPT_IMAGE_4K_TOKEN_VERIFY",
+    title="4K · n=10 · Token 验真",
+    description="gpt-image-2/high、gpt-image-2.5-flare/max、gpt-image-2.5-sunburst/max 各请求一次；固定 4K、n=10，核对 usage 与实际提示词/图片换算结果。",
+    project_model="gpt-image-2 + gpt-image-2.5-flare + gpt-image-2.5-sunburst",
+    qualities=("high", "max"),
+    sizes=("3840x2160",),
+    model_choices=("gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"),
+    cost="极高",
+)
+
+LOAD_CASES: dict[str, Case] = {
     GPT_IMAGE_2.case_id: GPT_IMAGE_2,
     GPT_IMAGE_25.case_id: GPT_IMAGE_25,
+}
+
+CASES: dict[str, Case] = {
+    **LOAD_CASES,
+    GPT_IMAGE_4K_TOKEN_VERIFY.case_id: GPT_IMAGE_4K_TOKEN_VERIFY,
 }

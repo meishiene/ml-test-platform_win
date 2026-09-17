@@ -17,7 +17,7 @@ import httpx
 from common.audit import redact
 from common.finalizer import finalize_result_dir
 
-from .cases import CASES, Case
+from .cases import LOAD_CASES, Case
 
 
 PROMPTS = (
@@ -30,6 +30,8 @@ PROMPTS = (
     "A warm lifestyle photograph of a wooden desk with a notebook, dried flowers, and a brass lamp beside a sunny window.",
     "A whimsical miniature coastal town built inside a seashell, tiny boats and people, soft storybook lighting.",
 )
+
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 
 
 def image_endpoint(base_url: str) -> str:
@@ -101,7 +103,14 @@ def _safe_response_headers(response: httpx.Response) -> dict[str, str]:
 
 def _response_summary(body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
-        return {"image_count": 0, "result_types": [], "response_id": None}
+        return {
+            "image_count": 0,
+            "result_types": [],
+            "response_id": None,
+            "created": None,
+            "usage": None,
+            "response_model": None,
+        }
     items = body.get("data")
     if not isinstance(items, list):
         items = []
@@ -246,6 +255,51 @@ async def _request_one(
     }
 
 
+def _failed_request_row(
+    request_plan: dict[str, Any],
+    *,
+    protocol: str,
+    base_url: str,
+    started_epoch: float,
+    elapsed_seconds: float,
+    error_type: str,
+    error_message: str,
+) -> dict[str, Any]:
+    """Build a complete request row even when transport/internal code fails."""
+    return {
+        "case": request_plan["case"],
+        "index": int(request_plan["index"]),
+        "request_id": f"{request_plan['case']}-{request_plan['index']}-{uuid.uuid4().hex[:10]}",
+        "started_at": datetime.fromtimestamp(started_epoch, timezone.utc).isoformat(),
+        "started_epoch": started_epoch,
+        "completed_epoch": time.time(),
+        "protocol": protocol,
+        "endpoint": image_endpoint(base_url),
+        "model": request_plan["model"],
+        "quality": request_plan["quality"],
+        "size": request_plan["size"],
+        "prompt": request_plan["prompt"],
+        "http_status": None,
+        "success": False,
+        "error_type": error_type,
+        "error_message": error_message,
+        "elapsed_seconds": elapsed_seconds,
+        "response_headers": {},
+        "image_count": 0,
+        "result_types": [],
+        "response_id": None,
+        "response_model": None,
+        "created": None,
+        "usage": None,
+        "transport_status": "error",
+        "response_body_shape": {
+            "keys": [],
+            "image_count": 0,
+            "result_types": [],
+        },
+    }
+
+
 async def _run_requests(
     *,
     request_plan: list[dict[str, Any]],
@@ -253,64 +307,104 @@ async def _run_requests(
     protocol: str,
     base_url: str,
     api_key: str,
+    request_timeout_seconds: float,
+    requests_path: Path,
 ) -> list[dict[str, Any]]:
     queue: asyncio.Queue[int] = asyncio.Queue()
     for index in range(len(request_plan)):
         queue.put_nowait(index)
     rows: list[dict[str, Any]] = []
     rows_lock = asyncio.Lock()
+    successful_count = 0
     timeout = httpx.Timeout(
-        float(os.getenv("GPT_IMAGE_REQUEST_TIMEOUT_SECONDS", "900")),
-        connect=30.0,
-        pool=30.0,
+        request_timeout_seconds,
+        connect=min(30.0, request_timeout_seconds),
+        write=min(30.0, request_timeout_seconds),
+        pool=min(30.0, request_timeout_seconds),
     )
     limits = httpx.Limits(
         max_connections=concurrency,
         max_keepalive_connections=concurrency,
         keepalive_expiry=60.0,
     )
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        limits=limits,
-        verify=True,
-        trust_env=False,
-    ) as client:
-        async def worker() -> None:
-            while True:
-                try:
-                    index = queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
-                try:
-                    row = await _request_one(
-                        client,
-                        request_plan=request_plan[index],
-                        protocol=protocol,
-                        base_url=base_url,
-                        api_key=api_key,
-                    )
+    # Incremental persistence is intentional: a SIGTERM or process crash must
+    # not discard every request that already completed.
+    with requests_path.open("w", encoding="utf-8", buffering=1) as request_stream:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            limits=limits,
+            verify=True,
+            trust_env=False,
+        ) as client:
+            async def worker() -> None:
+                nonlocal successful_count
+                while True:
+                    try:
+                        index = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    plan = request_plan[index]
+                    started_epoch = time.time()
+                    started_mono = time.perf_counter()
+                    try:
+                        # httpx read/write timeouts are inactivity timeouts. This
+                        # outer deadline is the absolute wall-clock request limit.
+                        async with asyncio.timeout(request_timeout_seconds):
+                            row = await _request_one(
+                                client,
+                                request_plan=plan,
+                                protocol=protocol,
+                                base_url=base_url,
+                                api_key=api_key,
+                            )
+                    except TimeoutError as exc:
+                        row = _failed_request_row(
+                            plan,
+                            protocol=protocol,
+                            base_url=base_url,
+                            started_epoch=started_epoch,
+                            elapsed_seconds=time.perf_counter() - started_mono,
+                            error_type="request_timeout",
+                            error_message=str(exc) or f"请求总时长超过 {request_timeout_seconds:g} 秒",
+                        )
+                    except Exception as exc:  # isolate one bad request from other workers
+                        row = _failed_request_row(
+                            plan,
+                            protocol=protocol,
+                            base_url=base_url,
+                            started_epoch=started_epoch,
+                            elapsed_seconds=time.perf_counter() - started_mono,
+                            error_type=f"internal_{type(exc).__name__}",
+                            error_message=str(exc),
+                        )
+                    finally:
+                        queue.task_done()
+
                     async with rows_lock:
                         rows.append(row)
+                        request_stream.write(json.dumps(redact(row), ensure_ascii=False) + "\n")
+                        request_stream.flush()
                         completed = len(rows)
+                        successful_count += int(bool(row["success"]))
+                        successful = successful_count
                     if (
                         completed % max(1, min(100, len(request_plan) // 20 or 1)) == 0
                         or completed == len(request_plan)
                     ):
                         print(
-                            f"\r{request_plan[0]['case']}: "
-                            f"{completed}/{len(request_plan)}",
+                            f"\r{request_plan[0]['case']}: 完成 {completed}/{len(request_plan)} "
+                            f"(成功 {successful}, 失败 {completed - successful}, "
+                            f"待完成 {len(request_plan) - completed})",
                             end="",
                             flush=True,
                         )
-                finally:
-                    queue.task_done()
 
-        await asyncio.gather(
-            *(
-                asyncio.create_task(worker())
-                for _ in range(min(concurrency, len(request_plan)))
+            await asyncio.gather(
+                *(
+                    asyncio.create_task(worker())
+                    for _ in range(min(concurrency, len(request_plan)))
+                )
             )
-        )
     print()
     return sorted(rows, key=lambda row: row["index"])
 
@@ -328,7 +422,9 @@ def _write_report(out: Path, summary: dict[str, Any]) -> None:
         "",
         f"- 生成时间（UTC）：{datetime.now(timezone.utc).isoformat()}",
         f"- 总请求数：{summary['requested']}",
-        f"- 成功：{summary['successful']}；失败：{summary['failed']}；成功率：{summary['success_rate']:.2%}",
+        f"- 完成：{summary['completed']}；成功：{summary['successful']}；失败：{summary['failed']}；成功率：{summary['success_rate']:.2%}",
+        f"- 请求总超时：{summary['request_timeout_seconds']} 秒",
+        f"- 错误分布：{json.dumps(summary['error_distribution'], ensure_ascii=False)}",
         f"- 并发数：{summary['concurrency']}",
         f"- 实际模型分布：{json.dumps(summary['model_distribution'], ensure_ascii=False)}",
         f"- 尺寸分布：{json.dumps(summary['size_distribution'], ensure_ascii=False)}",
@@ -351,7 +447,7 @@ def _write_report(out: Path, summary: dict[str, Any]) -> None:
 
 async def main_async(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GPT Image 并发图片压测")
-    parser.add_argument("case", choices=sorted(CASES))
+    parser.add_argument("case", choices=sorted(LOAD_CASES))
     parser.add_argument("--output-root", type=Path, default=Path("results"))
     parser.add_argument("--requests", type=int, required=True)
     parser.add_argument("--concurrency", type=int, required=True)
@@ -366,7 +462,7 @@ async def main_async(argv: list[str] | None = None) -> int:
     if not 1 <= args.concurrency <= 1000:
         parser.error("--concurrency 必须在 1～1000 之间")
 
-    case = CASES[args.case]
+    case = LOAD_CASES[args.case]
     qualities = _parse_positive_list(
         args.quality or os.getenv("GPT_IMAGE_QUALITIES"),
         case.qualities,
@@ -388,6 +484,17 @@ async def main_async(argv: list[str] | None = None) -> int:
         parser.error("缺少 GPT_IMAGE_API_KEY/VOLC_API_KEY 或 GPT_IMAGE_BASE_URL/VOLC_BASE_URL")
     if protocol not in {"openai", "volcengine"}:
         parser.error("图片压测仅支持 openai 或 volcengine 协议")
+    try:
+        request_timeout_seconds = float(
+            os.getenv(
+                "GPT_IMAGE_REQUEST_TIMEOUT_SECONDS",
+                str(DEFAULT_REQUEST_TIMEOUT_SECONDS),
+            )
+        )
+    except ValueError:
+        parser.error("GPT_IMAGE_REQUEST_TIMEOUT_SECONDS 必须是数字")
+    if request_timeout_seconds <= 0:
+        parser.error("GPT_IMAGE_REQUEST_TIMEOUT_SECONDS 必须大于 0")
 
     run_id = os.getenv("VOLC_RECORD_ID") or uuid.uuid4().hex[:16]
     out = args.output_root / f"{case.case_id}-{time.strftime('%Y%m%d-%H%M%S')}-{run_id[:6]}"
@@ -415,6 +522,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         "base_url": base_url,
         "requests": args.requests,
         "concurrency": args.concurrency,
+        "request_timeout_seconds": request_timeout_seconds,
         "qualities": qualities,
         "sizes": sizes,
         "models": models,
@@ -441,15 +549,16 @@ async def main_async(argv: list[str] | None = None) -> int:
         protocol=protocol,
         base_url=base_url,
         api_key=api_key,
-    )
-    (out / "requests.jsonl").write_text(
-        "\n".join(json.dumps(redact(row), ensure_ascii=False) for row in rows) + "\n",
-        encoding="utf-8",
+        request_timeout_seconds=request_timeout_seconds,
+        requests_path=out / "requests.jsonl",
     )
 
     successful = [row for row in rows if row["success"]]
     latencies = [float(row["elapsed_seconds"]) for row in rows]
     successful_latencies = [float(row["elapsed_seconds"]) for row in successful]
+    error_distribution = dict(
+        Counter(row["error_type"] for row in rows if row["error_type"])
+    )
     summary = {
         "schema_version": "mltest.gpt-image.v1",
         "record_id": run_id,
@@ -463,10 +572,12 @@ async def main_async(argv: list[str] | None = None) -> int:
         "sizes": sizes,
         "requested": args.requests,
         "sent": len(rows),
+        "completed": len(rows),
         "successful": len(successful),
         "failed": len(rows) - len(successful),
         "success_rate": len(successful) / len(rows) if rows else 0.0,
         "concurrency": args.concurrency,
+        "request_timeout_seconds": request_timeout_seconds,
         "latency_p50_seconds": percentile(successful_latencies, 0.50),
         "latency_p90_seconds": percentile(successful_latencies, 0.90),
         "latency_p99_seconds": percentile(successful_latencies, 0.99),
@@ -474,9 +585,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         "model_distribution": dict(Counter(row["model"] for row in rows)),
         "quality_distribution": dict(Counter(row["quality"] for row in rows)),
         "size_distribution": dict(Counter(row["size"] for row in rows)),
-        "error_distribution": dict(
-            Counter(row["error_type"] for row in rows if row["error_type"])
-        ),
+        "error_distribution": error_distribution,
         "checks": {
             "exact_request_count": {
                 "value": len(rows),

@@ -65,6 +65,9 @@ def summarize(case: Any, rows: list[dict[str, Any]], baseline_p90: float | None 
         checks["exactly_10_successes"] = _check(len(success), minimum=10, maximum=10)
     elif case.name.startswith("B1"):
         checks["error_rate"] = _check(1 - success_rate, maximum=0)
+    elif case.name == "RANDOM_LOAD":
+        checks["exact_request_count"] = _check(len(measured), minimum=case.samples, maximum=case.samples)
+        checks["success_rate"] = _check(success_rate, minimum=.99)
     elif case.name.startswith("L"):
         checks["sample_count"] = _check(len(measured), minimum=case.samples)
         checks["success_rate"] = _check(success_rate, minimum=.99)
@@ -91,11 +94,12 @@ def summarize(case: Any, rows: list[dict[str, Any]], baseline_p90: float | None 
         "prompt_p50_in_target_plus_minus_5pct": p50_in_target, "truncation_rate": truncation_rate,
         "tpot_valid_samples": len(tpots), "tpot_basis": sorted(set(r.get("tpot_token_basis") for r in success if r.get("tpot_token_basis"))),
     }
-    if case.name in {"L1", "L2", "L3", "L4", "L5", "O1"}:
+    if case.name in {"L1", "L2", "L3", "L4", "L5", "O1", "RANDOM_LOAD"}:
         checks["usage_complete_rate"] = _check(usage_rate, minimum=1)
         checks["input_tokens_in_range_rate"] = _check(input_rate, minimum=.95)
-        checks["prompt_p50_target"] = {"value": prompt_p50, "passed": p50_in_target}
         checks["truncation_rate"] = _check(truncation_rate, maximum=.05)
+        if case.name != "RANDOM_LOAD":
+            checks["prompt_p50_target"] = {"value": prompt_p50, "passed": p50_in_target}
     windows: list[dict[str, Any]] = []
     if case.name in {"C0", "C1"}:
         for phase, rps, duration, counted in case.rps_stages:

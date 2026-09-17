@@ -36,6 +36,7 @@ class Case:
 
 CASES = {
     "T0": Case("T0", "I1", 7500, 7200, 7900, 1024, "closed", concurrency=2, samples=10, core=True),
+    "RANDOM_LOAD": Case("RANDOM_LOAD", "RANDOM_1K_20K", 10500, 1000, 20000, 2048, "closed", concurrency=10, samples=100),
     # B1 合并执行 2K/8K/16K/32K，每档固定 4 次，合计 16 次；并发统一为 2。
     "B1": Case("B1", "I1", 7500, 7200, 50000, 1024, "closed", concurrency=2, samples=16),
     "L1": Case("L1", "I1", 7500, 7200, 7900, 1024, "closed", 50, 100, 60, 180, ttfc_p50_limit=5, ttfc_p90_limit=15, tpot_p90_limit=60, core=True),
