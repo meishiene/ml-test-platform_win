@@ -18,6 +18,7 @@ from common.audit import redact
 from common.finalizer import finalize_result_dir
 
 from .cases import LOAD_CASES, Case
+from volcperf.protocols import api_root
 
 
 PROMPTS = (
@@ -34,8 +35,8 @@ PROMPTS = (
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
 
 
-def image_endpoint(base_url: str) -> str:
-    return f"{base_url.rstrip('/')}/images/generations"
+def image_endpoint(base_url: str, protocol: str = "openai") -> str:
+    return f"{api_root(protocol, base_url)}/images/generations"
 
 
 def request_headers(protocol: str, api_key: str, request_id: str) -> dict[str, str]:
@@ -44,7 +45,7 @@ def request_headers(protocol: str, api_key: str, request_id: str) -> dict[str, s
         "Accept": "application/json",
         "X-Request-ID": request_id,
     }
-    if protocol in {"openai", "volcengine"}:
+    if protocol in {"openai", "openai_images", "volcengine"}:
         headers["Authorization"] = f"Bearer {api_key}"
     else:
         raise ValueError(f"图片压测暂不支持 {protocol} 协议")
@@ -195,7 +196,7 @@ async def _request_one(
     error_message: str | None = None
     try:
         response = await client.post(
-            image_endpoint(base_url),
+            image_endpoint(base_url, protocol),
             json=payload,
             headers=request_headers(protocol, api_key, request_id),
         )
@@ -228,7 +229,7 @@ async def _request_one(
         "started_epoch": started_epoch,
         "completed_epoch": time.time(),
         "protocol": protocol,
-        "endpoint": image_endpoint(base_url),
+        "endpoint": image_endpoint(base_url, protocol),
         "model": model,
         "quality": quality,
         "size": size,
@@ -274,7 +275,7 @@ def _failed_request_row(
         "started_epoch": started_epoch,
         "completed_epoch": time.time(),
         "protocol": protocol,
-        "endpoint": image_endpoint(base_url),
+        "endpoint": image_endpoint(base_url, protocol),
         "model": request_plan["model"],
         "quality": request_plan["quality"],
         "size": request_plan["size"],
@@ -482,8 +483,8 @@ async def main_async(argv: list[str] | None = None) -> int:
     protocol = (os.getenv("GPT_IMAGE_PROTOCOL") or os.getenv("VOLC_PROTOCOL") or "openai").lower()
     if not api_key or not base_url:
         parser.error("缺少 GPT_IMAGE_API_KEY/VOLC_API_KEY 或 GPT_IMAGE_BASE_URL/VOLC_BASE_URL")
-    if protocol not in {"openai", "volcengine"}:
-        parser.error("图片压测仅支持 openai 或 volcengine 协议")
+    if protocol not in {"openai", "openai_images", "volcengine"}:
+        parser.error("图片压测仅支持 OpenAI Images 或火山云协议")
     try:
         request_timeout_seconds = float(
             os.getenv(

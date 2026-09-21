@@ -81,7 +81,7 @@ def _build_request_plan_item(
         "sequence": sequence,
         "request_id": f"{case.name}-{sequence}-{uuid.uuid4().hex[:8]}",
         "dataset_id": record.id,
-        "target_prompt_tokens": record.target_prompt_tokens,
+        "target_prompt_tokens": getattr(record, "target_prompt_tokens", case.target_prompt_tokens),
         "max_tokens": case.max_tokens,
         "phase": phase,
         "counted": counted,

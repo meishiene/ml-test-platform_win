@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, json, os, shutil, subprocess, time
 from pathlib import Path
 from common.suite_runtime import finalize
+from volcperf.protocols import api_root
 
 ROOT=Path(__file__).resolve().parent.parent
 REPO_URL="https://github.com/datacurve-ai/deep-swe.git"
@@ -16,6 +17,7 @@ def main()->int:
  if shutil.which('pier') is None: raise SystemExit('缺少 Pier：请安装官方运行器 datacurve-pier（DeepSWE 官方推荐）')
  key=os.getenv('VOLC_API_KEY'); base=os.getenv('VOLC_BASE_URL'); model=os.getenv('VOLC_MODEL'); protocol=os.getenv('VOLC_PROTOCOL','volcengine')
  if not all((key,base,model)): raise SystemExit('缺少 VOLC_API_KEY/VOLC_BASE_URL/VOLC_MODEL')
+ base=api_root(protocol,base)
  provider='openai' if protocol in {'openai','volcengine'} else protocol
  full_model=model if '/' in model else f'{provider}/{model}'
  env=os.environ.copy(); env['OPENAI_API_KEY']=key; env['OPENAI_BASE_URL']=base.rstrip('/')

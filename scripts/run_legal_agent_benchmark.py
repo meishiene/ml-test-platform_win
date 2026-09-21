@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, json, os, re, shutil, subprocess, time
 from pathlib import Path
 from common.suite_runtime import finalize
+from volcperf.protocols import api_root
 ROOT=Path(__file__).resolve().parent.parent
 REPO=ROOT/'data_cache'/'harvey-labs-official'
 URL='https://github.com/harveyai/harvey-labs.git'
@@ -16,6 +17,7 @@ def main()->int:
  key=os.getenv('VOLC_API_KEY'); base=os.getenv('VOLC_BASE_URL'); model=os.getenv('VOLC_MODEL'); protocol=os.getenv('VOLC_PROTOCOL','volcengine')
  if not all((key,base,model)): raise SystemExit('缺少 VOLC_API_KEY/VOLC_BASE_URL/VOLC_MODEL')
  if protocol not in {'openai','volcengine'}: raise SystemExit('当前集成仅支持 OpenAI/火山云兼容端点')
+ base=api_root(protocol,base)
  env=os.environ.copy(); env.update({'OPENAI_API_KEY':key,'OPENAI_BASE_URL':base.rstrip('/'),'OPENAI_API_BASE':base.rstrip('/')})
  task_files=sorted((REPO/'tasks').rglob('task.json')); tasks=[str(p.parent.relative_to(REPO/'tasks')) for p in task_files]
  import random; random.Random(a.sample_seed).shuffle(tasks); tasks=tasks[:max(1,a.n_tasks)]

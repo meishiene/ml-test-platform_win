@@ -115,6 +115,8 @@ def test_image_request_uses_generation_endpoint_and_does_not_store_base64():
     assert row["image_count"] == 1
     assert "a-very-large-image-payload" not in str(row)
     assert image_endpoint("https://api.openai.com/v1/") == "https://api.openai.com/v1/images/generations"
+    assert image_endpoint("https://mux.la", "openai_images") == "https://mux.la/v1/images/generations"
+    assert image_endpoint("https://ark.example", "volcengine") == "https://ark.example/api/v3/images/generations"
 
 
 def test_request_plan_is_complete_and_reproducible_before_execution():
@@ -295,3 +297,101 @@ def test_4k_token_verifier_sends_one_n10_request_and_saves_images(tmp_path):
     assert row["checks"]["all_dimensions_4k"]["passed"] is False
     assert row["checks"]["all_images_around_10m"]["passed"] is False
     assert row["case_passed"] is False
+
+
+def _probe_png_b64() -> str:
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), (200, 30, 30)).save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+async def _run_probe(handler, save_image=None):
+    from scripts.probe_gpt_image import run_probe
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        return await run_probe(
+            client,
+            model="gpt-image-2.5-sunburst",
+            protocol="openai",
+            base_url="https://example.test/v1",
+            api_key="secret",
+            save_image=save_image,
+        )
+
+
+def test_probe_reports_callable_for_valid_b64_response():
+    from scripts.probe_gpt_image import DEFAULT_PROMPT, probe_exit_code
+
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "url": str(request.url),
+                "auth": request.headers.get("authorization"),
+                "payload": json.loads(request.content),
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "model": "gpt-image-2.5-sunburst",
+                "data": [{"b64_json": _probe_png_b64()}],
+                "usage": {"input_tokens": 21, "output_tokens": 6, "total_tokens": 27},
+            },
+        )
+
+    row = asyncio.run(_run_probe(handler))
+
+    assert seen[0]["url"] == "https://example.test/v1/images/generations"
+    assert seen[0]["auth"] == "Bearer secret"
+    assert seen[0]["payload"] == {
+        "model": "gpt-image-2.5-sunburst",
+        "prompt": DEFAULT_PROMPT,
+        "size": "1024x1024",
+        "quality": "low",
+        "n": 1,
+    }
+    assert row["callable"] is True
+    assert row["image_count"] == 1
+    assert row["result_types"] == ["b64_json"]
+    assert row["image_bytes"] > 0
+    assert probe_exit_code(row) == 0
+
+
+def test_probe_saves_url_result_and_flags_unusable_response():
+    from scripts.probe_gpt_image import probe_exit_code
+
+    async def url_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/images/generations"):
+            return httpx.Response(
+                200,
+                json={"model": "gpt-image-2.5-sunburst", "data": [{"url": "https://cdn.test/a.png"}]},
+            )
+        return httpx.Response(200, content=base64.b64decode(_probe_png_b64()))
+
+    async def empty_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"model": "gpt-image-2.5-sunburst", "data": []})
+
+    async def error_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"message": "model not found"}})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "probe.png"
+        url_row = asyncio.run(_run_probe(url_handler, target))
+        assert url_row["callable"] is True
+        assert url_row["result_types"] == ["url"]
+        assert target.exists() and target.stat().st_size > 0
+        assert url_row["saved_image"] == str(target)
+
+    empty_row = asyncio.run(_run_probe(empty_handler))
+    assert empty_row["callable"] is False
+    assert empty_row["error_type"] == "invalid_image_response"
+    assert empty_row["error_message"] == "HTTP 成功但响应未包含 data 图片结果"
+    assert probe_exit_code(empty_row) == 2
+
+    error_row = asyncio.run(_run_probe(error_handler))
+    assert error_row["callable"] is False
+    assert error_row["error_type"] == "http_404"
+    assert "model not found" in error_row["error_message"]
+    assert probe_exit_code(error_row) == 1

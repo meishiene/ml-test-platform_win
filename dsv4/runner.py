@@ -7,6 +7,7 @@ import os
 import time
 from pathlib import Path
 from common.suite_runtime import finalize
+from volcperf.protocols import api_root
 
 from .cases import CASES
 from .core import DeepSeekConfig, DeepSeekV4Runner, summarize_results, write_report
@@ -19,7 +20,7 @@ def config_from_env() -> DeepSeekConfig:
         raise ValueError("缺少 DS_API_KEY/DS_BASE_URL（Web 启动时由界面配置自动注入）")
     return DeepSeekConfig(
         api_key=api_key,
-        base_url=base_url.rstrip("/"),
+        base_url=api_root(os.getenv("VOLC_PROTOCOL", "volcengine"), base_url),
         beta_base_url=os.getenv("DS_BETA_BASE_URL"),
         anthropic_base_url=os.getenv("DS_ANTHROPIC_BASE_URL"),
         timeout=float(os.getenv("DS_REQUEST_TIMEOUT_SECONDS", "300")),

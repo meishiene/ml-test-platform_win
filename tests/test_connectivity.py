@@ -1,22 +1,46 @@
 import unittest
 from unittest.mock import patch
 from volcperf.config import ApiConfig
-from volcperf.connectivity import connectivity_endpoint, connectivity_payload, check_connectivity
+from volcperf.connectivity import connectivity_endpoint, connectivity_headers, connectivity_payload, check_connectivity
 
 class Response:
-    def __init__(self,status=200,data=None,text=''):
-        self.status_code=status;self._data=data if data is not None else {"ok":True};self.text=text
+    def __init__(self,status=200,data=None,text='',headers=None):
+        self.status_code=status;self._data=data if data is not None else {"ok":True};self.text=text;self.headers=headers or {}
     def json(self): return self._data
 
 class ConnectivityTests(unittest.TestCase):
     def test_openai_low_effort(self):
         cfg=ApiConfig('k','https://api.example/v1','m',protocol='volcengine')
         self.assertEqual(connectivity_endpoint(cfg),'https://api.example/v1/chat/completions')
-        body=connectivity_payload(cfg);self.assertEqual(body['max_tokens'],32);self.assertEqual(body['reasoning_effort'],'low')
+        body=connectivity_payload(cfg);self.assertEqual(body['max_tokens'],2048);self.assertEqual(body['reasoning_effort'],'low')
 
     def test_gemini_nonstream_endpoint(self):
         cfg=ApiConfig('k','https://google/v1beta','gemini/x',protocol='gemini')
         self.assertEqual(connectivity_endpoint(cfg),'https://google/v1beta/models/gemini%2Fx:generateContent')
+
+    def test_openai_responses_endpoint_and_payload(self):
+        cfg=ApiConfig('k','https://mux.la','gpt-x',protocol='openai_responses')
+        self.assertEqual(connectivity_endpoint(cfg),'https://mux.la/v1/responses')
+        body=connectivity_payload(cfg)
+        self.assertEqual(body['input'],'Reply with OK only.')
+        self.assertEqual(body['max_output_tokens'],2048)
+        self.assertNotIn('reasoning',body)
+        self.assertNotIn('stream',body)
+
+    def test_anthropic_k3_compatible_probe(self):
+        cfg=ApiConfig('k','https://mux.la','kimi-k3',protocol='anthropic')
+        body=connectivity_payload(cfg);request_headers=connectivity_headers(cfg)
+        self.assertEqual(body['max_tokens'],2048)
+        self.assertNotIn('thinking',body)
+        self.assertNotIn('stream',body)
+        self.assertEqual(request_headers['Accept'],'application/json')
+        self.assertEqual(request_headers['x-api-key'],'k')
+        self.assertEqual(request_headers['Authorization'],'Bearer k')
+
+    def test_openai_images_endpoint_and_payload(self):
+        cfg=ApiConfig('k','https://mux.la','gpt-image-2',protocol='openai_images')
+        self.assertEqual(connectivity_endpoint(cfg),'https://mux.la/v1/images/generations')
+        self.assertEqual(connectivity_payload(cfg)['quality'],'low')
 
     def test_success_does_not_require_visible_content(self):
         cfg=ApiConfig('k','https://api.example/v1','m',protocol='openai')
@@ -29,5 +53,16 @@ class ConnectivityTests(unittest.TestCase):
         fake=type('Client',(),{'__enter__':lambda s:s,'__exit__':lambda *a:None,'post':lambda *a,**k:Response(401,text='bad key')})
         with patch('volcperf.connectivity.httpx.Client',return_value=fake()): result=check_connectivity(cfg)
         self.assertFalse(result['passed']);self.assertIn('401',result['error'])
+
+    def test_html_upstream_failure_has_protocol_diagnosis(self):
+        cfg=ApiConfig('k','https://mux.la','kimi-k3',protocol='openai_responses')
+        error='{"error":{"message":"invalid character \'<\' looking for beginning of value"}}'
+        fake=type('Client',(),{'__enter__':lambda s:s,'__exit__':lambda *a:None,'post':lambda *a,**k:Response(500,text=error,headers={'x-request-id':'req-1'})})
+        with patch('volcperf.connectivity.httpx.Client',return_value=fake()): result=check_connectivity(cfg)
+        self.assertFalse(result['passed'])
+        self.assertIn('OpenAI Responses',result['diagnosis'])
+        self.assertIn('不是本地 Base URL 拼装错误',result['diagnosis'])
+        self.assertEqual(result['provider_request_id'],'req-1')
+        self.assertEqual(result['request']['endpoint'],'https://mux.la/v1/responses')
 
 if __name__=='__main__':unittest.main()

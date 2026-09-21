@@ -9,6 +9,7 @@ from common.model_contracts import PROFILES, load_profile_data, validate_identit
 from common.suite_runtime import finalize
 from common.test_framework import HttpExecutor
 from common.audit import AuditLog
+from volcperf.protocols import api_root
 
 async def main():
     ap=argparse.ArgumentParser(description="跨模型公共契约探针")
@@ -16,6 +17,7 @@ async def main():
     a=ap.parse_args(); env={"kvv":("VOLC_BASE_URL","VOLC_API_KEY","VOLC_MODEL"),"deepseek":("DS_BASE_URL","DS_API_KEY","DS_MODEL"),"glm":("GLM_BASE_URL","GLM_API_KEY","GLM_MODEL")}[a.family]
     base=a.base_url or os.getenv(env[0]); key=a.api_key or os.getenv(env[1]); model=a.model or os.getenv(env[2])
     if not base or not key or not model: raise SystemExit(f"缺少 {env[0]}/{env[1]}/{env[2]}")
+    base=api_root(os.getenv("VOLC_PROTOCOL","volcengine"),base)
     profile=PROFILES[a.family]; data=load_profile_data(a.family); results=[]
     out=a.output_root/f"{os.getenv('CONTRACT_CASE') or f'CONTRACT-{a.family.upper()}'}-{time.strftime('%Y%m%d-%H%M%S')}"; out.mkdir(parents=True,exist_ok=True)
     audit_path=out/'requests.jsonl'; request_seq=0

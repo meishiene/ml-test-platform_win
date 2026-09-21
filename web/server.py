@@ -24,7 +24,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from volcperf.protocols import PROTOCOLS, models_endpoint, models_headers, parse_models
+from volcperf.protocols import (
+    PROTOCOLS,
+    api_root,
+    models_endpoint,
+    models_headers,
+    normalize_base_url,
+    parse_models,
+    supports_test_kind,
+)
 from volcperf.config import ApiConfig
 from volcperf.cases import CASES as LOAD_CASES
 from volcperf.connectivity import check_connectivity
@@ -410,23 +418,24 @@ def _execute_child(job: dict[str, Any]) -> None:
     update(run_id, status="running", started_at=now_iso(), log_path=str(log_path.relative_to(ROOT)))
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    resolved_base_url = api_root(job["protocol"], job["base_url"])
     env.update({"VOLC_RECORD_ID": run_id, "VOLC_BATCH_ID": job.get("batch_id") or "", "VOLC_API_KEY": job["api_key"],
-                "VOLC_BASE_URL": job["base_url"], "VOLC_MODEL": job["model"], "VOLC_PROTOCOL": job["protocol"]})
+                "VOLC_BASE_URL": resolved_base_url, "VOLC_MODEL": job["model"], "VOLC_PROTOCOL": job["protocol"]})
     if job["test_kind"] == "deepseek":
-        env.update({"DS_API_KEY": job["api_key"], "DS_BASE_URL": job["base_url"], "DS_MODEL": job["model"]})
+        env.update({"DS_API_KEY": job["api_key"], "DS_BASE_URL": resolved_base_url, "DS_MODEL": job["model"]})
     if job["test_kind"] in {"glm", "glm_stream_retest"}:
-        env.update({"GLM_API_KEY": job["api_key"], "GLM_BASE_URL": job["base_url"], "GLM_MODEL": job["model"]})
+        env.update({"GLM_API_KEY": job["api_key"], "GLM_BASE_URL": resolved_base_url, "GLM_MODEL": job["model"]})
     if job["case"] in CONTRACT_CASES:
         family = CONTRACT_CASES[job["case"]]["family"]
-        env.update({"CONTRACT_CASE": job["case"], "DS_API_KEY": job["api_key"], "DS_BASE_URL": job["base_url"], "DS_MODEL": job["model"], "GLM_API_KEY": job["api_key"], "GLM_BASE_URL": job["base_url"], "GLM_MODEL": job["model"], "VOLC_API_KEY": job["api_key"], "VOLC_BASE_URL": job["base_url"], "VOLC_MODEL": job["model"]})
+        env.update({"CONTRACT_CASE": job["case"], "DS_API_KEY": job["api_key"], "DS_BASE_URL": resolved_base_url, "DS_MODEL": job["model"], "GLM_API_KEY": job["api_key"], "GLM_BASE_URL": resolved_base_url, "GLM_MODEL": job["model"], "VOLC_API_KEY": job["api_key"], "VOLC_BASE_URL": resolved_base_url, "VOLC_MODEL": job["model"]})
     if job["test_kind"] == "authenticity" or job["case"] in {"DS_V4_FINGERPRINT"}:
-        env.update({"VOLC_API_KEY": job["api_key"], "VOLC_BASE_URL": job["base_url"], "VOLC_MODEL": job["model"]})
+        env.update({"VOLC_API_KEY": job["api_key"], "VOLC_BASE_URL": resolved_base_url, "VOLC_MODEL": job["model"]})
     if job["test_kind"] == "gpt":
-        env.update({"GPT_API_KEY": job["api_key"], "GPT_BASE_URL": job["base_url"], "GPT_MODEL": job["model"], "GPT_PROTOCOL": job["protocol"]})
+        env.update({"GPT_API_KEY": job["api_key"], "GPT_BASE_URL": resolved_base_url, "GPT_MODEL": job["model"], "GPT_PROTOCOL": job["protocol"]})
     if job["test_kind"] == "gpt-image":
         env.update({
             "GPT_IMAGE_API_KEY": job["api_key"],
-            "GPT_IMAGE_BASE_URL": job["base_url"],
+            "GPT_IMAGE_BASE_URL": resolved_base_url,
             "GPT_IMAGE_PROTOCOL": job["protocol"],
             "GPT_IMAGE_QUALITIES": ",".join(job.get("image_quality") or []),
             "GPT_IMAGE_MODELS": ",".join(job.get("image_models") or []),
@@ -628,7 +637,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = unquote(urlparse(self.path).path)
         if path == "/api/protocols":
-            return self.json_response([{"id": item.id, "name": item.name, "default_base_url": item.default_base_url, "description": item.description, "model_hint": item.model_hint} for item in PROTOCOLS.values()])
+            return self.json_response([{
+                "id": item.id, "provider": item.provider, "name": item.name,
+                "default_base_url": item.default_base_url, "path_template": item.path_template,
+                "description": item.description, "model_hint": item.model_hint,
+                "family": item.family, "test_kinds": list(item.test_kinds),
+            } for item in PROTOCOLS.values()])
         if path == "/api/cases":
             load_cases = [load_case_payload(name) for name in CASES]
             kvv_cases = [capability_case_payload(name, "kvv", KVV_CASES[name], KVV_META[name]) for name in KVV_CASES]
@@ -796,11 +810,9 @@ class Handler(BaseHTTPRequestHandler):
                 base_url = str(payload.get("base_url", "")).strip()
                 api_key = str(payload.get("api_key", "")).strip()
                 model = str(payload.get("model", "")).strip()
-                parsed = urlparse(base_url)
                 if protocol not in PROTOCOLS:
                     raise ValueError("未知模型协议")
-                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                    raise ValueError("base_url 必须是有效的 HTTP(S) 地址")
+                base_url = normalize_base_url(base_url)
                 if not api_key:
                     raise ValueError("api_key 不能为空")
                 if not model:
@@ -816,11 +828,9 @@ class Handler(BaseHTTPRequestHandler):
                 protocol = str(payload.get("protocol", "")).strip().lower()
                 base_url = str(payload.get("base_url", "")).strip()
                 api_key = str(payload.get("api_key", "")).strip()
-                parsed = urlparse(base_url)
                 if protocol not in PROTOCOLS:
                     raise ValueError("未知模型协议")
-                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                    raise ValueError("base_url 必须是有效的 HTTP(S) 地址")
+                base_url = normalize_base_url(base_url)
                 if not api_key:
                     raise ValueError("api_key 不能为空")
                 try:
@@ -873,9 +883,7 @@ class Handler(BaseHTTPRequestHandler):
                 if custom_requests is None or custom_concurrency is None:
                     raise ValueError("随机输入压测必须填写请求数和并发数")
                 quick = False
-            parsed = urlparse(base_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ValueError("base_url 必须是有效的 HTTP(S) 地址")
+            base_url = normalize_base_url(base_url)
             if not api_key:
                 raise ValueError("api_key 不能为空")
             if not model:
@@ -921,7 +929,7 @@ class Handler(BaseHTTPRequestHandler):
                 if name in CONTRACT_CASES:
                     return CONTRACT_CASES[name]["protocols"]
                 return KVV_CASES[name].protocols if test_kind == "kvv" else DEEPSEEK_CASES[name].protocols if test_kind == "deepseek" else GLM_CASES[name].protocols if test_kind == "glm" else ("openai", "volcengine") if test_kind == "authenticity" else ("openai", "volcengine") if test_kind == "moderation" else ("anthropic",) if test_kind == "awsb" else tuple(PROTOCOLS)
-            unsupported = [name for name in case_names if protocol not in protocols_for(name)]
+            unsupported = [name for name in case_names if not supports_test_kind(protocol, test_kind, protocols_for(name))]
             if unsupported:
                 raise ValueError(f"{', '.join(unsupported)} 不支持 {protocol} 协议")
             preset_names = [name for name in case_names if name in LOAD_PRESETS]

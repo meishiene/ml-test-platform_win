@@ -11,6 +11,7 @@ from pathlib import Path
 from common.suite import ManifestCase, execute_manifest_case
 from common.test_framework import HttpExecutor, ResultLog
 from common.validators import status, status_2xx, status_error, content, usage, sse, json_content, tool_calls
+from volcperf.protocols import api_root
 
 ROOT=Path(__file__).resolve().parent.parent
 MANIFEST=ROOT/'test_cases/kimi_k3_temp_cases.json'
@@ -44,7 +45,8 @@ async def main_async(args):
     manifest=json.loads(MANIFEST.read_text(encoding='utf-8')); cases=[ManifestCase(x) for x in manifest['cases']]
     out=ROOT/'results'/f"K3_TEMP_SUITE-{time.strftime('%Y%m%d-%H%M%S')}"; out.mkdir(parents=True)
     log=ResultLog(out/'execution.jsonl'); results=[]
-    base_url=os.environ['VOLC_BASE_URL'].rstrip('/')+'/chat/completions'
+    protocol=os.getenv('VOLC_PROTOCOL','volcengine')
+    base_url=api_root(protocol,os.environ['VOLC_BASE_URL'])+'/chat/completions'
     base_headers={'Authorization':f"Bearer {os.environ['VOLC_API_KEY']}",'Content-Type':'application/json','Accept':'text/event-stream'}
     async with HttpExecutor(timeout=300,max_connections=10) as executor:
         for case in cases:

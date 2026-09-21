@@ -13,6 +13,7 @@ from typing import Any
 
 from .cases import CASES
 from common.suite_runtime import finalize
+from volcperf.protocols import api_root
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_KVV_HOME = ROOT / "vendor_verifier"
@@ -51,9 +52,10 @@ def validate_runtime(home: Path, python: Path) -> None:
 
 
 def build_command(home: Path, python: Path, suite: str, junit_path: Path, tool_report: Path) -> list[str]:
+    base_url = api_root(os.getenv("VOLC_PROTOCOL", "volcengine"), os.environ["VOLC_BASE_URL"])
     command = [
         str(python), "-m", "pytest", *SUITE_PATHS[suite],
-        "--base-url", os.environ["VOLC_BASE_URL"],
+        "--base-url", base_url,
         "--smoke-model", os.environ["VOLC_MODEL"],
         "--think-mode", think_mode(),
         f"--junitxml={junit_path}", "-ra", "-v",
@@ -96,7 +98,7 @@ def execute(case_id: str, output_root: Path) -> tuple[Path, dict[str, Any]]:
     out = output_root / f"{case_id}-{time.strftime('%Y%m%d-%H%M%S')}"
     out.mkdir(parents=True, exist_ok=False)
     env = os.environ.copy()
-    env.update({"KIMI_API_KEY": os.environ["VOLC_API_KEY"], "KIMI_BASE_URL": os.environ["VOLC_BASE_URL"],
+    env.update({"KIMI_API_KEY": os.environ["VOLC_API_KEY"], "KIMI_BASE_URL": api_root(os.getenv("VOLC_PROTOCOL", "volcengine"), os.environ["VOLC_BASE_URL"]),
                 "MODEL_NAME": os.environ["VOLC_MODEL"], "THINK_MODE": think_mode()})
     suite_results=[]; commands=[]
     with (out / "pytest.log").open("w", encoding="utf-8", buffering=1) as log:

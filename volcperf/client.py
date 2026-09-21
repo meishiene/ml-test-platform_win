@@ -20,6 +20,30 @@ def parse_event(protocol: str, obj: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {"content": "", "reasoning": "", "finish_reason": None,
                               "prompt_tokens": None, "completion_tokens": None,
                               "reasoning_tokens": None, "visible_tokens": None, "done": False}
+    if protocol == "openai_responses":
+        event_type = obj.get("type")
+        response = obj.get("response") or {}
+        usage = response.get("usage") or obj.get("usage") or {}
+        result["prompt_tokens"] = _int(usage.get("input_tokens"))
+        result["completion_tokens"] = _int(usage.get("output_tokens"))
+        details = usage.get("output_tokens_details") or {}
+        result["reasoning_tokens"] = _int(details.get("reasoning_tokens"))
+        if event_type == "response.output_text.delta":
+            result["content"] = str(obj.get("delta") or "")
+        elif event_type == "response.reasoning_summary_text.delta":
+            result["reasoning"] = str(obj.get("delta") or "")
+        elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+            result["done"] = True
+            if event_type == "response.completed":
+                result["finish_reason"] = "stop"
+            elif event_type == "response.incomplete":
+                reason = (response.get("incomplete_details") or {}).get("reason")
+                result["finish_reason"] = "length" if reason == "max_output_tokens" else (reason or "incomplete")
+            else:
+                result["finish_reason"] = "failed"
+        elif event_type == "error":
+            raise ValueError(json.dumps(obj.get("error") or obj, ensure_ascii=False))
+        return result
     if protocol in {"openai", "volcengine"}:
         usage = obj.get("usage") or {}
         result["prompt_tokens"] = _int(usage.get("prompt_tokens", usage.get("input_tokens")))
@@ -113,7 +137,8 @@ async def stream_chat(session: httpx.AsyncClient, config: ApiConfig, *, request_
                 p,c,r,v = (event[k] for k in ("prompt_tokens","completion_tokens","reasoning_tokens","visible_tokens"))
                 prompt_tokens = p if p is not None else prompt_tokens; completion_tokens = c if c is not None else completion_tokens
                 reasoning_tokens = r if r is not None else reasoning_tokens; visible_tokens = v if v is not None else visible_tokens
-                if row.get("response_object_id") is None and obj.get("id"): row["response_object_id"] = obj.get("id")
+                response_id = obj.get("id") or (obj.get("response") or {}).get("id")
+                if row.get("response_object_id") is None and response_id: row["response_object_id"] = response_id
                 if event["finish_reason"] is not None: row["finish_reason"] = event["finish_reason"]
                 if event["reasoning"]: first_reasoning = first_reasoning or now; row["reasoning_chunk_count"] += 1
                 if event["content"]: first_content = first_content or now; row["content_chunk_count"] += 1; row["content_char_count"] += len(event["content"])

@@ -22,9 +22,12 @@
     <section class="launcher panel">
       <div class="section-heading"><div><span class="step">01</span><h2>接口配置</h2></div><p>API Key 只在本次任务内存及子进程环境中使用，不写入记录。</p></div>
       <form id="runForm" autocomplete="off" data-form-type="other">
-        <div class="protocol-grid" id="protocolGrid"><div class="loading">正在载入协议…</div></div>
+        <div class="protocol-picker">
+          <label><span>API 协议 / 接口</span><select id="protocolSelect" required aria-describedby="protocolDescription"><option>正在载入协议…</option></select></label>
+          <small id="protocolDescription" class="field-hint">请选择实际请求协议</small>
+        </div>
         <div class="field-grid">
-          <label><span>BASE URL</span><input id="baseUrl" required type="url" placeholder="https://ark.cn-beijing.volces.com/api/v3" autocomplete="url" /></label>
+          <label><span>BASE URL（仅域名）</span><input id="baseUrl" required type="url" placeholder="https://mux.la" autocomplete="url" /><small id="endpointPreview" class="field-hint endpoint-preview">选择协议后自动拼装请求路径</small></label>
           <label><span>MODEL / ENDPOINT ID</span><div class="model-combobox"><div class="model-row"><input id="model" name="model_identifier" required type="text" placeholder="例如 ep-2026xxxx" autocomplete="off" autocapitalize="off" spellcheck="false" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="modelSuggestions" /><button type="button" id="queryModels">查询模型</button></div><div id="modelSuggestions" class="model-suggestions" role="listbox" aria-label="匹配的模型"></div></div><small id="modelHint" class="field-hint">可直接输入；查询后支持按名称或 ID 模糊匹配</small></label>
           <label class="key-field"><span>API KEY</span><div class="input-wrap"><input id="apiKey" name="api_access_token" required type="text" class="secret-masked" placeholder="输入 API Key（仅保留在当前页面内存）" autocomplete="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" /><button type="button" id="toggleKey">显示</button></div><small class="field-hint">不会写入浏览器存储或测试记录；页面刷新后清空</small></label>
         </div>

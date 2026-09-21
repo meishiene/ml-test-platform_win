@@ -90,12 +90,14 @@ class WebTests(unittest.TestCase):
         self.assertIn("2K / 8K / 16K / 32K",b1["input_tokens"])
         self.assertIn("L1–L5",simple["workload_profile"])
         self.assertTrue(simple["fixed_parameters"])
-        self.assertEqual(len(self.get_json("/api/protocols")), 4)
+        protocols=self.get_json("/api/protocols")
+        self.assertEqual(len(protocols), 6)
+        self.assertEqual(next(x for x in protocols if x["id"]=="openai_responses")["path_template"], "/v1/responses")
         with urlopen(self.base + "/") as response:
             self.assertIn("性能测试台", response.read().decode())
 
     def test_create_run_does_not_persist_key(self):
-        payload = json.dumps({"protocol":"anthropic", "test_kind":"load", "base_url":"https://example.com/v1", "api_key":"super-secret", "model":"ep-test", "case":"T0", "quick":True}).encode()
+        payload = json.dumps({"protocol":"anthropic", "test_kind":"load", "base_url":"https://example.com", "api_key":"super-secret", "model":"ep-test", "case":"T0", "quick":True}).encode()
         request = Request(self.base + "/api/runs", data=payload, method="POST", headers={"Content-Type":"application/json"})
         with patch.object(server.JOB_QUEUE, "put") as put:
             with urlopen(request) as response: created=json.load(response)
@@ -106,8 +108,17 @@ class WebTests(unittest.TestCase):
             self.assertEqual(put.call_args.args[0]["api_key"], "super-secret")
         self.assertNotIn("super-secret", self.db_path.read_bytes().decode("utf-8", "ignore"))
 
+    def test_create_openai_responses_load_run(self):
+        payload=json.dumps({"protocol":"openai_responses", "test_kind":"load", "base_url":"https://mux.la", "api_key":"secret", "model":"gpt-5-mini", "case":"T0", "quick":True}).encode()
+        with patch.object(server.JOB_QUEUE, "put") as put:
+            with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
+                result=json.load(response)
+        self.assertEqual(result["protocol"], "openai_responses")
+        self.assertEqual(result["base_url"], "https://mux.la")
+        self.assertEqual(put.call_args.args[0]["protocol"], "openai_responses")
+
     def test_create_load_presets(self):
-        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"SIMPLE_LOAD", "quick":True}).encode()
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com", "api_key":"secret", "model":"m", "case":"SIMPLE_LOAD", "quick":True}).encode()
         with patch.object(server.JOB_QUEUE, "put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 result=json.load(response)
@@ -119,7 +130,7 @@ class WebTests(unittest.TestCase):
         self.assertTrue(all(child["warmup_seconds"] == 0 for child in children))
         self.assertTrue(all(not child["quick"] for child in children))
 
-        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"FULL_LOAD"}).encode()
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com", "api_key":"secret", "model":"m", "case":"FULL_LOAD"}).encode()
         with patch.object(server.JOB_QUEUE, "put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})):
                 pass
@@ -127,7 +138,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual([(child["requests"],child["concurrency"]) for child in children], [(100,50)]*5+[(50,10)])
 
     def test_create_random_load_uses_exact_manual_request_and_concurrency_values(self):
-        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"RANDOM_LOAD", "quick":True, "requests":37, "concurrency":6}).encode()
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"load", "base_url":"https://example.com", "api_key":"secret", "model":"m", "case":"RANDOM_LOAD", "quick":True, "requests":37, "concurrency":6}).encode()
         with patch.object(server.JOB_QUEUE, "put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 result=json.load(response)
@@ -137,13 +148,13 @@ class WebTests(unittest.TestCase):
         self.assertFalse(job["quick"])
 
     def test_reject_removed_strict_suite(self):
-        payload=json.dumps({"protocol":"anthropic", "test_kind":"strict", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"STRICT_T0"}).encode()
+        payload=json.dumps({"protocol":"anthropic", "test_kind":"strict", "base_url":"https://example.com", "api_key":"secret", "model":"m", "case":"STRICT_T0"}).encode()
         with self.assertRaises(HTTPError) as caught:
             urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"}))
         self.assertEqual(caught.exception.code,400)
 
     def test_create_kvv_run(self):
-        payload=json.dumps({"protocol":"volcengine", "test_kind":"kvv", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"KVV_K3_FEATURES"}).encode()
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"kvv", "base_url":"https://example.com", "api_key":"secret", "model":"m", "case":"KVV_K3_FEATURES"}).encode()
         with patch.object(server.JOB_QUEUE, "put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 result=json.load(response)
@@ -152,9 +163,9 @@ class WebTests(unittest.TestCase):
 
     def test_create_gpt_image_run_keeps_randomization_choices(self):
         payload=json.dumps({
-            "protocol":"openai",
+            "protocol":"openai_images",
             "test_kind":"gpt-image",
-            "base_url":"https://api.openai.com/v1",
+            "base_url":"https://api.openai.com",
             "api_key":"secret",
             "model":"gpt-image-2",
             "case":"GPT_IMAGE_2",
@@ -175,9 +186,9 @@ class WebTests(unittest.TestCase):
 
     def test_create_fixed_gpt_image_4k_token_verification(self):
         payload=json.dumps({
-            "protocol":"openai",
+            "protocol":"openai_images",
             "test_kind":"gpt-image",
-            "base_url":"https://api.openai.com/v1",
+            "base_url":"https://api.openai.com",
             "api_key":"secret",
             "model":"gpt-image-2",
             "case":"GPT_IMAGE_4K_TOKEN_VERIFY",
@@ -203,7 +214,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(job["model"], "deepseek-v4-pro")
 
     def test_create_multi_kvv_batch(self):
-        payload=json.dumps({"protocol":"volcengine","test_kind":"kvv","base_url":"https://example.com/v1","api_key":"secret","model":"m","cases":["KVV_K3_FEATURES","KVV_PARAMS"]}).encode()
+        payload=json.dumps({"protocol":"volcengine","test_kind":"kvv","base_url":"https://example.com","api_key":"secret","model":"m","cases":["KVV_K3_FEATURES","KVV_PARAMS"]}).encode()
         with patch.object(server.JOB_QUEUE,"put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 batch=json.load(response)
@@ -227,20 +238,20 @@ class WebTests(unittest.TestCase):
         self.assertEqual(put.call_args.args[0]["model"],"deepseek-v4-pro-ga-260813")
 
     def test_accept_gateway_model_alias_for_deepseek_suite(self):
-        payload=json.dumps({"protocol":"volcengine", "test_kind":"deepseek", "base_url":"https://example.com/v1", "api_key":"secret", "model":"ep-customer-ds-prod", "case":"DS_V4_P0"}).encode()
+        payload=json.dumps({"protocol":"volcengine", "test_kind":"deepseek", "base_url":"https://example.com", "api_key":"secret", "model":"ep-customer-ds-prod", "case":"DS_V4_P0"}).encode()
         with patch.object(server.JOB_QUEUE,"put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 result=json.load(response)
         self.assertEqual(result["model"],"ep-customer-ds-prod")
 
     def test_reject_unsupported_kvv_protocol(self):
-        payload=json.dumps({"protocol":"anthropic", "test_kind":"kvv", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m", "case":"KVV_PARAMS"}).encode()
+        payload=json.dumps({"protocol":"anthropic", "test_kind":"kvv", "base_url":"https://example.com", "api_key":"secret", "model":"m", "case":"KVV_PARAMS"}).encode()
         with self.assertRaises(HTTPError) as caught:
             urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"}))
         self.assertEqual(caught.exception.code,400)
 
     def test_create_multi_load_batch(self):
-        payload=json.dumps({"protocol":"volcengine","test_kind":"load","base_url":"https://example.com/v1","api_key":"secret","model":"m","cases":["T0","B1"]}).encode()
+        payload=json.dumps({"protocol":"volcengine","test_kind":"load","base_url":"https://example.com","api_key":"secret","model":"m","cases":["T0","B1"]}).encode()
         with patch.object(server.JOB_QUEUE,"put") as put:
             with urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 batch=json.load(response)
@@ -253,7 +264,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(detail["children"]),2)
 
     def test_connectivity_check(self):
-        payload=json.dumps({"protocol":"volcengine", "base_url":"https://example.com/v1", "api_key":"secret", "model":"m"}).encode()
+        payload=json.dumps({"protocol":"volcengine", "base_url":"https://example.com", "api_key":"secret", "model":"m"}).encode()
         result={"name":"connectivity","passed":True,"http_status":200,"duration_ms":12.3}
         with patch.object(server, "check_connectivity", return_value=result) as checked:
             with urlopen(Request(self.base+"/api/connectivity/check",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
@@ -264,16 +275,23 @@ class WebTests(unittest.TestCase):
         self.assertEqual(config.api_key,"secret")
 
     def test_query_models(self):
-        payload=json.dumps({"protocol":"openai", "base_url":"https://example.com/v1", "api_key":"secret"}).encode()
+        payload=json.dumps({"protocol":"openai", "base_url":"https://example.com", "api_key":"secret"}).encode()
         fake = type("Response", (), {"status_code": 200, "text": "", "json": lambda self: {"data": [{"id":"model-b"},{"id":"model-a"}]}})()
         with patch.object(server.httpx, "get", return_value=fake) as get:
             with urlopen(Request(self.base+"/api/models/query",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
                 result=json.load(response)
         self.assertEqual([m["id"] for m in result["models"]], ["model-a", "model-b"])
         self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer secret")
+        self.assertEqual(get.call_args.args[0], "https://example.com/v1/models")
 
     def test_reject_bad_url(self):
         payload=json.dumps({"base_url":"bad", "api_key":"x", "model":"m", "case":"T0"}).encode()
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"}))
+        self.assertEqual(caught.exception.code,400)
+
+    def test_reject_base_url_with_path(self):
+        payload=json.dumps({"protocol":"openai", "base_url":"https://mux.la/v1", "api_key":"x", "model":"m", "case":"T0"}).encode()
         with self.assertRaises(HTTPError) as caught:
             urlopen(Request(self.base+"/api/runs",data=payload,method="POST",headers={"Content-Type":"application/json"}))
         self.assertEqual(caught.exception.code,400)

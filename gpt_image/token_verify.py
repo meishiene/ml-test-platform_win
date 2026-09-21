@@ -175,7 +175,7 @@ async def run_model(
         "case": CASE_ID,
         "request_id": request_id,
         "model": model,
-        "endpoint": image_endpoint(base_url),
+        "endpoint": image_endpoint(base_url, protocol),
         "prompt": PROMPT,
         "prompt_utf8_bytes": len(PROMPT.encode("utf-8")),
         "expected_input_tokens": expected_input_tokens(PROMPT),
@@ -187,7 +187,7 @@ async def run_model(
     }
     try:
         response = await client.post(
-            image_endpoint(base_url),
+            image_endpoint(base_url, protocol),
             json=payload,
             headers=request_headers(protocol, api_key, request_id),
         )
@@ -306,8 +306,8 @@ async def main_async(argv: list[str] | None = None) -> int:
     protocol = (os.getenv("GPT_IMAGE_PROTOCOL") or os.getenv("VOLC_PROTOCOL") or "openai").lower()
     if not api_key or not base_url:
         parser.error("缺少 GPT_IMAGE_API_KEY/VOLC_API_KEY 或 GPT_IMAGE_BASE_URL/VOLC_BASE_URL")
-    if protocol not in {"openai", "volcengine"}:
-        parser.error("图片测试仅支持 openai 或 volcengine 协议")
+    if protocol not in {"openai", "openai_images", "volcengine"}:
+        parser.error("图片测试仅支持 OpenAI Images 或火山云协议")
     try:
         timeout_seconds = float(os.getenv("GPT_IMAGE_4K_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
     except ValueError:

@@ -1,4 +1,4 @@
-const state = { protocols: [], protocol: 'volcengine', testKind: 'load', cases: [], runs: [], selected: [], filter: 'all', models: [], downloadSelected: new Set() };
+const state = { protocols: [], protocol: 'openai', testKind: 'load', cases: [], runs: [], selected: [], filter: 'all', models: [], downloadSelected: new Set() };
 const $ = (s) => document.querySelector(s);
 const escapeHtml = (s='') => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 
@@ -42,13 +42,28 @@ function kindLabel(kind){return kind==='open-source'?'开源测试集':kind==='k
 
 
 function renderProtocols() {
-  $('#protocolGrid').innerHTML=state.protocols.map(item=>`<button type="button" class="protocol-card ${state.protocol===item.id?'selected':''}" data-protocol="${item.id}"><span class="protocol-tag">${item.id.toUpperCase()}</span><b>${escapeHtml(item.name)}</b><small>${escapeHtml(item.description)}</small></button>`).join('');
-  document.querySelectorAll('.protocol-card').forEach(el=>el.onclick=()=>selectProtocol(el.dataset.protocol));
+  const select=$('#protocolSelect'), providers=[...new Set(state.protocols.map(item=>item.provider))];
+  select.innerHTML=providers.map(provider=>`<optgroup label="${escapeHtml(provider)}">${state.protocols.filter(item=>item.provider===provider).map(item=>`<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)} · ${escapeHtml(item.path_template)}</option>`).join('')}</optgroup>`).join('');
+  select.value=state.protocol;
+  select.onchange=()=>selectProtocol(select.value);
+}
+function protocolSupports(item, protocolId=state.protocol) {
+  const protocol=state.protocols.find(x=>x.id===protocolId);
+  return Boolean(protocol && item.protocols.includes(protocol.family) && (!protocol.test_kinds.length || protocol.test_kinds.includes(item.test_kind)));
+}
+function updateEndpointPreview() {
+  const item=state.protocols.find(x=>x.id===state.protocol), preview=$('#endpointPreview');
+  if(!item)return;
+  const base=$('#baseUrl').value.trim().replace(/\/+$/,'');
+  const model=$('#model').value.trim();
+  const path=item.path_template.replace('{model}',model?encodeURIComponent(model):'{model}');
+  preview.textContent=base?`请求地址：${base}${path}`:`路径将自动拼装：${path}`;
 }
 function selectProtocol(id) {
-  const previous=state.protocols.find(x=>x.id===state.protocol); const item=state.protocols.find(x=>x.id===id); state.protocol=id; renderProtocols();
+  const previous=state.protocols.find(x=>x.id===state.protocol); const item=state.protocols.find(x=>x.id===id); if(!item)return; state.protocol=id; renderProtocols();
   const base=$('#baseUrl'); if(!base.value || (previous && base.value===previous.default_base_url)) base.value=item.default_base_url;
-  setModelPlaceholder(item); renderCases(); state.selected=state.selected.filter(caseId=>state.cases.find(x=>x.id===caseId)?.protocols.includes(id)); if(!state.selected.length){const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&x.protocols.includes(id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint';
+  $('#protocolDescription').textContent=`${item.provider} · ${item.description}`; updateEndpointPreview();
+  setModelPlaceholder(item); renderCases(); state.selected=state.selected.filter(caseId=>{const selected=state.cases.find(x=>x.id===caseId);return selected&&protocolSupports(selected,id)}); if(!state.selected.length){const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x,id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint';
 }
 
 function setModelPlaceholder(protocol){
@@ -72,7 +87,7 @@ function caseFacts(item){
 }
 function renderCases() {
   const cases=state.cases.filter(item=>state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(item.test_kind):item.test_kind===state.testKind);
-  $('#caseGrid').innerHTML = cases.map(item => {const supported=item.protocols.includes(state.protocol);return `<button type="button" class="case-card ${state.selected.includes(item.id)?'selected':''} ${supported?'':'unsupported'}" data-case="${item.id}" ${supported?'':'disabled'}>
+  $('#caseGrid').innerHTML = cases.map(item => {const supported=protocolSupports(item);return `<button type="button" class="case-card ${state.selected.includes(item.id)?'selected':''} ${supported?'':'unsupported'}" data-case="${item.id}" ${supported?'':'disabled'}>
     <div class="case-head"><b>${item.id}</b><span class="cost">${supported?'成本 '+escapeHtml(item.cost):'当前协议不支持'}</span></div><div class="case-source">${escapeHtml(item.source||'专项自研代码')} · ${escapeHtml(item.executor||'')}</div><h3>${escapeHtml(item.title)}</h3>
     <dl class="case-facts">${caseFacts(item).map(([label,value])=>`<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value||'—')}</dd></div>`).join('')}</dl>
     <div class="admission-standard"><strong>准入标准</strong><p>${escapeHtml(item.admission||'以报告中的全部检查项通过为准。')}</p></div>
@@ -117,7 +132,8 @@ function updateSelectionUI(){
 function selectCase(id) {
   const item=state.cases.find(x=>x.id===id);
   const hasFixedLoad=state.selected.some(selectedId=>state.cases.find(x=>x.id===selectedId)?.fixed_parameters);
-  if(state.testKind==='open-source' || state.testKind==='gpt-image' || item?.fixed_parameters || item?.manual_parameters || hasFixedLoad) state.selected=[id];
+  const hasManualLoad=state.selected.some(selectedId=>state.cases.find(x=>x.id===selectedId)?.manual_parameters);
+  if(state.testKind==='open-source' || state.testKind==='gpt-image' || item?.fixed_parameters || item?.manual_parameters || hasFixedLoad || hasManualLoad) state.selected=[id];
   else state.selected=state.selected.includes(id)?state.selected.filter(x=>x!==id):[...state.selected,id];
   if(state.selected.length!==1){$('#customRequests').dataset.edited='';$('#customConcurrency').dataset.edited='';}
   renderCases();updateSelectionUI(); if(state.testKind==='gpt-image') renderImageConfig();
@@ -132,7 +148,7 @@ function renderRuns() {
   const visible=state.runs.filter(run=> state.filter==='all' || (state.filter==='running' ? ['queued','running'].includes(run.status) : state.filter==='failed' ? ['failed','interrupted'].includes(run.status) : run.status===state.filter));
   $('#runRows').innerHTML = visible.length ? visible.map(run => `<tr>
     <td class="select-col"><input type="checkbox" class="download-check" data-run-id="${run.id}" ${state.downloadSelected.has(run.id)?'checked':''} ${run.download_url?'':'disabled'} aria-label="选择下载 ${escapeHtml(run.case_name)}"></td><td class="run-title"><b><span class="kind-label">${kindLabel(run.test_kind)}</span> ${escapeHtml(run.is_batch?'批量聚合':run.case_name)} · ${escapeHtml(run.is_batch?run.case_ids.join(' + '):caseLabel(run.case_name))}${run.quick?' [快速]':''}</b><small>${escapeHtml(run.created_at)}</small><button class="record-id" title="点击复制记录 ID" onclick="copyRecordId('${run.id}')">ID ${run.id}</button></td>
-    <td class="endpoint"><b title="${escapeHtml(run.model)}">${escapeHtml(run.model)}</b><small>${escapeHtml((state.protocols.find(p=>p.id===run.protocol)?.name||run.protocol)+' · '+run.base_url)}</small></td>
+    <td class="endpoint"><b title="${escapeHtml(run.model)}">${escapeHtml(run.model)}</b><small>${escapeHtml((state.protocols.find(p=>p.id===run.protocol)?`${state.protocols.find(p=>p.id===run.protocol).provider} ${state.protocols.find(p=>p.id===run.protocol).name}`:run.protocol)+' · '+run.base_url)}</small></td>
     <td><span class="badge ${run.status}">${statusLabel(run.status)}</span></td>
     <td>${run.passed===true?'<b class="pass">通过</b>':run.passed===false?'<b class="fail">未通过</b>':'<span class="pending">待判定</span>'}</td>
     <td data-start="${run.id}">${formatDuration(run)}</td>
@@ -216,7 +232,10 @@ $('#connectivityBtn').onclick=async()=>{
   try{
     const response=await fetch('/api/connectivity/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({protocol:state.protocol,base_url,api_key,model})});
     const data=await response.json();
-    if(!response.ok || !data.passed) throw new Error(data.error||'连通性测试失败');
+    if(!response.ok || !data.passed){
+      const details=[data.error||'连通性测试失败',data.diagnosis,data.endpoint&&`请求地址：${data.endpoint}`,data.provider_request_id&&`请求 ID：${data.provider_request_id}`].filter(Boolean);
+      throw new Error(details.join('；'));
+    }
     result.textContent=`连接成功 · HTTP ${data.http_status} · ${Number(data.duration_ms).toFixed(0)} ms`;
     result.classList.add('success');toast('连通性测试通过');
   }catch(e){result.textContent=`连接失败：${e.message}`;result.classList.add('error')}
@@ -251,7 +270,9 @@ function renderModelSuggestions(query=''){
   box.classList.add('show');$('#model').setAttribute('aria-expanded','true');
   box.querySelectorAll('[data-model-id]').forEach(button=>button.onmousedown=event=>{event.preventDefault();selectSuggestedModel(button.dataset.modelId)});
 }
-$('#model').oninput=()=>renderModelSuggestions($('#model').value);
+$('#model').oninput=()=>{renderModelSuggestions($('#model').value);updateEndpointPreview()};
+$('#baseUrl').oninput=updateEndpointPreview;
+$('#baseUrl').onblur=()=>{const input=$('#baseUrl');input.value=input.value.trim().replace(/\/+$/,'');updateEndpointPreview()};
 $('#model').onfocus=()=>{if(state.models.length)renderModelSuggestions($('#model').value)};
 $('#model').onkeydown=event=>{if(event.key==='Escape')hideModelSuggestions()};
 document.addEventListener('mousedown',event=>{if(!event.target.closest('.model-combobox'))hideModelSuggestions()});
@@ -267,7 +288,9 @@ document.querySelectorAll('.kind-tab').forEach(button=>button.onclick=()=>{
   $('#quick').closest('.mode-toggle').style.display=state.testKind==='load'?'flex':'none';
   setModelPlaceholder();
   renderCases();
-  const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&x.protocols.includes(state.protocol));if(first)state.selected=[first.id];renderCases();updateSelectionUI();
+  let first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x));
+  if(!first){const matchingProtocol=state.protocols.find(protocol=>state.cases.some(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x,protocol.id)));if(matchingProtocol){selectProtocol(matchingProtocol.id);first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x));}}
+  if(first)state.selected=[first.id];renderCases();updateSelectionUI();updateEndpointPreview();
   if(state.testKind==='gpt-image' && first && !$('#model').value) $('#model').value=first.image_models?.[0]||first.title;
 });
 document.querySelectorAll('.filter').forEach(button=>button.onclick=()=>{
@@ -275,7 +298,7 @@ document.querySelectorAll('.filter').forEach(button=>button.onclick=()=>{
 });
 
 (async function init(){
-  try { state.protocols=await api('/api/protocols'); renderProtocols(); selectProtocol('volcengine'); state.cases=await api('/api/cases'); state.selected=['T0']; renderCases(); updateSelectionUI(); await refreshRuns(); }
+  try { state.protocols=await api('/api/protocols'); renderProtocols(); selectProtocol('openai'); state.cases=await api('/api/cases'); state.selected=['T0']; renderCases(); updateSelectionUI(); await refreshRuns(); }
   catch(e){$('#serviceState').innerHTML='<i style="background:#fb7185"></i>服务异常';toast(e.message)}
   setInterval(()=>refreshRuns(),3000); setInterval(()=>{state.runs.filter(r=>['queued','running'].includes(r.status)).forEach(r=>{const el=document.querySelector(`[data-start="${r.id}"]`);if(el)el.textContent=formatDuration(r)})},1000);
 })();
