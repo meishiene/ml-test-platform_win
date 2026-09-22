@@ -189,18 +189,44 @@ def validate_case(record, assertions):
 | R15 | **`kvv/runner.py:35`** 依赖 `vendor_verifier/.venv` 存在性（历史上因非法 venv 导致官方套件 0 用例通过）；`KVV_PYTHON` 需在 Web 注入才生效。 |
 | R16 | 死代码 / 双分叉分散注意力（见 3.4）。 |
 
+### 补记（同日新发现，级别 P0）
+
+**R17｜`vendor_verifier/.venv` 已不存在，官方 KVV 套件全部无法执行**
+
+R15 描述的是"依赖 `.venv` 存在性"这一设计脆弱点，本次实测确认该依赖**当前已经断裂**：
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+FAILED tests/test_kvv.py::OfficialKvvTests::test_existing_official_runtime
+E   ValueError: 未找到官方 KVV Python：/Users/liuyeyu/workspace/ml-test-platform/vendor_verifier/.venv/bin/python
+1 failed, 99 passed in 1.90s
+```
+
+`ls -la vendor_verifier/` 中已无 `.venv`。据 2026-09-10 的工作记录，该路径曾是**指向 `../.venv` 的软链**（当时为修复"官方套件 0 用例通过"而建），推测在后续重克隆 / 清理中丢失。
+
+影响：`KVV_K3_FEATURES`、`KVV_PARAMS`、`KVV_TOOL_SCHEMA` 三个测试项全部无法运行，`kvv/runner.py:validate_runtime()` 直接抛错。
+
+恢复（该路径已在 `.gitignore`，软链不会被提交）：
+
+```bash
+ln -s ../.venv vendor_verifier/.venv
+```
+
+建议同时评估 R15 提到的 `KVV_PYTHON` 环境变量方案，让依赖不再隐式绑定目录布局。
+
 ---
 
 ## 五、建议修复顺序
 
 1. **（立刻）补 `web/server.py` 的 5 个脚本路径常量**，同时给 `worker()` 加 `except Exception` 兜底：把任务标 failed + 记录 traceback，保证单任务失败不会终止队列。这是当前唯一"点一下就整站瘫痪"的问题。
-2. **（立刻）收紧监听**：`start.sh` 默认改 `127.0.0.1`，或加一层 Bearer 校验；对外暴露前不要用 `0.0.0.0`。
-3. **（高）修恒真漏洞**：`validate_case` 对空断言返回 `not_evaluable`；`validators.content()` / `tool_calls()` 无参时抛错而非恒真；补上这几条路径的单元测试。
-4. **（高）KVV 准入把 `skipped` 纳入判定**；同时决定 `test_tokenization_groundtruth.py` 是修复后启用还是明确标注为"不覆盖"。
-5. **（高）authenticity 补 `admission_passed`**，让 finalizer 能给出真实结论。
-6. **（中）统一重试策略**，至少在 L\*/C1 前置 429 退避；对齐两引擎的 TTFT/TPOT 口径。
-7. **（中）清理死代码与双分叉**（`utils.py`、`k3perf/awsb.py`、`scripts/run_.py`、无生产引用的 `common/*`），减少后续改动踩空。
-8. **（中）给 `results/` 做一次完整端到端回归**：目前只有 1 条真实记录，接线类问题（如 R1）正是靠这个才能被发现。
+2. **（立刻）恢复 `vendor_verifier/.venv`**：`ln -s ../.venv vendor_verifier/.venv`。一条命令让 3 个 KVV 测试项恢复可用（当前完全跑不了，见 R17）；同时按 R15 评估改用 `KVV_PYTHON` 显式指定解释器，别让依赖隐式绑定目录布局。
+3. **（立刻）收紧监听**：`start.sh` 默认改 `127.0.0.1`，或加一层 Bearer 校验；对外暴露前不要用 `0.0.0.0`。
+4. **（高）修恒真漏洞**：`validate_case` 对空断言返回 `not_evaluable`；`validators.content()` / `tool_calls()` 无参时抛错而非恒真；补上这几条路径的单元测试。
+5. **（高）KVV 准入把 `skipped` 纳入判定**；同时决定 `test_tokenization_groundtruth.py` 是修复后启用还是明确标注为"不覆盖"。
+6. **（高）authenticity 补 `admission_passed`**，让 finalizer 能给出真实结论。
+7. **（中）统一重试策略**，至少在 L\*/C1 前置 429 退避；对齐两引擎的 TTFT/TPOT 口径。
+8. **（中）清理死代码与双分叉**（`utils.py`、`k3perf/awsb.py`、`scripts/run_.py`、无生产引用的 `common/*`），减少后续改动踩空。
+9. **（中）给 `results/` 做一次完整端到端回归**：目前只有 1 条真实记录，接线类问题（如 R1）正是靠这个才能被发现。
 
 ---
 
