@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
@@ -30,6 +31,29 @@ class WebTests(unittest.TestCase):
     def get_json(self, path):
         with urlopen(self.base + path) as response:
             return json.load(response)
+
+    def test_latest_result_finds_temporary_suite_for_single_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = Path(directory)
+            suite_result = results / "K3_TEMP_SUITE-20260922-172637"
+            suite_result.mkdir()
+            with patch.object(server, "RESULTS", results):
+                found = server.latest_result("CACHE-HIT-10", time.time() - 2)
+            self.assertEqual(found, suite_result)
+
+    def test_single_temporary_run_persists_selected_case_name(self):
+        payload = json.dumps({
+            "protocol": "volcengine", "test_kind": "temporary",
+            "base_url": "https://example.com", "api_key": "secret", "model": "kimi-k3",
+            "case": "K3_TEMP_SUITE", "temporary_case": "CACHE-HIT-10",
+        }).encode()
+        with patch.object(server.JOB_QUEUE, "put") as put:
+            with urlopen(Request(self.base + "/api/runs", data=payload, method="POST",
+                                 headers={"Content-Type": "application/json"})) as response:
+                result = json.load(response)
+        self.assertEqual(result["case_name"], "CACHE-HIT-10")
+        self.assertEqual(result["case_title"], "90% 稳定前缀命中探测")
+        self.assertEqual(put.call_args.args[0]["temporary_case"], "CACHE-HIT-10")
 
     def test_interrupted_image_summary_keeps_partial_request_counts(self):
         with tempfile.TemporaryDirectory() as directory:

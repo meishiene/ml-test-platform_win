@@ -168,6 +168,14 @@ def temporary_case_payload() -> dict[str, Any]:
             "steady": None, "admission": "可选择其中一个合并案例执行；不选择时运行全部合并案例。",
             "display_only": True, "atomic_case_count": atomic_count, "case_options": options}
 
+
+def temporary_case_title(case_id: str) -> str | None:
+    """Return the merged temporary case name for a persisted single-case run."""
+    if not case_id or case_id == "K3_TEMP_SUITE":
+        return None
+    case = find_case(temporary_merged_cases(), case_id)
+    return case.name if case else None
+
 def moderation_case_payload(name: str) -> dict[str, Any]:
     title, desc, duration, cost, dataset = MODERATION_CASES[name]
     path = MODERATION_ROOT / dataset / "cases.jsonl"
@@ -362,8 +370,11 @@ def update(run_id: str, **values: Any) -> None:
         connection.execute(f"UPDATE runs SET {assignments} WHERE id=?", (*values.values(), run_id))
 
 
-def latest_result(case_name: str, since: float) -> Path | None:
-    names = [case_name]
+def latest_result(case_name: str, since: float, *, aliases: tuple[str, ...] = ()) -> Path | None:
+    # 临时测试脚本按套件统一输出 K3_TEMP_SUITE-*，即使只执行了其中
+    # 一个合并案例（例如 CACHE-HIT-10）。收尾阶段仍按选中的案例名查找
+    # 会找不到 summary/report，导致单案例记录只有日志而没有报告按钮。
+    names = [case_name, *aliases]
     # 内容审核执行脚本会将 MOD_* 展示用例名映射为 moderation_test_project 下的实际目录名。
     moderation_names = {
         "MOD_GENERAL_COMMON": "general_common",
@@ -493,7 +504,8 @@ def _execute_child(job: dict[str, Any]) -> None:
             returncode = process.wait()
             with ACTIVE_LOCK:
                 ACTIVE_PROCESSES.pop(run_id, None)
-        result = latest_result(job["case"], started_epoch)
+        result_aliases = ("K3_TEMP_SUITE",) if job["test_kind"] == "temporary" else ()
+        result = latest_result(job["case"], started_epoch, aliases=result_aliases)
         summary_path = result / "summary.json" if result else None
         report_path = result / "report.md" if result else None
         summary = enrich_summary(summary_path, record_id=run_id, batch_id=job.get("batch_id"), test_kind=job["test_kind"],
@@ -608,6 +620,7 @@ def public_run(row: sqlite3.Row) -> dict[str, Any]:
     data["quick"] = bool(data["quick"])
     data["is_batch"] = bool(data.get("is_batch"))
     data["case_ids"] = json.loads(data["case_ids"]) if data.get("case_ids") else [data["case_name"]]
+    data["case_title"] = temporary_case_title(data["case_name"]) if data.get("test_kind") == "temporary" else None
     data["passed"] = None if data["passed"] is None else bool(data["passed"])
     data["report_url"] = f"/api/runs/{data['id']}/report" if data.get("report_path") else None
     data["summary_url"] = f"/api/runs/{data['id']}/summary" if data.get("summary_path") else None
@@ -994,9 +1007,10 @@ class Handler(BaseHTTPRequestHandler):
                 JOB_QUEUE.put({"id":run_id,"is_batch":True,"test_kind":test_kind,"api_key":api_key,"children":children})
             else:
                 execution = execution_cases[0]
+                stored_case_name = temporary_case or case_name if test_kind == "temporary" and temporary_case else case_name
                 with db() as connection:
                     connection.execute("INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,case_ids) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                       (run_id,test_kind,case_name,protocol,base_url,model,"queued",int(quick),created,json.dumps(case_names)))
+                                       (run_id,test_kind,stored_case_name,protocol,base_url,model,"queued",int(quick),created,json.dumps(case_names)))
                 JOB_QUEUE.put({"id":run_id,"test_kind":test_kind,"case":execution["name"],"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"temporary_case":temporary_case})
             with db() as connection:
                 row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
