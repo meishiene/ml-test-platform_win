@@ -57,9 +57,17 @@ def aggregate(plan: TempCase, group_results: list[dict]) -> dict:
         return {**group_results[0], 'case_id': plan.id, 'category': plan.category, 'case_ids': list(plan.case_ids), 'repetitions': 1, 'merged': plan.merged}
     statuses={item['status'] for item in group_results}
     status_value='passed' if statuses=={'passed'} else 'failed' if 'failed' in statuses else 'not_evaluable'
+    reasons=[(item['case_id'], '；'.join(item['failure_reasons'])) for item in group_results if item.get('failure_reasons')]
+    # 合并案例下多条请求往往是同一个原因（例如整批都缺 messages），逐个铺开会
+    # 把报告撑成一行巨文；同因时折叠成一条并标明次数。
+    distinct={text for _, text in reasons}
+    if len(reasons)>1 and len(distinct)==1:
+        detail=[f"{len(reasons)} 次请求同一原因：{distinct.pop()}"]
+    else:
+        detail=[f"{case_id}: {text}" for case_id, text in reasons]
     return {'case_id':plan.id, 'category':plan.category, 'case_ids':list(plan.case_ids), 'repetitions':len(group_results),
             'merged':plan.merged, 'status':status_value, 'passed':status_value=='passed', 'checks':[],
-            'failure_reasons':[f"{item['case_id']}: {'；'.join(item['failure_reasons'])}" for item in group_results if item.get('failure_reasons')]}
+            'failure_reasons':detail}
 
 async def main_async(args):
     atomic_cases=manifest_cases(load_manifest(MANIFEST))

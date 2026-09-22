@@ -14,20 +14,33 @@ from .test_framework import ExecutionRecord, HttpExecutor, ResultLog, validate_c
 from .validators import status, status_2xx, status_error, content, usage, sse, json_content, tool_calls
 
 class ManifestCase:
+    # 只描述测试场景、不构成可发送请求体的字段。它们既不是请求参数，也不能凭
+    # 它们伪造一个"看起来像请求"的东西（架构约定：不把 scenario 降级为普通请求）。
+    SCENARIO_ONLY_KEYS = frozenset({
+        "headers", "scenario", "input_tokens_target", "concurrency", "repetition",
+        "batch", "phase", "wait_seconds", "warm_input_tokens_target",
+        "same_prefix_byte_exact", "append_tail",
+    })
+
     def __init__(self, raw: dict[str, Any]):
         self.raw = raw; self.id = raw["id"]; self.request = raw.get("request") or {}
         self.expected = raw.get("expected") or {}
         self.assertions = raw.get("assertions") or []
 
+    def blocking_keys(self) -> list[str]:
+        """用例里被执行器剥离的场景字段，用于生成可读的 not_evaluable 原因。"""
+        return sorted(k for k in self.request if k in self.SCENARIO_ONLY_KEYS)
+
     def build_payload(self, *, model: str) -> dict[str, Any] | None:
-        # A scenario without a concrete request must not be silently normalized.
-        if "scenario" in self.request and not any(k in self.request for k in ("messages", "tools", "response_format")):
-            return None
-        payload = copy.deepcopy({k:v for k,v in self.request.items() if k not in {"headers", "scenario", "input_tokens_target", "concurrency", "repetition", "batch", "phase", "wait_seconds", "warm_input_tokens_target", "same_prefix_byte_exact", "append_tail"}})
+        payload = copy.deepcopy({k:v for k,v in self.request.items() if k not in self.SCENARIO_ONLY_KEYS})
         payload.setdefault("model", model)
         if "messages" not in payload and "input_tokens_target" in self.request:
             target = int(self.request["input_tokens_target"])
             payload["messages"] = [{"role":"user", "content":("性能测试固定前缀。" * max(1, target * 4 // 8))[:target * 4]}]
+        # 没有 messages 就不是一个可发送的 chat 请求。发出去必然被上游 400 拒绝，
+        # 从而把一个"用例没写完"的问题误报成"被测模型不达标"——这是最坏的假阴性。
+        if "messages" not in payload:
+            return None
         return payload
 
     def validators(self) -> list[Callable]:
@@ -57,7 +70,9 @@ def not_evaluable(case_id: str, reason: str) -> dict[str, Any]:
 
 async def execute_manifest_case(executor: HttpExecutor, log: ResultLog, case: ManifestCase, *, model: str, url: str, base_headers: dict[str,str]) -> dict[str,Any]:
     payload=case.build_payload(model=model)
-    if payload is None: return not_evaluable(case.id, "案例只有 scenario 描述，缺少可执行请求；未伪造普通请求")
+    if payload is None:
+        keys="、".join(f"`{k}`" for k in case.blocking_keys()) or "无"
+        return not_evaluable(case.id, f"用例未提供可发送的请求内容：请求里只有 {keys} 这类场景/传输字段，没有 `messages`；未伪造请求，需要专用执行器或在清单中补齐")
     headers=dict(base_headers); headers.update(case.request.get("headers") or {})
     headers.setdefault("X-Request-ID", f"{case.id}-{uuid.uuid4().hex[:10]}")
     stream=bool(payload.get("stream"))
