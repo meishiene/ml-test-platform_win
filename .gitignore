@@ -9,3 +9,6 @@ results/*
 web/data/*.db
 web/data/*.db-*
 results/web-*.log
+
+# 本地回滚检查点（临时快照，不入库）
+rollback-checkpoints/

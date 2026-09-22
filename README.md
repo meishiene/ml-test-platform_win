@@ -125,7 +125,7 @@ L1–L4 另需 `TTFC P90 ≤ 同档 B1 基线的 3 倍`，因此**必须先有 B
 | `gpt-image` | `GPT_IMAGE_2` / `GPT_IMAGE_25` / `GPT_IMAGE_4K_TOKEN_VERIFY` | 图像并发压测 + 4K token 验真 |
 | `awsb` | `AWSB-O5-01`–`04` + `AWSB-O5-CACHE` | Anthropic Messages 协议网关自检（身份 / thinking / 边界 / 流式工具 / 缓存） |
 | `open-source` | `ARXIVMATH` / `DEEPSWE` / `SWE_ATLAS_TW` / `SWE_ATLAS_RF` / `LEGAL_AGENT_BENCHMARK` | 5 项开源基准，走官方数据集与官方 verifier（**当前 Web 侧接线缺失，见已知问题**） |
-| `temporary` | `K3_TEMP_SUITE`(68) | 清单驱动的原子用例，唯一完整走通四层契约的套件 |
+| `temporary` | `K3_TEMP_SUITE`（24 个合并案例 / 68 条原子请求） | 清单驱动用例；同 `category` 且同 `request.batch` 的重复请求合并为一个逻辑案例，执行时逐条发起、分别留证。唯一完整走通四层契约的套件 |
 | `moderation` | `MOD_GENERAL_COMMON` / `MOD_PARTNER_COMMON` / `MOD_PARTNER_SMOKE` | SillyTavern 上下文劫持 + 关键词变体，含不变性分组 |
 | `authenticity` | `DS_AUTH_FINGERPRINT` / `DS_V4_FINGERPRINT` | 6 探针：动态 required 工具、随机 JSON Schema、多轮记忆、reasoning 字段、SSE 完整性、静默吞参对照 |
 
@@ -161,9 +161,12 @@ L1–L4 另需 `TTFC P90 ≤ 同档 B1 基线的 3 倍`，因此**必须先有 B
 .venv/bin/python scripts/run_authenticity.py DS_V4_FINGERPRINT
 .venv/bin/python scripts/run_moderation.py MOD_GENERAL_COMMON
 
-# 清单驱动的原子用例
-.venv/bin/python scripts/run_temp_cases.py
+# 清单驱动的临时用例（同类项已合并：24 个逻辑案例 / 68 条原子请求）
+.venv/bin/python scripts/run_temp_cases.py --output-root results
+VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /tmp/probe   # 只跑「16K 输入 TTFT」这一个合并案例（10 次请求）
 ```
+
+`scripts/run_temp_cases.py` 支持 `--output-root`（默认 `results/`）。用 `VOLC_TEMP_CASE` 指定单个合并案例：取其 `batch` 名（如 `16K-10`、`TPOT-10`、`CACHE-HIT-10`），也兼容原子案例 id（如 `K3-TTFT-12` → 展开为 `64K-10`）。合并只改变案例集与汇总粒度，合并案例下的每个原子请求仍单独发起并单独记录证据。
 
 退出码约定：`0` 通过，`2` 未通过或数据不足。
 

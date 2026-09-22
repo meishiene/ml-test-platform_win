@@ -50,6 +50,7 @@ from legal_agent_benchmark_cases import CASE as LEGAL_AGENT_BENCHMARK_CASE
 
 from web.aggregation import aggregate_batch, enrich_summary
 from common.finalizer import finalize_result_dir
+from common.temp_suite import TempCase, find_case, load_manifest, manifest_cases, merge_cases
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMP_CASES_PATH = ROOT / "test_cases" / "kimi_k3_temp_cases.json"
@@ -133,24 +134,39 @@ def seconds_text(seconds: int) -> str | None:
     return f"{seconds // 60} 分钟" if seconds % 60 == 0 else f"{seconds} 秒"
 
 
-def temporary_case_payload() -> dict[str, Any]:
-    """Return the document-derived temporary suite as a display-only frontend item."""
+def temporary_merged_cases() -> list[TempCase]:
+    """合并后的临时案例；清单不可读时抛 ValueError，避免静默放行未校验的选择。"""
     try:
-        data = json.loads(TEMP_CASES_PATH.read_text(encoding="utf-8"))
-        count = len(data.get("cases") or [])
-        title = data.get("title", "Kimi-K3 临时测试案例集")
-        scope = data.get("scope", "接口兼容性、性能与缓存")
+        return merge_cases(manifest_cases(load_manifest(TEMP_CASES_PATH)))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"临时案例清单不可用: {exc}") from exc
+
+
+def temporary_case_payload() -> dict[str, Any]:
+    """Return the temporary suite with same-kind cases merged into one logical case.
+
+    清单里性能/缓存案例是按实际请求拆成的原子条目；对外的案例集只呈现合并后的
+    逻辑案例，选中其中一个即执行它名下的全部原子请求。
+    """
+    try:
+        data = load_manifest(TEMP_CASES_PATH)
+        merged = merge_cases(manifest_cases(data))
     except (OSError, json.JSONDecodeError):
-        count, title, scope = 68, "Kimi-K3 临时测试案例集", "接口兼容性、性能与缓存"
+        data, merged = {}, []
+    atomic_count = len(manifest_cases(data)) or 68
+    count = len(merged) or atomic_count
+    title = data.get("title", "Kimi-K3 临时测试案例集")
+    scope = data.get("scope", "接口兼容性、性能与缓存")
+    options = [case.payload() for case in merged]
     return {"id": "K3_TEMP_SUITE", "test_kind": "temporary", "source": "供应商自测基线标准 0828.md + 临时案例集",
             "executor": "test_cases/kimi_k3_temp_cases.md（展示清单）", "title": title,
-            "description": scope, "duration": "按子案例执行", "cost": "中",
+            "description": scope, "duration": "按合并案例执行", "cost": "中",
             "protocols": ["openai", "volcengine"], "concurrency": 10,
-            "concurrency_text": "按子案例", "requests": count, "case_count": count,
-            "case_count_text": f"{count} 条临时案例", "request_text": f"{count} 条子案例",
+            "concurrency_text": "按合并案例", "requests": count, "case_count": count,
+            "case_count_text": f"{count} 个合并案例（{atomic_count} 条原子请求）", "request_text": f"{atomic_count} 条原子请求",
             "input_tokens": "短请求 + 16K/64K/100K/200K + 70K 缓存前缀", "warmup": None,
-            "steady": None, "admission": "临时案例集展示项；正式执行请按清单中的接口、性能和缓存子案例分别运行。",
-            "display_only": True}
+            "steady": None, "admission": "可选择其中一个合并案例执行；不选择时运行全部合并案例。",
+            "display_only": True, "atomic_case_count": atomic_count, "case_options": options}
 
 def moderation_case_payload(name: str) -> dict[str, Any]:
     title, desc, duration, cost, dataset = MODERATION_CASES[name]
@@ -421,6 +437,8 @@ def _execute_child(job: dict[str, Any]) -> None:
     resolved_base_url = api_root(job["protocol"], job["base_url"])
     env.update({"VOLC_RECORD_ID": run_id, "VOLC_BATCH_ID": job.get("batch_id") or "", "VOLC_API_KEY": job["api_key"],
                 "VOLC_BASE_URL": resolved_base_url, "VOLC_MODEL": job["model"], "VOLC_PROTOCOL": job["protocol"]})
+    if job["test_kind"] == "temporary":
+        env["VOLC_TEMP_CASE"] = job.get("temporary_case") or ""
     if job["test_kind"] == "deepseek":
         env.update({"DS_API_KEY": job["api_key"], "DS_BASE_URL": resolved_base_url, "DS_MODEL": job["model"]})
     if job["test_kind"] in {"glm", "glm_stream_retest"}:
@@ -860,6 +878,7 @@ class Handler(BaseHTTPRequestHandler):
             case_name = case_names[0] if case_names else ""
             test_kind = str(payload.get("test_kind", "load")).strip().lower()
             protocol = str(payload.get("protocol", "volcengine")).strip().lower()
+            temporary_case = str(payload.get("temporary_case") or "").strip() or None
             quick = bool(payload.get("quick", False))
             custom_requests = payload.get("requests")
             custom_concurrency = payload.get("concurrency")
@@ -888,12 +907,18 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("api_key 不能为空")
             if not model:
                 raise ValueError("model 不能为空")
+            if test_kind == "temporary" and temporary_case is not None:
+                # 选择项是合并案例 id（batch 名），原子案例 id 继续兼容。
+                if find_case(temporary_merged_cases(), temporary_case) is None:
+                    raise ValueError("未知临时测试案例")
             available = {"LEGAL_AGENT_BENCHMARK": LEGAL_AGENT_BENCHMARK_CASE} if test_kind == "legal-agent-benchmark" else {"SWE_ATLAS_RF": SWE_ATLAS_RF_CASE} if test_kind == "swe-atlas-rf" else {"SWE_ATLAS_TW": SWE_ATLAS_TW_CASE} if test_kind == "swe-atlas-tw" else {"DEEPSWE": DEEPSWE_CASE} if test_kind == "deepswe" else {"ARXIVMATH": ARXIVMATH_CASE} if test_kind == "arxivmath" else {"K3_TEMP_SUITE": temporary_case_payload()} if test_kind == "temporary" else CASES if test_kind == "load" else MODERATION_CASES if test_kind == "moderation" else KVV_CASES if test_kind == "kvv" else DEEPSEEK_CASES if test_kind == "deepseek" else GLM_CASES if test_kind == "glm" else GPT_IMAGE_CASES if test_kind == "gpt-image" else AUTH_CASES if test_kind == "authenticity" else {spec.case_id: spec for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)} if test_kind == "awsb" else {}
             if test_kind in {"kvv", "deepseek", "glm"}:
                 available = dict(available)
                 available.update({name: item for name, item in CONTRACT_CASES.items() if item["test_kind"] == test_kind})
             if not case_names or any(name not in available for name in case_names):
                 raise ValueError("未知测试类型")
+            if test_kind == "temporary" and case_names != ["K3_TEMP_SUITE"]:
+                raise ValueError("临时测试案例集只能选择测试集入口")
             if test_kind == "gpt-image":
                 image_case = GPT_IMAGE_CASES[case_names[0]]
                 def image_choices(value: Any, allowed: tuple[str, ...], label: str) -> list[str]:
@@ -947,6 +972,8 @@ class Handler(BaseHTTPRequestHandler):
                     }
                     for name in preset["cases"]
                 ]
+            elif test_kind == "temporary":
+                execution_cases = [{"name": temporary_case or "K3_TEMP_SUITE", "requests": custom_requests, "concurrency": custom_concurrency, "warmup_seconds": None}]
             else:
                 execution_cases = [
                     {"name": name, "requests": custom_requests, "concurrency": custom_concurrency, "warmup_seconds": None}
@@ -963,14 +990,14 @@ class Handler(BaseHTTPRequestHandler):
                         child_id=uuid.uuid4().hex[:16]; child_created=f"{created}.{index:03d}"
                         connection.execute("INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                            (child_id,test_kind,name,protocol,base_url,model,"queued",int(quick),child_created,run_id))
-                        children.append({"id":child_id,"batch_id":run_id,"test_kind":test_kind,"case":name,"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes})
+                        children.append({"id":child_id,"batch_id":run_id,"test_kind":test_kind,"case":name,"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"temporary_case":temporary_case})
                 JOB_QUEUE.put({"id":run_id,"is_batch":True,"test_kind":test_kind,"api_key":api_key,"children":children})
             else:
                 execution = execution_cases[0]
                 with db() as connection:
                     connection.execute("INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,case_ids) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                        (run_id,test_kind,case_name,protocol,base_url,model,"queued",int(quick),created,json.dumps(case_names)))
-                JOB_QUEUE.put({"id":run_id,"test_kind":test_kind,"case":execution["name"],"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes})
+                JOB_QUEUE.put({"id":run_id,"test_kind":test_kind,"case":execution["name"],"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"temporary_case":temporary_case})
             with db() as connection:
                 row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             return self.json_response(public_run(row), HTTPStatus.ACCEPTED)

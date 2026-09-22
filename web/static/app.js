@@ -1,6 +1,41 @@
-const state = { protocols: [], protocol: 'openai', testKind: 'load', cases: [], runs: [], selected: [], filter: 'all', models: [], downloadSelected: new Set() };
+const state = { protocols: [], protocol: 'openai', testKind: 'load', cases: [], selected: [], temporaryCase: '', runs: [], filter: 'all', models: [], downloadSelected: new Set() };
 const $ = (s) => document.querySelector(s);
 const escapeHtml = (s='') => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const FORM_STORAGE_KEY = 'ml-test-platform.form.v1';
+
+function readPersistedForm() {
+  try {
+    const value = JSON.parse(localStorage.getItem(FORM_STORAGE_KEY) || 'null');
+    return value && typeof value === 'object' ? value : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function persistForm() {
+  try {
+    const values = {
+      protocol: state.protocol,
+      testKind: state.testKind,
+      selected: state.selected,
+      temporaryCase: state.temporaryCase,
+      baseUrl: $('#baseUrl').value,
+      apiKey: $('#apiKey').value,
+      model: $('#model').value,
+      quick: $('#quick').checked,
+      customEnabled: $('#customEnabled').checked,
+      customRequests: $('#customRequests').value,
+      customConcurrency: $('#customConcurrency').value,
+      moderationConcurrency: $('#moderationConcurrency').value,
+      imageQuality: selectedValues('#imageQuality'),
+      imageModels: selectedValues('#imageModels'),
+      imageSizes: selectedValues('#imageSizes')
+    };
+    localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(values));
+  } catch (e) {
+    // Private browsing or a disabled storage API should not break the form.
+  }
+}
 
 
 function inlineMarkdown(source='') {
@@ -63,7 +98,7 @@ function selectProtocol(id) {
   const previous=state.protocols.find(x=>x.id===state.protocol); const item=state.protocols.find(x=>x.id===id); if(!item)return; state.protocol=id; renderProtocols();
   const base=$('#baseUrl'); if(!base.value || (previous && base.value===previous.default_base_url)) base.value=item.default_base_url;
   $('#protocolDescription').textContent=`${item.provider} · ${item.description}`; updateEndpointPreview();
-  setModelPlaceholder(item); renderCases(); state.selected=state.selected.filter(caseId=>{const selected=state.cases.find(x=>x.id===caseId);return selected&&protocolSupports(selected,id)}); if(!state.selected.length){const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x,id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint';
+  setModelPlaceholder(item); renderCases(); state.selected=state.selected.filter(caseId=>{const selected=state.cases.find(x=>x.id===caseId);return selected&&protocolSupports(selected,id)}); if(!state.selected.length){const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x,id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint'; persistForm();
 }
 
 function setModelPlaceholder(protocol){
@@ -87,12 +122,14 @@ function caseFacts(item){
 }
 function renderCases() {
   const cases=state.cases.filter(item=>state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(item.test_kind):item.test_kind===state.testKind);
-  $('#caseGrid').innerHTML = cases.map(item => {const supported=protocolSupports(item);return `<button type="button" class="case-card ${state.selected.includes(item.id)?'selected':''} ${supported?'':'unsupported'}" data-case="${item.id}" ${supported?'':'disabled'}>
+  $('#caseGrid').innerHTML = cases.map(item => {const supported=protocolSupports(item);const tempOptions=item.test_kind==='temporary'?(item.case_options||[]).map(option=>`<option value="${escapeHtml(option.id)}" ${state.temporaryCase===option.id?'selected':''}>${escapeHtml(option.id)} · ${escapeHtml(option.name)}${option.merged?`（${option.repetitions} 次）`:''}</option>`).join(''):'';return `<div class="case-item"><button type="button" class="case-card ${state.selected.includes(item.id)?'selected':''} ${supported?'':'unsupported'}" data-case="${item.id}" ${supported?'':'disabled'}>
     <div class="case-head"><b>${item.id}</b><span class="cost">${supported?'成本 '+escapeHtml(item.cost):'当前协议不支持'}</span></div><div class="case-source">${escapeHtml(item.source||'专项自研代码')} · ${escapeHtml(item.executor||'')}</div><h3>${escapeHtml(item.title)}</h3>
     <dl class="case-facts">${caseFacts(item).map(([label,value])=>`<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value||'—')}</dd></div>`).join('')}</dl>
     <div class="admission-standard"><strong>准入标准</strong><p>${escapeHtml(item.admission||'以报告中的全部检查项通过为准。')}</p></div>
-  </button>`}).join('');
+  </button>
+  ${item.test_kind==='temporary'?`<label class="temporary-case-picker"><span>执行范围（同类项已合并）</span><select id="temporaryCaseSelect"><option value="">全部 ${item.case_count||''} 个合并案例</option>${tempOptions}</select></label>`:''}</div>`}).join('');
   document.querySelectorAll('.case-card:not(:disabled)').forEach(el => el.onclick = () => selectCase(el.dataset.case));
+  const picker=$('#temporaryCaseSelect'); if(picker) picker.onchange=event=>{state.temporaryCase=event.target.value;persistForm()};
 }
 function selectedValues(selector){
   return [...document.querySelector(selector).selectedOptions].map(option=>option.value);
@@ -218,7 +255,7 @@ $('#runForm').addEventListener('submit', async event => {
   if((isImage && !selectedItem?.fixed_parameters || selectedItem?.manual_parameters) && (!Number($('#customRequests').value) || !Number($('#customConcurrency').value))){message.textContent='请填写总请求数和并发数';return}
   const button=$('#submitBtn'); button.disabled=true;
   try {
-    const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:effectiveTestKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,quick,requests:(effectiveTestKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:effectiveTestKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customConcurrency').value):null),image_quality:isImage?selectedValues('#imageQuality'):null,image_models:isImage?selectedValues('#imageModels'):null,image_sizes:isImage?selectedValues('#imageSizes'):null})});
+    const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:effectiveTestKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,temporary_case:effectiveTestKind==='temporary'?state.temporaryCase:null,quick,requests:(effectiveTestKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:effectiveTestKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customConcurrency').value):null),image_quality:isImage?selectedValues('#imageQuality'):null,image_models:isImage?selectedValues('#imageModels'):null,image_sizes:isImage?selectedValues('#imageSizes'):null})});
     state.runs.unshift(run); renderRuns(); toast(`${state.selected.join('、')} 已加入执行队列`);
     document.querySelector('.history').scrollIntoView({behavior:'smooth'});
   } catch(e){message.textContent=e.message} finally {button.disabled=false}
@@ -262,7 +299,7 @@ function fuzzyModelMatch(model, query){
   let index=0;for(const char of haystack){if(char===needle[index])index++;if(index===needle.length)return true}return false;
 }
 function hideModelSuggestions(){const box=$('#modelSuggestions');box.classList.remove('show');box.innerHTML='';$('#model').setAttribute('aria-expanded','false')}
-function selectSuggestedModel(id){$('#model').value=id;hideModelSuggestions();$('#model').focus()}
+function selectSuggestedModel(id){$('#model').value=id;hideModelSuggestions();$('#model').focus();persistForm()}
 function renderModelSuggestions(query=''){
   const box=$('#modelSuggestions');if(!state.models.length){hideModelSuggestions();return}
   const matches=state.models.filter(model=>fuzzyModelMatch(model,query)).slice(0,50);
@@ -270,21 +307,23 @@ function renderModelSuggestions(query=''){
   box.classList.add('show');$('#model').setAttribute('aria-expanded','true');
   box.querySelectorAll('[data-model-id]').forEach(button=>button.onmousedown=event=>{event.preventDefault();selectSuggestedModel(button.dataset.modelId)});
 }
-$('#model').oninput=()=>{renderModelSuggestions($('#model').value);updateEndpointPreview()};
-$('#baseUrl').oninput=updateEndpointPreview;
-$('#baseUrl').onblur=()=>{const input=$('#baseUrl');input.value=input.value.trim().replace(/\/+$/,'');updateEndpointPreview()};
+$('#model').oninput=()=>{renderModelSuggestions($('#model').value);updateEndpointPreview();persistForm()};
+$('#apiKey').oninput=()=>persistForm();
+$('#baseUrl').oninput=()=>{updateEndpointPreview();persistForm()};
+$('#baseUrl').onblur=()=>{const input=$('#baseUrl');input.value=input.value.trim().replace(/\/+$/,'');updateEndpointPreview();persistForm()};
 $('#model').onfocus=()=>{if(state.models.length)renderModelSuggestions($('#model').value)};
 $('#model').onkeydown=event=>{if(event.key==='Escape')hideModelSuggestions()};
 document.addEventListener('mousedown',event=>{if(!event.target.closest('.model-combobox'))hideModelSuggestions()});
 $('#toggleKey').onclick=()=>{const input=$('#apiKey');const masked=input.classList.toggle('secret-masked');$('#toggleKey').textContent=masked?'显示':'隐藏'};
-$('#customRequests').oninput=()=>$('#customRequests').dataset.edited='1'; $('#customConcurrency').oninput=()=>$('#customConcurrency').dataset.edited='1';
-$('#customEnabled').onchange=()=>{ $('#customRequests').disabled=!$('#customEnabled').checked; $('#customConcurrency').disabled=!$('#customEnabled').checked; };
-$('#resetCustom').onclick=()=>{delete $('#customRequests').dataset.edited; delete $('#customConcurrency').dataset.edited; updateCustomDefaults()};
+$('#customRequests').oninput=()=>{$('#customRequests').dataset.edited='1';persistForm()}; $('#customConcurrency').oninput=()=>{$('#customConcurrency').dataset.edited='1';persistForm()};
+$('#customEnabled').onchange=()=>{ $('#customRequests').disabled=!$('#customEnabled').checked; $('#customConcurrency').disabled=!$('#customEnabled').checked; persistForm(); };
+$('#resetCustom').onclick=()=>{delete $('#customRequests').dataset.edited; delete $('#customConcurrency').dataset.edited; updateCustomDefaults();persistForm()};
 $('#refreshBtn').onclick=()=>refreshRuns(false);
 $('#closeDialog').onclick=()=>$('#reportDialog').close();
 $('#reportDialog').addEventListener('click',e=>{if(e.target===$('#reportDialog')) $('#reportDialog').close()});
+document.querySelectorAll('#runForm input, #runForm select').forEach(input=>input.addEventListener('change',persistForm));
 document.querySelectorAll('.kind-tab').forEach(button=>button.onclick=()=>{
-  document.querySelectorAll('.kind-tab').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.testKind=button.dataset.kind;state.selected=[]; delete $('#customRequests').dataset.edited; delete $('#customConcurrency').dataset.edited; $('#customEnabled').checked=false;
+  document.querySelectorAll('.kind-tab').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.testKind=button.dataset.kind;state.selected=[];if(state.testKind!=='temporary')state.temporaryCase=''; delete $('#customRequests').dataset.edited; delete $('#customConcurrency').dataset.edited; $('#customEnabled').checked=false;
   $('#quick').closest('.mode-toggle').style.display=state.testKind==='load'?'flex':'none';
   setModelPlaceholder();
   renderCases();
@@ -292,13 +331,41 @@ document.querySelectorAll('.kind-tab').forEach(button=>button.onclick=()=>{
   if(!first){const matchingProtocol=state.protocols.find(protocol=>state.cases.some(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x,protocol.id)));if(matchingProtocol){selectProtocol(matchingProtocol.id);first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x));}}
   if(first)state.selected=[first.id];renderCases();updateSelectionUI();updateEndpointPreview();
   if(state.testKind==='gpt-image' && first && !$('#model').value) $('#model').value=first.image_models?.[0]||first.title;
+  persistForm();
 });
 document.querySelectorAll('.filter').forEach(button=>button.onclick=()=>{
   document.querySelectorAll('.filter').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.filter=button.dataset.filter;renderRuns();
 });
 
 (async function init(){
-  try { state.protocols=await api('/api/protocols'); renderProtocols(); selectProtocol('openai'); state.cases=await api('/api/cases'); state.selected=['T0']; renderCases(); updateSelectionUI(); await refreshRuns(); }
+  try {
+    const saved=readPersistedForm();
+    state.testKind=['load','kvv','deepseek','glm','gpt-image','awsb','open-source','temporary','moderation'].includes(saved.testKind)?saved.testKind:'load';
+    document.querySelectorAll('.kind-tab').forEach(button=>button.classList.toggle('active',button.dataset.kind===state.testKind));
+    $('#quick').closest('.mode-toggle').style.display=state.testKind==='load'?'flex':'none';
+    state.protocols=await api('/api/protocols');
+    state.protocol=state.protocols.some(item=>item.id===saved.protocol)?saved.protocol:'openai';
+    renderProtocols(); selectProtocol(state.protocol);
+    state.cases=await api('/api/cases');
+    if(saved.baseUrl!=null)$('#baseUrl').value=String(saved.baseUrl);
+    if(saved.apiKey!=null)$('#apiKey').value=String(saved.apiKey);
+    if(saved.model!=null)$('#model').value=String(saved.model);
+    if(saved.temporaryCase!=null)state.temporaryCase=String(saved.temporaryCase);
+    if(typeof saved.quick==='boolean')$('#quick').checked=saved.quick;
+    if(typeof saved.customEnabled==='boolean')$('#customEnabled').checked=saved.customEnabled;
+    if(saved.customRequests!=null){$('#customRequests').value=String(saved.customRequests);$('#customRequests').dataset.edited='1'}
+    if(saved.customConcurrency!=null){$('#customConcurrency').value=String(saved.customConcurrency);$('#customConcurrency').dataset.edited='1'}
+    if(saved.moderationConcurrency!=null)$('#moderationConcurrency').value=String(saved.moderationConcurrency);
+    state.selected=Array.isArray(saved.selected)?saved.selected.filter(id=>state.cases.some(item=>item.id===id&&protocolSupports(item))):[];
+    if(!state.selected.length){const first=state.cases.find(item=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(item.test_kind):item.test_kind===state.testKind)&&protocolSupports(item));if(first)state.selected=[first.id];}
+    renderCases(); updateSelectionUI();
+    [['#imageQuality',saved.imageQuality],['#imageModels',saved.imageModels],['#imageSizes',saved.imageSizes]].forEach(([selector,values])=>{
+      if(!Array.isArray(values))return;
+      const element=$(selector); if(!element)return;
+      [...element.options].forEach(option=>option.selected=values.includes(option.value));
+    });
+    updateEndpointPreview(); persistForm(); await refreshRuns();
+  }
   catch(e){$('#serviceState').innerHTML='<i style="background:#fb7185"></i>服务异常';toast(e.message)}
   setInterval(()=>refreshRuns(),3000); setInterval(()=>{state.runs.filter(r=>['queued','running'].includes(r.status)).forEach(r=>{const el=document.querySelector(`[data-start="${r.id}"]`);if(el)el.textContent=formatDuration(r)})},1000);
 })();
