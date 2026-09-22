@@ -5,7 +5,7 @@ This runner deliberately has no pass/fail business logic.  Every verdict is
 produced by validators and every request is written as an auditable record.
 """
 from __future__ import annotations
-import argparse, asyncio, json, os, sys, time
+import argparse, asyncio, json, os, sys, time, uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
 
 from common.suite import ManifestCase, execute_manifest_case
 from common.temp_suite import TempCase, find_case, load_manifest, manifest_cases, merge_cases
-from common.test_framework import HttpExecutor, ResultLog
+from common.test_framework import HttpExecutor, ResultLog, check, validate_case
 from common.validators import status, status_2xx, status_error, content, usage, sse, json_content, tool_calls
 from volcperf.protocols import api_root
 
@@ -69,6 +69,47 @@ def aggregate(plan: TempCase, group_results: list[dict]) -> dict:
             'merged':plan.merged, 'status':status_value, 'passed':status_value=='passed', 'checks':[],
             'failure_reasons':detail}
 
+
+def _cache_usage_check(record):
+    usage_value = record.usage or {}
+    details = usage_value.get('prompt_tokens_details') or usage_value.get('input_tokens_details') or {}
+    prompt = usage_value.get('prompt_tokens', usage_value.get('input_tokens'))
+    cached = details.get('cached_tokens', usage_value.get('cached_tokens'))
+    ratio = (float(cached) / float(prompt)) if prompt and cached is not None else None
+    return check('cache_ratio', ratio is not None and ratio >= 0.80, 0.80, ratio, '缓存命中率缺失或低于 80%')
+
+
+async def execute_cache_probe_case(executor: HttpExecutor, log: ResultLog, plan: TempCase, *, model: str, url: str, base_headers: dict[str, str], wait_seconds: int = 0) -> list[dict]:
+    """Execute a cache case as one warm request followed by same-prefix probes."""
+    target_tokens = 70000
+    prefix = ('K3 缓存稳定前缀。请保留并识别这段固定上下文。' * (target_tokens * 4 // 24 + 1))[:target_tokens * 4]
+    warm_validators = [status_2xx(), usage('prompt_tokens')]
+    probe_validators = [status_2xx(), usage('prompt_tokens'), _cache_usage_check]
+    results = []
+    warm_id = f'K3-{plan.id}-WARM'
+    requests = [(warm_id, prefix)] + [
+        (case_id, prefix + f'\n本次探测尾部：{index}')
+        for index, case_id in enumerate(plan.case_ids, 1)
+    ]
+    for case_id, content_text in requests:
+        if case_id != warm_id and wait_seconds:
+            await asyncio.sleep(wait_seconds)
+        payload = {
+            'model': model, 'stream': True, 'stream_options': {'include_usage': True},
+            'max_tokens': 16, 'messages': [{'role': 'user', 'content': content_text}],
+        }
+        headers = dict(base_headers)
+        headers['X-Request-ID'] = f'{case_id}-{uuid.uuid4().hex[:10]}'
+        record = await executor.execute(case_id=case_id, url=url, payload=payload, headers=headers, stream=True)
+        verdict = validate_case(record, probe_validators if case_id != warm_id else warm_validators)
+        record.validation = verdict
+        await log.write(record)
+        if case_id != warm_id:
+            results.append({'case_id': case_id, 'status': verdict.status, 'passed': verdict.passed,
+                            'checks': [asdict(item) for item in verdict.checks],
+                            'failure_reasons': verdict.reasons, 'request_id': record.request_id})
+    return results
+
 async def main_async(args):
     atomic_cases=manifest_cases(load_manifest(MANIFEST))
     merged_cases=merge_cases(atomic_cases)
@@ -88,11 +129,15 @@ async def main_async(args):
     base_headers={'Authorization':f"Bearer {os.environ['VOLC_API_KEY']}",'Content-Type':'application/json','Accept':'text/event-stream'}
     async with HttpExecutor(timeout=300,max_connections=10) as executor:
         for plan in plans:
-            group_results=[]
-            for case_id in plan.case_ids:
-                case=ManifestCase(raw_by_id[case_id])
-                case.validators=lambda v=validators_for(case): v
-                group_results.append(await execute_manifest_case(executor,log,case,model=os.environ['VOLC_MODEL'],url=base_url,base_headers=base_headers))
+            if plan.id in {'CACHE-HIT-10', 'CACHE-TTL-3'}:
+                wait_seconds = 30 if plan.id == 'CACHE-TTL-3' else 0
+                group_results = await execute_cache_probe_case(executor, log, plan, model=os.environ['VOLC_MODEL'], url=base_url, base_headers=base_headers, wait_seconds=wait_seconds)
+            else:
+                group_results=[]
+                for case_id in plan.case_ids:
+                    case=ManifestCase(raw_by_id[case_id])
+                    case.validators=lambda v=validators_for(case): v
+                    group_results.append(await execute_manifest_case(executor,log,case,model=os.environ['VOLC_MODEL'],url=base_url,base_headers=base_headers))
             results.append(aggregate(plan,group_results)); print(results[-1]['case_id'],results[-1]['status'],flush=True)
     log.close()
     passed=sum(x['passed'] for x in results); evaluated=sum(x['status'] in {'passed','failed'} for x in results)

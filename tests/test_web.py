@@ -38,7 +38,11 @@ class WebTests(unittest.TestCase):
             suite_result = results / "K3_TEMP_SUITE-20260922-172637"
             suite_result.mkdir()
             with patch.object(server, "RESULTS", results):
-                found = server.latest_result("CACHE-HIT-10", time.time() - 2)
+                # 与 web/server.py 收尾阶段的真实调用一致：单案例执行时
+                # 产物目录是 K3_TEMP_SUITE-*，通过 aliases 命中。
+                found = server.latest_result(
+                    "CACHE-HIT-10", time.time() - 2, aliases=("K3_TEMP_SUITE",)
+                )
             self.assertEqual(found, suite_result)
 
     def test_single_temporary_run_persists_selected_case_name(self):
