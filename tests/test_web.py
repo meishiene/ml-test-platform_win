@@ -124,6 +124,46 @@ class WebTests(unittest.TestCase):
         with urlopen(self.base + "/") as response:
             self.assertIn("性能测试台", response.read().decode())
 
+    def test_runs_api_returns_filtered_pages_and_total(self):
+        now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+        ids = [f"pagination-{uuid}" for uuid in ("a", "b", "c")]
+        with server.db() as connection:
+            for index, run_id in enumerate(ids):
+                connection.execute(
+                    "INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,passed) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (run_id, "load", "T0", "openai", "https://example.com", "m", "completed", 0,
+                     f"{now[:-6]}{index:02d}+00:00", index % 2),
+                )
+        try:
+            first = self.get_json("/api/runs?page=1&page_size=2&conclusion=pass")
+            second = self.get_json("/api/runs?page=2&page_size=2&conclusion=pass")
+            searched = self.get_json("/api/runs?page=1&page_size=2&q=example.com")
+            self.assertEqual((first["total"], len(first["items"])), (2, 2))
+            self.assertEqual((second["total"], len(second["items"])), (2, 0))
+            self.assertEqual(searched["total"], 3)
+        finally:
+            with server.db() as connection:
+                connection.executemany("DELETE FROM runs WHERE id=?", [(run_id,) for run_id in ids])
+
+    def test_delete_run_removes_record_and_result_directory(self):
+        run_id = f"delete-test-{time.time_ns()}"
+        result_dir = server.RESULTS / run_id
+        result_dir.mkdir(parents=True)
+        (result_dir / "report.md").write_text("test report", encoding="utf-8")
+        with server.db() as connection:
+            connection.execute(
+                "INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,result_dir) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (run_id, "load", "T0", "openai", "https://example.com", "m", "completed", 0,
+                 time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), str(result_dir.relative_to(server.ROOT))),
+            )
+        request = Request(self.base + f"/api/runs/{run_id}", method="DELETE")
+        with urlopen(request) as response:
+            result = json.load(response)
+        self.assertEqual(result["deleted_records"], 1)
+        self.assertFalse(result_dir.exists())
+        with server.db() as connection:
+            self.assertIsNone(connection.execute("SELECT id FROM runs WHERE id=?", (run_id,)).fetchone())
+
     def test_create_run_does_not_persist_key(self):
         payload = json.dumps({"protocol":"anthropic", "test_kind":"load", "base_url":"https://example.com", "api_key":"super-secret", "model":"ep-test", "case":"T0", "quick":True}).encode()
         request = Request(self.base + "/api/runs", data=payload, method="POST", headers={"Content-Type":"application/json"})
@@ -302,6 +342,21 @@ class WebTests(unittest.TestCase):
         self.assertEqual(config.protocol,"volcengine")
         self.assertEqual(config.api_key,"secret")
 
+    def test_connectivity_check_shares_trust_env_switch_with_load_tests(self):
+        """探针必须与正式压测共用 VOLC_TRUST_ENV。
+
+        否则会出现"模型列表查得到、连通性检查却走直连"的前后不一致：
+        探针忽略 .env 里的代理设置，直连在境外网关上失败，正式测试根本起不来。
+        """
+        payload=json.dumps({"protocol":"anthropic", "base_url":"https://mux.la", "api_key":"secret", "model":"kimi-k3"}).encode()
+        result={"name":"connectivity","passed":True,"http_status":200,"duration_ms":12.3}
+        for flag, expected in ((True, True), (False, False)):
+            with patch.object(server, "trust_env_enabled", return_value=flag):
+                with patch.object(server, "check_connectivity", return_value=result) as checked:
+                    with urlopen(Request(self.base+"/api/connectivity/check",data=payload,method="POST",headers={"Content-Type":"application/json"})) as response:
+                        json.load(response)
+            self.assertIs(checked.call_args.args[0].trust_env, expected)
+
     def test_query_models(self):
         payload=json.dumps({"protocol":"openai", "base_url":"https://example.com", "api_key":"secret"}).encode()
         fake = type("Response", (), {"status_code": 200, "text": "", "json": lambda self: {"data": [{"id":"model-b"},{"id":"model-a"}]}})()
@@ -311,6 +366,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual([m["id"] for m in result["models"]], ["model-a", "model-b"])
         self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer secret")
         self.assertEqual(get.call_args.args[0], "https://example.com/v1/models")
+        # 与探针保持一致：是否走环境代理由 VOLC_TRUST_ENV 决定，不再隐式使用。
+        self.assertIn("trust_env", get.call_args.kwargs)
 
     def test_reject_bad_url(self):
         payload=json.dumps({"base_url":"bad", "api_key":"x", "model":"m", "case":"T0"}).encode()

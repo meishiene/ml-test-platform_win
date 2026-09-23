@@ -1,6 +1,7 @@
+import os
 import unittest
 from unittest.mock import patch
-from volcperf.config import ApiConfig
+from volcperf.config import ApiConfig, trust_env_enabled
 from volcperf.connectivity import connectivity_endpoint, connectivity_headers, connectivity_payload, check_connectivity
 
 class Response:
@@ -64,5 +65,28 @@ class ConnectivityTests(unittest.TestCase):
         self.assertIn('不是本地 Base URL 拼装错误',result['diagnosis'])
         self.assertEqual(result['provider_request_id'],'req-1')
         self.assertEqual(result['request']['endpoint'],'https://mux.la/v1/responses')
+
+class TrustEnvFlagTests(unittest.TestCase):
+    """VOLC_TRUST_ENV 是 Web 探针与正式压测共用的开关，默认必须是直连。"""
+
+    def test_absent_flag_means_direct(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(trust_env_enabled())
+
+    def test_truthy_values_enable_proxy(self):
+        for value in ('true','TRUE','1','yes','on'):
+            with patch.dict(os.environ, {'VOLC_TRUST_ENV':value}):
+                self.assertTrue(trust_env_enabled(), value)
+
+    def test_falsey_values_keep_direct(self):
+        for value in ('false','FALSE','0','no','off',''):
+            with patch.dict(os.environ, {'VOLC_TRUST_ENV':value}):
+                self.assertFalse(trust_env_enabled(), value)
+
+    def test_from_env_propagates_flag(self):
+        env={'VOLC_API_KEY':'k','VOLC_BASE_URL':'https://mux.la','VOLC_MODEL':'kimi-k3','VOLC_TRUST_ENV':'true'}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertTrue(ApiConfig.from_env().trust_env)
+
 
 if __name__=='__main__':unittest.main()

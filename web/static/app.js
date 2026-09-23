@@ -1,4 +1,4 @@
-const state = { protocols: [], protocol: 'openai', testKind: 'load', cases: [], selected: [], temporaryCase: '', runs: [], filter: 'all', models: [], downloadSelected: new Set() };
+const state = { protocols: [], protocol: 'openai', testKind: 'load', cases: [], selected: [], temporaryCase: '', runs: [], runsTotal: 0, runsPage: 1, runsPageSize: 20, filter: 'all', conclusion: 'all', runsSearch: '', models: [], downloadSelected: new Set() };
 const $ = (s) => document.querySelector(s);
 const escapeHtml = (s='') => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const FORM_STORAGE_KEY = 'ml-test-platform.form.v1';
@@ -182,20 +182,22 @@ function formatDuration(run) {
 }
 function statusLabel(status){return ({queued:'排队中',running:'执行中',completed:'已完成',failed:'失败',interrupted:'已中断'})[status]||status}
 function renderRuns() {
-  const visible=state.runs.filter(run=> state.filter==='all' || (state.filter==='running' ? ['queued','running'].includes(run.status) : state.filter==='failed' ? ['failed','interrupted'].includes(run.status) : run.status===state.filter));
+  const visible=state.runs;
   $('#runRows').innerHTML = visible.length ? visible.map(run => `<tr>
     <td class="select-col"><input type="checkbox" class="download-check" data-run-id="${run.id}" ${state.downloadSelected.has(run.id)?'checked':''} ${run.download_url?'':'disabled'} aria-label="选择下载 ${escapeHtml(run.case_name)}"></td><td class="run-title"><b><span class="kind-label">${kindLabel(run.test_kind)}</span> ${escapeHtml(run.is_batch?'批量聚合':run.case_name)} · ${escapeHtml(run.is_batch?run.case_ids.join(' + '):(run.case_title||caseLabel(run.case_name))) }${run.quick?' [快速]':''}</b><small>${escapeHtml(run.created_at)}</small><button class="record-id" title="点击复制记录 ID" onclick="copyRecordId('${run.id}')">ID ${run.id}</button></td>
     <td class="endpoint"><b title="${escapeHtml(run.model)}">${escapeHtml(run.model)}</b><small>${escapeHtml((state.protocols.find(p=>p.id===run.protocol)?`${state.protocols.find(p=>p.id===run.protocol).provider} ${state.protocols.find(p=>p.id===run.protocol).name}`:run.protocol)+' · '+run.base_url)}</small></td>
     <td><span class="badge ${run.status}">${statusLabel(run.status)}</span></td>
     <td>${run.passed===true?'<b class="pass">通过</b>':run.passed===false?'<b class="fail">未通过</b>':'<span class="pending">待判定</span>'}</td>
     <td data-start="${run.id}">${formatDuration(run)}</td>
-    <td><div class="actions">${run.report_url?`<button class="link-btn" onclick="openArtifact('${run.id}','report')">报告</button>`:''}${run.summary_url?`<button class="link-btn" onclick="openArtifact('${run.id}','summary')">指标</button>`:''}${run.manifest_url?`<button class="link-btn" onclick="openArtifact('${run.id}','manifest')">聚合数据</button>`:''}${run.requests_url?`<button class="link-btn" onclick="openArtifact('${run.id}','requests')">请求明细</button>`:''}${run.download_url?`<a class="link-btn download-btn" href="${run.download_url}" download>下载全部</a>`:''}${run.log_url?`<button class="link-btn" onclick="openArtifact('${run.id}','log')">日志</button>`:''}${['queued','running'].includes(run.status)?`<button class="link-btn danger" onclick="cancelRun('${run.id}')">${run.status==='queued'?'取消':'停止'}</button>`:''}${!run.report_url&&!run.log_url&&!['queued','running'].includes(run.status)?'—':''}</div></td>
+    <td><div class="actions">${run.report_url?`<button class="link-btn" onclick="openArtifact('${run.id}','report')">报告</button>`:''}${run.summary_url?`<button class="link-btn" onclick="openArtifact('${run.id}','summary')">指标</button>`:''}${run.manifest_url?`<button class="link-btn" onclick="openArtifact('${run.id}','manifest')">聚合数据</button>`:''}${run.requests_url?`<button class="link-btn" onclick="openArtifact('${run.id}','requests')">请求明细</button>`:''}${run.download_url?`<a class="link-btn download-btn" href="${run.download_url}" download>下载全部</a>`:''}${run.log_url?`<button class="link-btn" onclick="openArtifact('${run.id}','log')">日志</button>`:''}${['queued','running'].includes(run.status)?`<button class="link-btn danger" onclick="cancelRun('${run.id}')">${run.status==='queued'?'取消':'停止'}</button>`:''}${!['queued','running'].includes(run.status)?`<button class="link-btn danger" onclick="deleteRun('${run.id}')">删除</button>`:''}</div></td>
   </tr>`).join('') : '<tr><td colspan="7" class="empty">暂无匹配的测试记录</td></tr>';
   document.querySelectorAll('.download-check').forEach(el=>el.onchange=()=>{if(el.checked)state.downloadSelected.add(el.dataset.runId);else state.downloadSelected.delete(el.dataset.runId);updateDownloadUI()});
+  const pages=Math.max(1,Math.ceil(state.runsTotal/state.runsPageSize));
+  $('#runsPageInfo').textContent=state.runsTotal?`${(state.runsPage-1)*state.runsPageSize+1}–${Math.min(state.runsPage*state.runsPageSize,state.runsTotal)} / ${state.runsTotal}`:'0 条记录';
+  $('#runsPrev').disabled=state.runsPage<=1; $('#runsNext').disabled=state.runsPage>=pages;
   updateDownloadUI();
 }
 function updateDownloadUI(){
-  state.downloadSelected = new Set([...state.downloadSelected].filter(id=>state.runs.some(r=>r.id===id && r.download_url)));
   const button=$('#downloadSelected'), count=state.downloadSelected.size;
   button.disabled=!count; button.textContent=`下载选中（${count}）`;
 }
@@ -217,7 +219,13 @@ $('#downloadSelected').onclick=async()=>{
 };
 
 async function refreshRuns(silent=true) {
-  try { state.runs=await api('/api/runs'); renderRuns(); }
+  try {
+    const query=new URLSearchParams({page:String(state.runsPage),page_size:String(state.runsPageSize),status:state.filter,conclusion:state.conclusion,q:state.runsSearch});
+    const data=await api(`/api/runs?${query}`); state.runs=data.items; state.runsTotal=data.total;
+    const lastPage=Math.max(1,Math.ceil(state.runsTotal/state.runsPageSize));
+    if(state.runsPage>lastPage){state.runsPage=lastPage;return refreshRuns(silent)}
+    renderRuns();
+  }
   catch(e) { if(!silent) toast(e.message); }
 }
 
@@ -228,6 +236,17 @@ window.cancelRun = async id => {
   if(!confirm(`确认${action}？已执行的请求会保留，并生成中断报告。`)) return;
   try { await api(`/api/runs/${id}/cancel`,{method:'POST',body:'{}'}); toast(`${action}请求已提交`); await refreshRuns(false); }
   catch(e) { toast(e.message); }
+};
+
+window.deleteRun = async id => {
+  const run=state.runs.find(item=>item.id===id); if(!run)return;
+  const target=run.is_batch?'整个批次及其子记录和报告文件':'这条记录及其报告文件';
+  if(!confirm(`确定删除${target}？此操作不可恢复。`))return;
+  try{
+    const response=await fetch(`/api/runs/${encodeURIComponent(id)}`,{method:'DELETE'});
+    const data=await response.json(); if(!response.ok)throw new Error(data.error||'删除失败');
+    state.downloadSelected.delete(id); toast(`已删除 ${data.deleted_records} 条记录`); await refreshRuns(false);
+  }catch(e){toast(e.message)}
 };
 
 window.copyRecordId = async id => {
@@ -256,7 +275,7 @@ $('#runForm').addEventListener('submit', async event => {
   const button=$('#submitBtn'); button.disabled=true;
   try {
     const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:effectiveTestKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,temporary_case:effectiveTestKind==='temporary'?state.temporaryCase:null,quick,requests:(effectiveTestKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:effectiveTestKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customConcurrency').value):null),image_quality:isImage?selectedValues('#imageQuality'):null,image_models:isImage?selectedValues('#imageModels'):null,image_sizes:isImage?selectedValues('#imageSizes'):null})});
-    state.runs.unshift(run); renderRuns(); toast(`${state.selected.join('、')} 已加入执行队列`);
+    state.runsPage=1; await refreshRuns(); toast(`${state.selected.join('、')} 已加入执行队列`);
     document.querySelector('.history').scrollIntoView({behavior:'smooth'});
   } catch(e){message.textContent=e.message} finally {button.disabled=false}
 });
@@ -333,9 +352,20 @@ document.querySelectorAll('.kind-tab').forEach(button=>button.onclick=()=>{
   if(state.testKind==='gpt-image' && first && !$('#model').value) $('#model').value=first.image_models?.[0]||first.title;
   persistForm();
 });
-document.querySelectorAll('.filter').forEach(button=>button.onclick=()=>{
-  document.querySelectorAll('.filter').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.filter=button.dataset.filter;renderRuns();
+document.querySelectorAll('.filter[data-filter]').forEach(button=>button.onclick=()=>{
+  document.querySelectorAll('.filter[data-filter]').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.filter=button.dataset.filter;state.runsPage=1;refreshRuns();
 });
+document.querySelectorAll('.cfilter').forEach(button=>button.onclick=()=>{
+  document.querySelectorAll('.cfilter').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.conclusion=button.dataset.conclusion;state.runsPage=1;refreshRuns();
+});
+$('#runsPrev').onclick=()=>{if(state.runsPage>1){state.runsPage--;refreshRuns()}};
+$('#runsNext').onclick=()=>{state.runsPage++;refreshRuns()};
+$('#runsPageSize').onchange=event=>{state.runsPageSize=Number(event.target.value);state.runsPage=1;refreshRuns()};
+let runsSearchTimer;
+$('#runsSearch').oninput=event=>{
+  state.runsSearch=event.target.value.trim();state.runsPage=1;clearTimeout(runsSearchTimer);
+  runsSearchTimer=setTimeout(()=>refreshRuns(),250);
+};
 
 (async function init(){
   try {

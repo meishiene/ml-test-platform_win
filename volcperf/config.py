@@ -3,6 +3,18 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def trust_env_enabled() -> bool:
+    """是否允许 httpx 读取环境中的代理变量（由 .env 的 VOLC_TRUST_ENV 控制）。
+
+    默认 false —— 平台直连目标地址。判定逻辑集中在这里，是为了让 Web 层的
+    连通性探针、模型列表查询与正式压测共用同一份开关，避免"模型能查到、
+    连通性检查却走直连"这类前后不一致。
+    """
+    return os.getenv("VOLC_TRUST_ENV", "false").lower() in _TRUTHY
+
 
 @dataclass(frozen=True)
 class ApiConfig:
@@ -30,7 +42,6 @@ class ApiConfig:
         missing = [name for name in required if not os.getenv(name)]
         if missing:
             raise ValueError(f"缺少环境变量: {', '.join(missing)}")
-        truthy = {"1", "true", "yes", "on"}
         falsy = {"0", "false", "no", "off"}
         verify = os.getenv("VOLC_VERIFY_SSL", "true").lower() not in falsy
         return cls(
@@ -43,7 +54,7 @@ class ApiConfig:
             connect_timeout_seconds=float(os.getenv("VOLC_CONNECT_TIMEOUT_SECONDS", "30")),
             max_connections=int(os.getenv("VOLC_MAX_CONNECTIONS", "1200")),
             verify_ssl=verify,
-            trust_env=os.getenv("VOLC_TRUST_ENV", "false").lower() in truthy,
+            trust_env=trust_env_enabled(),
             include_usage=os.getenv("VOLC_STREAM_INCLUDE_USAGE", "true").lower() not in falsy,
             reasoning_effort=(os.getenv("VOLC_REASONING_EFFORT") or "").strip() or None,
         )

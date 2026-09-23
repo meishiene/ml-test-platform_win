@@ -59,9 +59,11 @@
     </section>
 
     <section class="history">
-      <div class="section-heading"><div><span class="step">03</span><h2>测试记录</h2></div><div class="history-actions"><button type="button" id="selectAllDownloads" class="link-btn">全选可下载</button><button type="button" id="downloadSelected" class="link-btn" disabled>下载选中（0）</button><p>运行中任务每 3 秒自动刷新。</p></div></div>
-      <div class="filters"><button class="filter active" data-filter="all">全部</button><button class="filter" data-filter="running">执行中</button><button class="filter" data-filter="completed">已完成</button><button class="filter" data-filter="failed">异常</button></div>
+      <div class="section-heading"><div><span class="step">03</span><h2>测试记录</h2></div><div class="history-actions"><button type="button" id="selectAllDownloads" class="link-btn">全选本页可下载</button><button type="button" id="downloadSelected" class="link-btn" disabled>下载选中（0）</button><p>运行中任务每 3 秒自动刷新。</p></div></div>
+      <div class="filters"><button class="filter active" data-filter="all">全部</button><button class="filter" data-filter="running">执行中</button><button class="filter" data-filter="completed">已完成</button><button class="filter" data-filter="failed">异常</button><span class="filter-divider"></span><span class="filter-label">结论</span><button class="filter cfilter active" data-conclusion="all">全部</button><button class="filter cfilter" data-conclusion="pass">通过</button><button class="filter cfilter" data-conclusion="fail">未通过</button><button class="filter cfilter" data-conclusion="pending">待判定</button></div>
+      <label class="runs-search"><span>搜索记录</span><input id="runsSearch" type="search" placeholder="测试名称、记录 ID、模型、接口地址或创建时间" autocomplete="off" /></label>
       <div class="table-wrap panel"><table><thead><tr><th class="select-col">选择</th><th>测试 / 创建时间</th><th>模型与地址</th><th>状态</th><th>结论</th><th>耗时</th><th>产物</th></tr></thead><tbody id="runRows"><tr><td colspan="7" class="empty">暂无测试记录</td></tr></tbody></table></div>
+      <nav class="runs-pagination" aria-label="测试记录分页"><div class="runs-page-size"><span id="runsPageInfo">0 条记录</span><label for="runsPageSize">每页</label><select id="runsPageSize" aria-label="每页显示条数"><option value="5">5</option><option value="10">10</option><option value="20" selected>20</option><option value="50">50</option></select></div><div><button type="button" class="link-btn" id="runsPrev" disabled>上一页</button><button type="button" class="link-btn" id="runsNext" disabled>下一页</button></div></nav>
     </section>
   </main>
 

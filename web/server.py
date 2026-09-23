@@ -7,6 +7,7 @@ import mimetypes
 import os
 import queue
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from volcperf.protocols import (
     PROTOCOLS,
@@ -33,7 +34,7 @@ from volcperf.protocols import (
     parse_models,
     supports_test_kind,
 )
-from volcperf.config import ApiConfig
+from volcperf.config import ApiConfig, trust_env_enabled
 from volcperf.cases import CASES as LOAD_CASES
 from volcperf.connectivity import check_connectivity
 from kvv.cases import CASES as KVV_CASES
@@ -694,9 +695,43 @@ class Handler(BaseHTTPRequestHandler):
             legal_case = {"id": "LEGAL_AGENT_BENCHMARK", "test_kind": "legal-agent-benchmark", "source": "Harvey Labs v1.0 官方开源数据集", "executor": "scripts/run_legal_agent_benchmark.py（官方 harness + evaluator）", "title": LEGAL_AGENT_BENCHMARK_CASE.title, "description": LEGAL_AGENT_BENCHMARK_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": LEGAL_AGENT_BENCHMARK_CASE.cost, "protocols": list(LEGAL_AGENT_BENCHMARK_CASE.protocols), "concurrency": 1, "concurrency_text": "由官方 harness 管理 Agent 工具循环", "requests": None, "request_text": "官方 v1.0 Legal Agent 任务集", "case_count": 1, "case_count_text": "1 个任务（默认抽样）", "input_tokens": "法律材料 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 evaluator 完成评分；使用官方任务、材料、rubric 和 harness，不在本项目重写。"}
             return self.json_response(load_cases + kvv_cases + deepseek_cases + glm_cases + gpt_image_cases + awsb_cases + moderation_cases + temporary_cases + [arxivmath_case, deepswe_case, sweatlas_case, sweatlas_rf_case, legal_case])
         if path == "/api/runs":
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                page = max(1, int(query.get("page", ["1"])[0]))
+                page_size = min(100, max(1, int(query.get("page_size", ["20"])[0])))
+            except (TypeError, ValueError):
+                return self.json_response({"error": "分页参数无效"}, 400)
+            status_filter = query.get("status", ["all"])[0]
+            conclusion_filter = query.get("conclusion", ["all"])[0]
+            search = query.get("q", [""])[0].strip()[:120]
+            where = ["batch_id IS NULL"]
+            params: list[Any] = []
+            if status_filter == "running":
+                where.append("status IN ('queued','running')")
+            elif status_filter == "failed":
+                where.append("status IN ('failed','interrupted')")
+            elif status_filter in {"queued", "completed", "interrupted"}:
+                where.append("status=?")
+                params.append(status_filter)
+            if conclusion_filter == "pass":
+                where.append("passed=1")
+            elif conclusion_filter == "fail":
+                where.append("passed=0")
+            elif conclusion_filter == "pending":
+                where.append("passed IS NULL")
+            if search:
+                pattern = f"%{search}%"
+                where.append("(id LIKE ? OR case_name LIKE ? OR case_ids LIKE ? OR test_kind LIKE ? OR model LIKE ? OR base_url LIKE ? OR protocol LIKE ? OR created_at LIKE ?)")
+                params.extend([pattern] * 8)
+            clause = " AND ".join(where)
             with db() as connection:
-                rows = connection.execute("SELECT * FROM runs WHERE batch_id IS NULL ORDER BY created_at DESC LIMIT 200").fetchall()
-            return self.json_response([public_run(row) for row in rows])
+                total = connection.execute(f"SELECT COUNT(*) FROM runs WHERE {clause}", params).fetchone()[0]
+                rows = connection.execute(
+                    f"SELECT * FROM runs WHERE {clause} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    [*params, page_size, (page - 1) * page_size],
+                ).fetchall()
+            return self.json_response({"items": [public_run(row) for row in rows], "total": total,
+                                       "page": page, "page_size": page_size})
         parts = path.strip("/").split("/")
         if len(parts) >= 3 and parts[:2] == ["api", "runs"]:
             run_id = parts[2]
@@ -778,6 +813,41 @@ class Handler(BaseHTTPRequestHandler):
             return self.text_response("Not Found", status=404)
         return self.serve_file(target)
 
+    def do_DELETE(self) -> None:
+        request_path = urlparse(self.path).path
+        if not request_path.startswith("/api/runs/"):
+            return self.json_response({"error": "不支持的删除目标"}, 404)
+        run_id = unquote(request_path.removeprefix("/api/runs/")).strip("/")
+        if not run_id or "/" in run_id:
+            return self.json_response({"error": "记录 ID 无效"}, 400)
+        with db() as connection:
+            row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not row:
+                return self.json_response({"error": "记录不存在"}, 404)
+            if row["batch_id"]:
+                return self.json_response({"error": "批次子记录不能单独删除，请删除整个批次"}, 409)
+            records = [row]
+            if row["is_batch"]:
+                records.extend(connection.execute("SELECT * FROM runs WHERE batch_id=?", (run_id,)).fetchall())
+            if any(record["status"] in {"queued", "running"} for record in records):
+                return self.json_response({"error": "运行中的记录不能删除，请先等待结束或停止任务"}, 409)
+
+            directories: set[Path] = set()
+            allowed = RESULTS.resolve()
+            for record in records:
+                if not record["result_dir"]:
+                    continue
+                directory = (ROOT / record["result_dir"]).resolve()
+                if allowed not in directory.parents or not directory.is_dir():
+                    continue
+                directories.add(directory)
+            for directory in directories:
+                shutil.rmtree(directory)
+
+            ids = [record["id"] for record in records]
+            connection.executemany("DELETE FROM runs WHERE id=?", [(record_id,) for record_id in ids])
+        return self.json_response({"id": run_id, "deleted_records": len(ids)})
+
     def do_POST(self) -> None:
         request_path = urlparse(self.path).path
         if request_path == "/api/runs/download":
@@ -848,7 +918,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("api_key 不能为空")
                 if not model:
                     raise ValueError("model 不能为空")
-                config = ApiConfig(api_key=api_key, base_url=base_url, model=model, protocol=protocol)
+                config = ApiConfig(api_key=api_key, base_url=base_url, model=model, protocol=protocol,
+                                   trust_env=trust_env_enabled())
                 result = check_connectivity(config)
                 return self.json_response(result, 200 if result["passed"] else 502)
             except (ValueError, json.JSONDecodeError) as exc:
@@ -865,7 +936,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not api_key:
                     raise ValueError("api_key 不能为空")
                 try:
-                    response = httpx.get(models_endpoint(protocol, base_url), headers=models_headers(protocol, api_key), timeout=30, follow_redirects=False)
+                    response = httpx.get(models_endpoint(protocol, base_url), headers=models_headers(protocol, api_key), timeout=30, follow_redirects=False, trust_env=trust_env_enabled())
                 except httpx.HTTPError as exc:
                     return self.json_response({"error": f"模型接口连接失败: {exc}"}, 502)
                 if not 200 <= response.status_code < 300:
