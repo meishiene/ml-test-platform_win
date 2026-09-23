@@ -186,15 +186,14 @@ VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /
 
 ### 哪些临时案例跑不了（`not_evaluable`）
 
-清单里有 14 条用例只写了场景、没有可发送的请求内容（缺 `messages`），执行器不会为它们伪造请求，直接判 `not_evaluable`：
+当前有 4 条用例只写了场景、没有可发送的请求内容（缺 `messages`），执行器不会为它们伪造请求，直接判 `not_evaluable`：
 
 | 案例 | 场景字段 | 缺什么 |
 |---|---|---|
-| `CACHE-HIT-10`(7)、`CACHE-TTL-3`(3) | `phase` / `warm_input_tokens_target` / `same_prefix_byte_exact` / `append_tail` / `wait_seconds` | 需要 warm→probe 两段式缓存执行器 |
 | `K3-AUTH-002`、`K3-TOOL-002`、`K3-TOOL-003` | `scenario` | 需要人为构造限流 / 多工具并发场景 |
 | `K3-AUTH-001` | `headers`(无效 key) | 清单未给请求体，补一条 `messages` 即可恢复为可执行 |
 
-缓存能力在 `k3perf/`（`CACHE_T0`/`CACHE_L1–L4`/`CACHE_C1`，基于 `data_cache/CI*.jsonl.gz` 的公共前缀配方，判定 `cache_ratio` 0.80–0.90）已有完整实现，但**尚未接入 Web**，也不为临时清单的缓存批次服务。要真正跑通 `CACHE-HIT-10`，需把该批次接到 `k3perf` 或用 `validators.cache_ratio` 另建 warm→probe 执行器。
+`CACHE-HIT-10` 和 `CACHE-TTL-3` 已由 `scripts/run_temp_cases.py` 的专用执行器支持：先发送一次 warm 请求，再按原子案例逐条发送同前缀 probe；`CACHE-TTL-3` 在 warm 后等待 30 秒。每次请求都写入 `execution.jsonl`，probe 通过 `cached_tokens / prompt_tokens >= 80%` 判定命中。独立的 `k3perf/` 缓存压测（`CACHE_T0`/`CACHE_L1–L4`/`CACHE_C1`）仍保留，用于并发和长稳态缓存指标。
 
 退出码约定：`0` 通过，`2` 未通过或数据不足。
 
