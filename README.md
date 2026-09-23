@@ -140,7 +140,7 @@ L1–L4 另需 `TTFC P90 ≤ 同档 B1 基线的 3 倍`，因此**必须先有 B
 | `glm` | `GLM_53_CORE` / `AGENT` / `CACHE` / `FINGERPRINT` | 含缓存命中率 ≥70% 门槛 |
 | `gpt-image` | `GPT_IMAGE_2` / `GPT_IMAGE_25` / `GPT_IMAGE_4K_TOKEN_VERIFY` | 图像并发压测 + 4K token 验真 |
 | `awsb` | `AWSB-O5-01`–`04` + `AWSB-O5-CACHE` | Anthropic Messages 协议网关自检（身份 / thinking / 边界 / 流式工具 / 缓存） |
-| `open-source` | `ARXIVMATH` / `DEEPSWE` / `SWE_ATLAS_TW` / `SWE_ATLAS_RF` / `LEGAL_AGENT_BENCHMARK` | 5 项开源基准，走官方数据集与官方 verifier（**当前 Web 侧接线缺失，见已知问题**） |
+| `open-source` | `ARXIVMATH` / `DEEPSWE` / `SWE_ATLAS_TW` / `SWE_ATLAS_RF` / `LEGAL_AGENT_BENCHMARK` | 5 项开源基准，CLI runner 已实现；Web 侧脚本分发仍有未定义常量，见已知问题 |
 | `temporary` | `K3_TEMP_SUITE`（24 个合并案例 / 68 条原子请求） | 清单驱动用例；同 `category` 且同 `request.batch` 的重复请求合并为一个逻辑案例，执行时逐条发起、分别留证。唯一完整走通四层契约的套件 |
 | `moderation` | `MOD_GENERAL_COMMON` / `MOD_PARTNER_COMMON` / `MOD_PARTNER_SMOKE` | SillyTavern 上下文劫持 + 关键词变体，含不变性分组 |
 | `authenticity` | `DS_AUTH_FINGERPRINT` / `DS_V4_FINGERPRINT` | 6 探针：动态 required 工具、随机 JSON Schema、多轮记忆、reasoning 字段、SSE 完整性、静默吞参对照 |
@@ -289,10 +289,9 @@ VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /
 
 ### P0
 
-1. **5 个开源基准无法从 UI 运行，且会拖死任务队列**
-   `web/server.py` 的脚本分发表引用了 6 个从未定义的常量：`ARXIVMATH_SCRIPT`、`DEEPSWE_SCRIPT`、`SWE_ATLAS_TW_SCRIPT`、`SWE_ATLAS_RF_SCRIPT`、`LEGAL_AGENT_BENCHMARK_SCRIPT`、`GLM_STREAM_RETEST_SCRIPT`。
-   触发即 `NameError`；而 `worker()` 只有 `try/finally`、没有 `except`，异常会逃逸出线程 → **队列永久卡死，必须重启进程**。
-   注：这 5 个 runner 脚本（`scripts/run_arxivmath.py` 等）本身是完整实现，仅 Web 侧接线缺失。
+1. **5 个开源基准仍无法从 UI 正常运行**
+   `web/server.py` 的脚本分发表仍引用了 6 个未定义的常量：`ARXIVMATH_SCRIPT`、`DEEPSWE_SCRIPT`、`SWE_ATLAS_TW_SCRIPT`、`SWE_ATLAS_RF_SCRIPT`、`LEGAL_AGENT_BENCHMARK_SCRIPT`、`GLM_STREAM_RETEST_SCRIPT`。
+   触发时会产生 `NameError`；CLI runner（`scripts/run_arxivmath.py` 等）本身已经实现，可直接从命令行运行。Web worker 现在会捕获任务异常并将任务标为 `failed`，提交新任务时也会自动拉起已退出的 worker，不再因为单个任务异常永久卡死队列。
 
 2. **平台无入站鉴权**，且 `start.sh` 默认监听 `0.0.0.0`。
    同网段任何人都可以提交测试（消耗你的 API 额度）、读取全部报告与 `requests.jsonl`、打包下载。对外暴露前请改为 `127.0.0.1` 或加一层 Bearer 校验。
@@ -309,7 +308,7 @@ VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /
 ### P1
 
 4. **空断言恒过**：`common/test_framework.py:validate_case(record, [])` 对任意 HTTP 状态和传输异常都返回 `passed`；`common/validators.py` 的 `content()` / `tool_calls()` 无参调用恒真。漏挂断言的新用例会静默通过。
-5. **单 worker 串行 + 子进程无超时**：一个卡住的测试会阻塞整条队列；`cancel` 对排队中的任务只改数据库状态，不摘队列，任务仍会启动并消耗额度。
+5. **单 worker 串行 + 子进程无超时**：一个卡住的测试会阻塞整条队列；`cancel` 对排队中的任务只改数据库状态，不摘队列，任务仍会启动并消耗额度。worker 异常隔离和自动拉起已覆盖，但单任务超时和排队任务取消仍待改进。
 6. **KVV 准入忽略 `skipped`**（`kvv/runner.py`）：pytest 全 skip 时退出码为 0，仍会判通过。该套件唯一的 tokenization groundtruth 断言目前被 `@pytest.mark.skip("skip, not pass")` 标记。
 7. **`authenticity` 永远显示未通过**：其 summary 不含 `admission_passed`，被终审规则 `original AND ...` 判为 False，即使 6 个探针全过。
 
