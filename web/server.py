@@ -322,6 +322,7 @@ AUTH_META = {
 JOB_QUEUE: queue.Queue[dict[str, Any]] = queue.Queue()
 WORKER_STARTED = False
 WORKER_LOCK = threading.Lock()
+WORKER_THREAD: threading.Thread | None = None
 ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 ACTIVE_LOCK = threading.Lock()
 CANCELLED_RUNS: set[str] = set()
@@ -369,6 +370,20 @@ def update(run_id: str, **values: Any) -> None:
     assignments = ", ".join(f"{key}=?" for key in values)
     with db() as connection:
         connection.execute(f"UPDATE runs SET {assignments} WHERE id=?", (*values.values(), run_id))
+
+
+def _mark_worker_failure(job: dict[str, Any], exc: BaseException) -> None:
+    """Make an executor crash visible instead of leaving jobs queued forever."""
+    detail = f"后台测试 worker 异常：{type(exc).__name__}: {exc}"
+    run_ids = [job["id"]]
+    if job.get("is_batch"):
+        run_ids.extend(child["id"] for child in job.get("children", []))
+    for run_id in run_ids:
+        try:
+            update(run_id, status="failed", finished_at=now_iso(), exit_code=-1, error=detail)
+        except Exception:
+            # A database failure must not be allowed to kill the worker too.
+            pass
 
 
 def latest_result(case_name: str, since: float, *, aliases: tuple[str, ...] = ()) -> Path | None:
@@ -597,11 +612,15 @@ def worker() -> None:
     while True:
         job = JOB_QUEUE.get()
         try:
-            if job.get("is_batch"):
-                update(job["id"],status="running",started_at=now_iso())
-                for child in job["children"]: _execute_child(child)
-                _finalize_batch(job)
-            else: _execute_child(job)
+            try:
+                if job.get("is_batch"):
+                    update(job["id"],status="running",started_at=now_iso())
+                    for child in job["children"]: _execute_child(child)
+                    _finalize_batch(job)
+                else:
+                    _execute_child(job)
+            except BaseException as exc:
+                _mark_worker_failure(job, exc)
         finally:
             job["api_key"] = ""
             for child in job.get("children",[]): child["api_key"]=""
@@ -609,11 +628,14 @@ def worker() -> None:
 
 
 def start_worker() -> None:
-    global WORKER_STARTED
+    global WORKER_STARTED, WORKER_THREAD
     with WORKER_LOCK:
-        if not WORKER_STARTED:
-            threading.Thread(target=worker, name="test-worker", daemon=True).start()
+        if WORKER_THREAD is not None and WORKER_THREAD.is_alive():
             WORKER_STARTED = True
+            return
+        WORKER_THREAD = threading.Thread(target=worker, name="test-worker", daemon=True)
+        WORKER_THREAD.start()
+        WORKER_STARTED = True
 
 
 def public_run(row: sqlite3.Row) -> dict[str, Any]:
@@ -1075,6 +1097,7 @@ class Handler(BaseHTTPRequestHandler):
                         connection.execute("INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                            (child_id,test_kind,name,protocol,base_url,model,"queued",int(quick),child_created,run_id))
                         children.append({"id":child_id,"batch_id":run_id,"test_kind":test_kind,"case":name,"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"temporary_case":temporary_case})
+                start_worker()
                 JOB_QUEUE.put({"id":run_id,"is_batch":True,"test_kind":test_kind,"api_key":api_key,"children":children})
             else:
                 execution = execution_cases[0]
@@ -1082,6 +1105,7 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as connection:
                     connection.execute("INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,case_ids) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                        (run_id,test_kind,stored_case_name,protocol,base_url,model,"queued",int(quick),created,json.dumps(case_names)))
+                start_worker()
                 JOB_QUEUE.put({"id":run_id,"test_kind":test_kind,"case":execution["name"],"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"temporary_case":temporary_case})
             with db() as connection:
                 row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()

@@ -45,6 +45,25 @@ class WebTests(unittest.TestCase):
                 )
             self.assertEqual(found, suite_result)
 
+    def test_worker_failure_marks_job_failed_instead_of_dying_silently(self):
+        run_id = f"worker-failure-{time.time_ns()}"
+        with server.db() as connection:
+            connection.execute(
+                "INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (run_id, "load", "T0", "openai", "https://example.com", "m", "queued", 0,
+                 time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())),
+            )
+        try:
+            server._mark_worker_failure({"id": run_id}, RuntimeError("boom"))
+            with server.db() as connection:
+                row = connection.execute("SELECT status,error,exit_code FROM runs WHERE id=?", (run_id,)).fetchone()
+            self.assertEqual(row["status"], "failed")
+            self.assertEqual(row["exit_code"], -1)
+            self.assertIn("RuntimeError: boom", row["error"])
+        finally:
+            with server.db() as connection:
+                connection.execute("DELETE FROM runs WHERE id=?", (run_id,))
+
     def test_single_temporary_run_persists_selected_case_name(self):
         payload = json.dumps({
             "protocol": "volcengine", "test_kind": "temporary",
