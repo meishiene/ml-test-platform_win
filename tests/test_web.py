@@ -150,13 +150,13 @@ class WebTests(unittest.TestCase):
             for index, run_id in enumerate(ids):
                 connection.execute(
                     "INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,passed) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (run_id, "load", "T0", "openai", "https://example.com", "m", "completed", 0,
-                     f"{now[:-6]}{index:02d}+00:00", index % 2),
+                    (run_id, "load", "T0", "openai", "https://pagination.example.test", "m", "completed", 0,
+                     f"{now[:-6]}{index:02d}+00:00", int(index != 1)),
                 )
         try:
             first = self.get_json("/api/runs?page=1&page_size=2&conclusion=pass")
             second = self.get_json("/api/runs?page=2&page_size=2&conclusion=pass")
-            searched = self.get_json("/api/runs?page=1&page_size=2&q=example.com")
+            searched = self.get_json("/api/runs?page=1&page_size=2&q=pagination.example.test")
             self.assertEqual((first["total"], len(first["items"])), (2, 2))
             self.assertEqual((second["total"], len(second["items"])), (2, 0))
             self.assertEqual(searched["total"], 3)
