@@ -35,7 +35,9 @@ class Case:
 
 
 CASES = {
-    "T0": Case("T0", "I1", 7500, 7200, 7900, 1024, "closed", concurrency=2, samples=10, core=True),
+    # T0 冒烟：thinking 默认开启时推理会吃掉大部分预算，1024 对 code 负载
+    # 系统性不足（推理未结束即 length 截断 → 零可见正文）。提到 4096 留出余量。
+    "T0": Case("T0", "I1", 7500, 7200, 7900, 4096, "closed", concurrency=2, samples=10, core=True),
     "RANDOM_LOAD": Case("RANDOM_LOAD", "RANDOM_1K_20K", 10500, 1000, 20000, 2048, "closed", concurrency=10, samples=100),
     # B1 合并执行 2K/8K/16K/32K，每档固定 4 次，合计 16 次；并发统一为 2。
     "B1": Case("B1", "I1", 7500, 7200, 50000, 1024, "closed", concurrency=2, samples=16),
