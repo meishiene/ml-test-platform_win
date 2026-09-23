@@ -4,6 +4,8 @@
 审计基线：`32bd2d0`（master，工作区干净）
 审计范围：仓库内 159 个 Python 文件 / 约 17,900 行（排除 `.venv`），含 `web/`、`common/`、`scripts/`、`volcperf/`、`k3perf/`、`kvv/`、`strictperf/`、`dsv4/`、`glm53/`、`gpt_image/`、`vendor_verifier/`、`moderation_*`、`tests/`
 
+> **历史快照说明（复核于 2026-09-23）**：本文保留 2026-09-22 审计时的原始现象和复现步骤，不回写历史结论。后续已修复：worker 异常隔离/自动拉起、Web 列表分页测试夹具，以及 `vendor_verifier/.venv` 运行环境。仍未修复：`web/server.py` 中开源基准和 GLM 流式复测的脚本路径常量未定义、KVV 全 skip 仍可能被判准入通过、authenticity 缺少 `admission_passed` 等问题。
+
 ---
 
 ## 一、总体判断

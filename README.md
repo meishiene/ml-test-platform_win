@@ -288,21 +288,17 @@ VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /
 
 ### P0
 
-1. **5 个开源基准仍无法从 UI 正常运行**
+1. **5 个开源基准与 1 个 GLM 流式复测仍无法从 UI 正常运行**
    `web/server.py` 的脚本分发表仍引用了 6 个未定义的常量：`ARXIVMATH_SCRIPT`、`DEEPSWE_SCRIPT`、`SWE_ATLAS_TW_SCRIPT`、`SWE_ATLAS_RF_SCRIPT`、`LEGAL_AGENT_BENCHMARK_SCRIPT`、`GLM_STREAM_RETEST_SCRIPT`。
    触发时会产生 `NameError`；CLI runner（`scripts/run_arxivmath.py` 等）本身已经实现，可直接从命令行运行。Web worker 现在会捕获任务异常并将任务标为 `failed`，提交新任务时也会自动拉起已退出的 worker，不再因为单个任务异常永久卡死队列。
 
 2. **平台无入站鉴权**，且 `start.sh` 默认监听 `0.0.0.0`。
    同网段任何人都可以提交测试（消耗你的 API 额度）、读取全部报告与 `requests.jsonl`、打包下载。对外暴露前请改为 `127.0.0.1` 或加一层 Bearer 校验。
 
-3. **`vendor_verifier/.venv` 缺失**，官方 KVV 套件无法执行。
-   `kvv/runner.py` 默认使用 `vendor_verifier/.venv/bin/python`。恢复方式：
-
-   ```bash
-   ln -s ../.venv vendor_verifier/.venv
-   ```
-
-   （该路径已在 `.gitignore` 中，软链不会被提交。）当前 `tests/test_kvv.py` 因此有 1 条失败。
+3. **KVV 依赖独立的官方 Python 环境**。
+   `kvv/runner.py` 默认使用 `vendor_verifier/.venv/bin/python`，也可以通过
+   `KVV_HOME` / `KVV_PYTHON` 显式指定官方套件目录和解释器。当前工作区已具备该环境，
+   `tests/test_kvv.py` 可通过；在新环境部署时需先按官方套件要求创建该虚拟环境。
 
 ### P1
 
