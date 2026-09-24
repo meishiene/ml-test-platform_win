@@ -22,7 +22,7 @@ PROTOCOLS = {
     "openai": Protocol(
         "openai", "OpenAI", "Chat Completions", "https://api.openai.com", "/v1/chat/completions",
         "文字、视觉输入、工具调用与流式输出", "例如 gpt-5-mini", "openai",
-        ("load", "kvv", "deepseek", "glm", "authenticity", "moderation", "temporary",
+        ("load", "kvv", "deepseek", "glm", "gpt", "authenticity", "moderation", "temporary",
          "arxivmath", "deepswe", "swe-atlas-tw", "swe-atlas-rf", "legal-agent-benchmark"),
     ),
     "openai_responses": Protocol(

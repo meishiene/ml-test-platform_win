@@ -370,7 +370,7 @@ $('#runsSearch').oninput=event=>{
 (async function init(){
   try {
     const saved=readPersistedForm();
-    state.testKind=['load','kvv','deepseek','glm','gpt-image','awsb','open-source','temporary','moderation'].includes(saved.testKind)?saved.testKind:'load';
+    state.testKind=['load','kvv','deepseek','glm','gpt','gpt-image','awsb','open-source','temporary','moderation'].includes(saved.testKind)?saved.testKind:'load';
     document.querySelectorAll('.kind-tab').forEach(button=>button.classList.toggle('active',button.dataset.kind===state.testKind));
     $('#quick').closest('.mode-toggle').style.display=state.testKind==='load'?'flex':'none';
     state.protocols=await api('/api/protocols');

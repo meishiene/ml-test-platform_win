@@ -40,6 +40,7 @@ from volcperf.connectivity import check_connectivity
 from kvv.cases import CASES as KVV_CASES
 from dsv4.cases import CASES as DEEPSEEK_CASES
 from glm53.cases import CASES as GLM_CASES
+from gpt56.cases import CASES as GPT56_CASES
 from authenticity import CASES as AUTH_CASES
 from gpt_image import CASES as GPT_IMAGE_CASES
 from awsb import CASE_SPECS as AWSB_CASE_SPECS, CACHE_CASE_SPECS as AWSB_CACHE_CASE_SPECS
@@ -65,6 +66,7 @@ KVV_SCRIPT = ROOT / "scripts" / "run_kvv.py"
 # 注意：init 时代的旧副本 k3perf/deepseek_v4.py 与 scripts/run_deepseek_v4.py 已删除，不要再引入。
 DEEPSEEK_SCRIPT = ROOT / "scripts" / "run_dsv4.py"
 GLM_SCRIPT = ROOT / "scripts" / "run_glm53.py"
+GPT56_SCRIPT = ROOT / "scripts" / "run_gpt56.py"
 CONTRACT_SCRIPT = ROOT / "scripts" / "run_contracts.py"
 AUTH_SCRIPT = ROOT / "scripts" / "run_authenticity.py"
 GPT_IMAGE_SCRIPT = ROOT / "scripts" / "run_gpt_image.py"
@@ -253,11 +255,12 @@ def awsb_case_payload(spec: Any) -> dict[str, Any]:
 
 def capability_case_payload(name: str, kind: str, case: Any, meta: tuple[str, str, str, str]) -> dict[str, Any]:
     source = "官方 KVV 工具" if kind == "kvv" else "专项自研代码"
-    executor = "scripts/run_kvv.py（官方 pytest）" if kind == "kvv" else ("scripts/run_dsv4.py" if kind == "deepseek" else "scripts/run_glm53.py")
+    executor = ("scripts/run_kvv.py（官方 pytest）" if kind == "kvv" else "scripts/run_dsv4.py" if kind == "deepseek" else
+                "scripts/run_glm53.py" if kind == "glm" else "scripts/run_gpt56.py")
     return {"id":name,"test_kind":kind,"title":meta[0],"description":meta[1],"source":source,"executor":executor,"title_badge":source,"duration":meta[2],"cost":meta[3],
             "concurrency":case.concurrency,"concurrency_text":str(case.concurrency),"requests":case.request_count,"request_text":str(case.request_count),
             "input_tokens":"按官方/专项用例动态输入","warmup":None,"steady":None,
-            "admission":(("官方 pytest 所选扩展套件退出码为0且无失败/错误；仅在供应商承诺动态工具与 Thinking Effort 时作为硬门槛。" if name=="KVV_K3_EXTENSIONS" else "官方 pytest 所选核心套件退出码为0，且失败数和错误数均为0；跳过项单独记录。") if kind=="kvv" else ("3组数据共6次探测均返回缓存usage；平均命中率目标80%，允许±10个百分点（最低70%），单组不得低于50%。" if name=="GLM_53_CACHE" else "所有 GLM 5.3 已评估用例无 failed/error；工具、深度思考和结构化输出按接口实际声明能力判定。" if kind=="glm" else "所有已评估用例无 failed/error；warning 与 blocked 仅记录，不否决准入。")),
+            "admission":(("官方 pytest 所选扩展套件退出码为0且无失败/错误；仅在供应商承诺动态工具与 Thinking Effort 时作为硬门槛。" if name=="KVV_K3_EXTENSIONS" else "官方 pytest 所选核心套件退出码为0，且失败数和错误数均为0；跳过项单独记录。") if kind=="kvv" else ("3组数据共6次探测均返回缓存usage；平均命中率目标80%，允许±10个百分点（最低70%），单组不得低于50%。" if name=="GLM_53_CACHE" else "所有 GLM 5.3 已评估用例无 failed/error；工具、深度思考和结构化输出按接口实际声明能力判定。" if kind=="glm" else "所有 GPT-5.6 已评估用例无 failed/error/blocked（warning 仅留痕）；判定口径详见 docs/GPT5.6专项测试用例设计.md。" if kind=="gpt" else "所有已评估用例无 failed/error；warning 与 blocked 仅记录，不否决准入。")),
             "protocols":list(case.protocols)}
 
 def auth_case_payload(name: str) -> dict[str, Any]:
@@ -318,6 +321,7 @@ def gpt_image_case_payload(name: str) -> dict[str, Any]:
 KVV_META = {name: (case.title, case.description, "按检查项执行", case.cost) for name, case in KVV_CASES.items()}
 DEEPSEEK_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in DEEPSEEK_CASES.items()}
 GLM_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in GLM_CASES.items()}
+GPT56_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in GPT56_CASES.items()}
 AUTH_META = {
     "DS_AUTH_FINGERPRINT": ("DeepSeek 满血能力指纹", "随机挑战、Thinking、工具、结构化输出、流式和静默吞参检查", "按随机挑战执行", "中"),
     "K3_AUTH_FINGERPRINT": ("Kimi K3 满血能力指纹", "随机挑战、工具、结构化输出、上下文、流式和参数行为检查", "按随机挑战执行", "中"),
@@ -491,7 +495,7 @@ def _execute_child(job: dict[str, Any]) -> None:
         })
     if job["test_kind"] == "awsb":
         env.update({"AWSB_API_KEY": job["api_key"], "AWSB_BASE_URL": job["base_url"], "AWSB_MODEL": job["model"], "AWSB_MESSAGES_PATH": "/v1/messages"})
-    script = TEMP_SCRIPT if job["test_kind"] == "temporary" else GPT_IMAGE_TOKEN_SCRIPT if job["case"] == GPT_IMAGE_TOKEN_CASE else GPT_IMAGE_SCRIPT if job["test_kind"] == "gpt-image" else LEGAL_AGENT_BENCHMARK_SCRIPT if job["test_kind"] == "legal-agent-benchmark" else SWE_ATLAS_RF_SCRIPT if job["test_kind"] == "swe-atlas-rf" else SWE_ATLAS_TW_SCRIPT if job["test_kind"] == "swe-atlas-tw" else DEEPSWE_SCRIPT if job["test_kind"] == "deepswe" else ARXIVMATH_SCRIPT if job["test_kind"] == "arxivmath" else AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else RUN_SCRIPT
+    script = TEMP_SCRIPT if job["test_kind"] == "temporary" else GPT_IMAGE_TOKEN_SCRIPT if job["case"] == GPT_IMAGE_TOKEN_CASE else GPT_IMAGE_SCRIPT if job["test_kind"] == "gpt-image" else LEGAL_AGENT_BENCHMARK_SCRIPT if job["test_kind"] == "legal-agent-benchmark" else SWE_ATLAS_RF_SCRIPT if job["test_kind"] == "swe-atlas-rf" else SWE_ATLAS_TW_SCRIPT if job["test_kind"] == "swe-atlas-tw" else DEEPSWE_SCRIPT if job["test_kind"] == "deepswe" else ARXIVMATH_SCRIPT if job["test_kind"] == "arxivmath" else AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else GPT56_SCRIPT if job["test_kind"] == "gpt" else RUN_SCRIPT
     # Most runners historically accept the case as a positional argument, but
     # the AWSB runner intentionally exposes it as a repeatable --case option.
     # Passing an AWSB case positionally makes argparse abort before any request
@@ -705,6 +709,7 @@ class Handler(BaseHTTPRequestHandler):
             kvv_cases = [capability_case_payload(name, "kvv", KVV_CASES[name], KVV_META[name]) for name in KVV_CASES]
             deepseek_cases = [auth_case_payload(name) if name == "DS_V4_FINGERPRINT" else capability_case_payload(name, "deepseek", DEEPSEEK_CASES[name], DEEPSEEK_META[name]) for name in DEEPSEEK_CASES]
             glm_cases = [capability_case_payload(name, "glm", GLM_CASES[name], GLM_META[name]) for name in GLM_CASES]
+            gpt56_cases = [capability_case_payload(name, "gpt", GPT56_CASES[name], GPT56_META[name]) for name in GPT56_CASES]
             contract_cases = [contract_case_payload(name) for name in CONTRACT_CASES]
             kvv_cases += [x for x in contract_cases if x["test_kind"] == "kvv"]
             deepseek_cases += [x for x in contract_cases if x["test_kind"] == "deepseek"]
@@ -718,7 +723,7 @@ class Handler(BaseHTTPRequestHandler):
             sweatlas_case = {"id": "SWE_ATLAS_TW", "test_kind": "swe-atlas-tw", "source": "Scale AI 官方开源数据集", "executor": "scripts/run_sweatlas_tw.py（Harbor）", "title": SWE_ATLAS_TW_CASE.title, "description": SWE_ATLAS_TW_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": SWE_ATLAS_TW_CASE.cost, "protocols": list(SWE_ATLAS_TW_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Harbor 管理隔离任务", "requests": None, "request_text": "官方 TW 任务集", "case_count": 66, "case_count_text": "66 个官方任务（默认）", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
             sweatlas_rf_case = {"id": "SWE_ATLAS_RF", "test_kind": "swe-atlas-rf", "source": "Scale AI 官方开源数据集", "executor": "scripts/run_sweatlas_rf.py（Harbor）", "title": SWE_ATLAS_RF_CASE.title, "description": SWE_ATLAS_RF_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": SWE_ATLAS_RF_CASE.cost, "protocols": list(SWE_ATLAS_RF_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Harbor 管理隔离任务", "requests": None, "request_text": "官方 RF 任务集", "case_count": 66, "case_count_text": "66 个官方任务（默认）", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
             legal_case = {"id": "LEGAL_AGENT_BENCHMARK", "test_kind": "legal-agent-benchmark", "source": "Harvey Labs v1.0 官方开源数据集", "executor": "scripts/run_legal_agent_benchmark.py（官方 harness + evaluator）", "title": LEGAL_AGENT_BENCHMARK_CASE.title, "description": LEGAL_AGENT_BENCHMARK_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": LEGAL_AGENT_BENCHMARK_CASE.cost, "protocols": list(LEGAL_AGENT_BENCHMARK_CASE.protocols), "concurrency": 1, "concurrency_text": "由官方 harness 管理 Agent 工具循环", "requests": None, "request_text": "官方 v1.0 Legal Agent 任务集", "case_count": 1, "case_count_text": "1 个任务（默认抽样）", "input_tokens": "法律材料 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 evaluator 完成评分；使用官方任务、材料、rubric 和 harness，不在本项目重写。"}
-            return self.json_response(load_cases + kvv_cases + deepseek_cases + glm_cases + gpt_image_cases + awsb_cases + moderation_cases + temporary_cases + [arxivmath_case, deepswe_case, sweatlas_case, sweatlas_rf_case, legal_case])
+            return self.json_response(load_cases + kvv_cases + deepseek_cases + glm_cases + gpt56_cases + gpt_image_cases + awsb_cases + moderation_cases + temporary_cases + [arxivmath_case, deepswe_case, sweatlas_case, sweatlas_rf_case, legal_case])
         if path == "/api/runs":
             query = parse_qs(urlparse(self.path).query)
             try:
@@ -1020,7 +1025,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 选择项是合并案例 id（batch 名），原子案例 id 继续兼容。
                 if find_case(temporary_merged_cases(), temporary_case) is None:
                     raise ValueError("未知临时测试案例")
-            available = {"LEGAL_AGENT_BENCHMARK": LEGAL_AGENT_BENCHMARK_CASE} if test_kind == "legal-agent-benchmark" else {"SWE_ATLAS_RF": SWE_ATLAS_RF_CASE} if test_kind == "swe-atlas-rf" else {"SWE_ATLAS_TW": SWE_ATLAS_TW_CASE} if test_kind == "swe-atlas-tw" else {"DEEPSWE": DEEPSWE_CASE} if test_kind == "deepswe" else {"ARXIVMATH": ARXIVMATH_CASE} if test_kind == "arxivmath" else {"K3_TEMP_SUITE": temporary_case_payload()} if test_kind == "temporary" else CASES if test_kind == "load" else MODERATION_CASES if test_kind == "moderation" else KVV_CASES if test_kind == "kvv" else DEEPSEEK_CASES if test_kind == "deepseek" else GLM_CASES if test_kind == "glm" else GPT_IMAGE_CASES if test_kind == "gpt-image" else AUTH_CASES if test_kind == "authenticity" else {spec.case_id: spec for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)} if test_kind == "awsb" else {}
+            available = {"LEGAL_AGENT_BENCHMARK": LEGAL_AGENT_BENCHMARK_CASE} if test_kind == "legal-agent-benchmark" else {"SWE_ATLAS_RF": SWE_ATLAS_RF_CASE} if test_kind == "swe-atlas-rf" else {"SWE_ATLAS_TW": SWE_ATLAS_TW_CASE} if test_kind == "swe-atlas-tw" else {"DEEPSWE": DEEPSWE_CASE} if test_kind == "deepswe" else {"ARXIVMATH": ARXIVMATH_CASE} if test_kind == "arxivmath" else {"K3_TEMP_SUITE": temporary_case_payload()} if test_kind == "temporary" else CASES if test_kind == "load" else MODERATION_CASES if test_kind == "moderation" else KVV_CASES if test_kind == "kvv" else DEEPSEEK_CASES if test_kind == "deepseek" else GLM_CASES if test_kind == "glm" else GPT56_CASES if test_kind == "gpt" else GPT_IMAGE_CASES if test_kind == "gpt-image" else AUTH_CASES if test_kind == "authenticity" else {spec.case_id: spec for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)} if test_kind == "awsb" else {}
             if test_kind in {"kvv", "deepseek", "glm"}:
                 available = dict(available)
                 available.update({name: item for name, item in CONTRACT_CASES.items() if item["test_kind"] == test_kind})
@@ -1062,7 +1067,7 @@ class Handler(BaseHTTPRequestHandler):
                     return GPT_IMAGE_CASES[name].protocols
                 if name in CONTRACT_CASES:
                     return CONTRACT_CASES[name]["protocols"]
-                return KVV_CASES[name].protocols if test_kind == "kvv" else DEEPSEEK_CASES[name].protocols if test_kind == "deepseek" else GLM_CASES[name].protocols if test_kind == "glm" else ("openai", "volcengine") if test_kind == "authenticity" else ("openai", "volcengine") if test_kind == "moderation" else ("anthropic",) if test_kind == "awsb" else tuple(PROTOCOLS)
+                return KVV_CASES[name].protocols if test_kind == "kvv" else DEEPSEEK_CASES[name].protocols if test_kind == "deepseek" else GLM_CASES[name].protocols if test_kind == "glm" else GPT56_CASES[name].protocols if test_kind == "gpt" else ("openai", "volcengine") if test_kind == "authenticity" else ("openai", "volcengine") if test_kind == "moderation" else ("anthropic",) if test_kind == "awsb" else tuple(PROTOCOLS)
             unsupported = [name for name in case_names if not supports_test_kind(protocol, test_kind, protocols_for(name))]
             if unsupported:
                 raise ValueError(f"{', '.join(unsupported)} 不支持 {protocol} 协议")
