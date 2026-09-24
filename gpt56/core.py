@@ -14,6 +14,10 @@ generation》），使用原始 HTTP 请求，避免 SDK 对扩展字段的过�
 
 与 dsv4 不同：GPT-5.6 无 beta / anthropic 特殊端点，所有请求都挂在 openai 家族根
 （{base}/v1）下，不存在"剥版本后缀"的地址派生问题。
+
+判定口径补充（2026-09-24）：上游 5xx / 连接错误属瞬时故障，先按 GPT56Config.max_retries
+退避重试，重试耗尽仍失败则该用例记 `blocked`（平台级前提不满足），不记 `failed`。
+4xx 与结构化 `model_not_found` 是确定性结论，既不重试也不降级。
 """
 from __future__ import annotations
 
@@ -44,6 +48,10 @@ class GPT56Config:
     timeout: float = 300.0
     verify_ssl: bool = True
     trust_env: bool = False
+    # 瞬时故障（上游 5xx / 连接错误）的重试次数与退避基数：网关抖动不该被记成模型失败。
+    # 重试耗尽后仍失败 → 用例按 blocked 收口（见 _transient_reason）。
+    max_retries: int = 2
+    retry_backoff_seconds: float = 1.0
 
 
 @dataclass
@@ -252,6 +260,64 @@ def _model_not_found_reason(requested_model: str, status: int, body: dict[str, A
     return f"未知模型被拒绝（HTTP {status}，code={code or 'n/a'}）：网关用非 4xx 状态码承载了「模型不存在」的语义，模型校验契约成立"
 
 
+# ---------------------------------------------------------------------------
+# 瞬时故障（上游 5xx / 连接错误）
+#
+# 真实批次证据（2026-09-24，results/GPT56_P0-20260924-153058/requests.jsonl）：
+# mux.la 中转对 GPT56-12 / GPT56-16 返回
+#   HTTP 503 {"code":"system_memory_overloaded",
+#             "message":"system memory overloaded (current: 91.5%, threshold: 90%)"}
+# 且 GPT56-12 第二跳叠加 ConnectError。这类故障不由被测模型决定，请求也未产生有效响应，
+# 因此：① 先做有限重试（5xx / 连接错误）；② 重试耗尽后用例按 blocked 收口，不记 failed。
+# 注意与"上游明确拒绝某参数"（4xx）区分：后者是确定性判定，既不重试也不降级。
+# ---------------------------------------------------------------------------
+_TRANSIENT_STATUS_MIN = 500
+
+
+def _is_transient_status(status: int | None) -> bool:
+    return isinstance(status, int) and _TRANSIENT_STATUS_MIN <= status < 600
+
+
+def _is_definitive_error(body: dict[str, Any] | None) -> bool:
+    """结构化且明确指向"模型不存在"的错误是确定性结论，不是网关抖动，不重试。
+
+    真实批次证据：New API 用 HTTP 503 + code=model_not_found 承载"未知模型"（GPT56-23），
+    该状态码虽在 5xx 区间，语义上却是确定性回答，重试只会浪费配额。
+    """
+    err = _error_body(body)
+    if not err:
+        return False
+    return str(err.get("code") or "").strip().lower() == "model_not_found"
+
+
+def _is_transient_record(record: Any) -> bool:
+    """传输层失败（连接错误/超时）或 5xx 视为瞬时故障；确定性错误与 4xx 不算。"""
+    if record.transport_status != "completed":
+        return True
+    if _is_definitive_error(record.response_body):
+        return False
+    return _is_transient_status(record.http_status)
+
+
+def _transient_event(record: Any, path: str, attempts: int) -> dict[str, Any]:
+    error = record.transport_error or {}
+    message = (_error_body(record.response_body) or {}).get("message") or str(record.response_text or "")[:160]
+    return {"path": path, "attempts": attempts, "http_status": record.http_status,
+            "transport_error": error.get("type"), "message": str(message)[:200]}
+
+
+def _transient_reason(event: dict[str, Any], total: int) -> str:
+    """瞬时故障的 blocked 理由，需自解释（谁报的错、重试了几次、为何不算模型失败）。"""
+    retried = f"已重试 {event['attempts'] - 1} 次仍失败" if event["attempts"] > 1 else "未启用重试"
+    more = f"；本用例累计 {total} 次瞬时故障" if total > 1 else ""
+    if event.get("transport_error"):
+        cause = f"链路错误 {event['transport_error']}（请求未完成）"
+    else:
+        cause = f"HTTP {event['http_status']}（原文：{event.get('message')}）"
+    return (f"上游瞬时故障：{cause}，{retried}{more}。该故障不由被测模型决定、请求未产生有效响应，"
+            f"用例目标特性未被触达，属平台级前提不满足（基础设施抖动），按 blocked 收口，建议重跑本批次")
+
+
 
 class GPT56Runner:
     def __init__(self, config: GPT56Config, client: httpx.AsyncClient | None = None, audit_dir: Path | None = None):
@@ -264,6 +330,8 @@ class GPT56Runner:
         self.audit_dir = audit_dir
         self.log: ResultLog | None = None
         self.current_case_id: str | None = None
+        # 本用例内"重试耗尽仍失败"的瞬时故障记录（5xx / 连接错误），供 run() 改判 blocked。
+        self.transient_events: list[dict[str, Any]] = []
 
     async def __aenter__(self) -> "GPT56Runner":
         if self.client is None:
@@ -297,15 +365,21 @@ class GPT56Runner:
             self.executor = HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
             await self.executor.__aenter__()
         headers = {"X-Request-ID": f"GPT56-{uuid.uuid4().hex[:16]}"}
-        record = await self.executor.execute(
-            case_id=payload.get("_case_id") or self.current_case_id or "GPT56-request",
-            url=self._url(path),
-            payload={k: v for k, v in payload.items() if k != "_case_id"},
-            headers=headers,
-            stream=stream,
-        )
-        if self.log:
-            await self.log.write(record)
+        body = {k: v for k, v in payload.items() if k != "_case_id"}
+        case_id = payload.get("_case_id") or self.current_case_id or "GPT56-request"
+        # 瞬时故障（5xx / 连接错误）做有限重试；4xx 与确定性错误（model_not_found）不重试。
+        # 每一次尝试都独立写入 requests.jsonl，重试过程本身也是证据。
+        attempts = 0
+        while True:
+            attempts += 1
+            record = await self.executor.execute(case_id=case_id, url=self._url(path), payload=body, headers=headers, stream=stream)
+            if self.log:
+                await self.log.write(record)
+            if not _is_transient_record(record) or attempts > self.config.max_retries:
+                break
+            await asyncio.sleep(self.config.retry_backoff_seconds * (2 ** (attempts - 1)))
+        if _is_transient_record(record):
+            self.transient_events.append(_transient_event(record, path, attempts))
         if not stream:
             return ApiResponse(record.http_status or 0, record.response_body if isinstance(record.response_body, dict) else None, record.response_text, record.timing.get("e2e_ms", 0) / 1000, record.response_headers, record.provider_request_id)
         # 流式：Responses 是 typed SSE（response.* 事件），Chat 是 choices delta SSE。
@@ -343,6 +417,7 @@ class GPT56Runner:
                     continue
                 started = time.perf_counter()
                 self.current_case_id = spec.case_id
+                self.transient_events = []
                 try:
                     outcome = await getattr(self, f"case_{spec.handler}")(model)
                     if len(outcome) == 4:
@@ -350,9 +425,21 @@ class GPT56Runner:
                     else:
                         passed, details, observations = outcome
                         status = "passed" if passed else "failed"
+                    if status in ("failed", "error") and self.transient_events:
+                        # 上游瞬时故障（5xx/连接错误）使请求未产生有效响应：不可归因于被测模型，
+                        # 按平台级前提不满足记 blocked，避免基础设施抖动污染"模型能力"结论。
+                        details = _transient_reason(self.transient_events[0], len(self.transient_events))
+                        status = "blocked"
+                        observations = {**(observations or {}), "transient_failures": list(self.transient_events)}
                     results.append(CaseResult(spec.case_id, spec.name, model, passed, status, details, time.perf_counter() - started, observations))
                 except Exception as exc:
-                    results.append(CaseResult(spec.case_id, spec.name, model, False, "error", f"{type(exc).__name__}: {exc}", time.perf_counter() - started))
+                    if self.transient_events:
+                        results.append(CaseResult(spec.case_id, spec.name, model, False, "blocked",
+                                                  _transient_reason(self.transient_events[0], len(self.transient_events)),
+                                                  time.perf_counter() - started,
+                                                  {"transient_failures": list(self.transient_events)}))
+                    else:
+                        results.append(CaseResult(spec.case_id, spec.name, model, False, "error", f"{type(exc).__name__}: {exc}", time.perf_counter() - started))
         self.current_case_id = None
         return results
 

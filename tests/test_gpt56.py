@@ -1,5 +1,10 @@
+import contextlib
+import io
 import json
+import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import httpx
 
@@ -71,7 +76,11 @@ class GPT56StaticTests(unittest.TestCase):
 
 
 class GPT56OutcomeTests(unittest.IsolatedAsyncioTestCase):
-    async def _runner(self, responses):
+    async def _runner(self, responses, max_retries=0):
+        """handler 级判定测试：默认关闭瞬时故障重试，保持"一问一答"的脚本语义。
+
+        重试与 blocked 收口（run 层）由 GPT56TransientTests 专门覆盖。
+        """
         queue = list(responses)
         requests = []
 
@@ -81,7 +90,8 @@ class GPT56OutcomeTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(status, json=body)
 
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        return GPT56Runner(GPT56Config("key"), client), client, requests
+        config = GPT56Config("key", max_retries=max_retries, retry_backoff_seconds=0.0)
+        return GPT56Runner(config, client), client, requests
 
     @staticmethod
     def _normalize(outcome):
@@ -297,6 +307,209 @@ class GPT56OutcomeTests(unittest.IsolatedAsyncioTestCase):
             await client.aclose()
         self.assertFalse(passed)
         self.assertEqual(status, "blocked")
+
+
+# 真实批次证据（2026-09-24，results/GPT56_P0-20260924-153058/requests.jsonl）：
+# mux.la 中转对 GPT56-12 / GPT56-16 返回的网关自身故障。
+MEMORY_OVERLOADED_503 = {"error": {"message": "system memory overloaded (current: 91.5%, threshold: 90%)",
+                                   "type": "new_api_error", "param": "", "code": "system_memory_overloaded"}}
+OK_CHAT = {"model": "gpt-5.6-sol", "choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+MODEL_NOT_FOUND_503 = {"error": {"code": "model_not_found", "type": "new_api_error",
+                                 "message": "No available channel for model gpt-5.6-nonexistent-deadbeef under group muxla_company"}}
+
+
+class GPT56TransientTests(unittest.IsolatedAsyncioTestCase):
+    """瞬时故障（上游 5xx / 连接错误）：先重试，重试耗尽后按 blocked 收口。"""
+
+    async def _runner(self, queue, *, max_retries=2, raise_errors=None):
+        queue = list(queue)
+        errors = list(raise_errors or [])
+        requests = []
+
+        async def handler(request):
+            requests.append(json.loads(request.content))
+            if errors:
+                raise errors.pop(0)
+            status, body = queue.pop(0)
+            return httpx.Response(status, json=body)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        config = GPT56Config("key", max_retries=max_retries, retry_backoff_seconds=0.0)
+        return GPT56Runner(config, client), client, requests
+
+    async def _run_one(self, runner, case_id, priority="P0"):
+        return (await runner.run(("gpt-5.6",), (priority,), {case_id}))[0]
+
+    async def test_5xx_is_retried_then_succeeds(self):
+        """首跳 503、重试命中 200：用例应正常判定，且不留下瞬时故障记录。"""
+        runner, client, requests = await self._runner([(503, MEMORY_OVERLOADED_503), (200, OK_CHAT)])
+        try:
+            result = await self._run_one(runner, "GPT56-01")
+            self.assertEqual(len(requests), 2, "503 应触发一次重试")
+            self.assertEqual(runner.transient_events, [])
+        finally:
+            await client.aclose()
+        self.assertEqual(result.status, "passed")
+
+    async def test_5xx_exhausted_retries_becomes_blocked_not_failed(self):
+        """重试耗尽仍 503：原判 failed 的用例改判 blocked，理由需自解释。"""
+        runner, client, requests = await self._runner([(503, MEMORY_OVERLOADED_503)] * 3)
+        try:
+            result = await self._run_one(runner, "GPT56-16")
+            self.assertEqual(len(requests), 3, "max_retries=2 → 共 3 次尝试")
+        finally:
+            await client.aclose()
+        self.assertEqual(result.status, "blocked")
+        self.assertFalse(result.passed)
+        self.assertIn("瞬时故障", result.details)
+        self.assertIn("已重试 2 次仍失败", result.details)
+        self.assertIn("system memory overloaded", result.details)
+        self.assertEqual(result.observations["transient_failures"][0]["http_status"], 503)
+
+    async def test_connection_error_exhausted_becomes_blocked(self):
+        """连接错误（ConnectError）同样重试，耗尽后记 blocked。"""
+        error = httpx.ConnectError("connection reset")
+        runner, client, requests = await self._runner([], raise_errors=[error, error, error])
+        try:
+            result = await self._run_one(runner, "GPT56-01")
+            self.assertEqual(len(requests), 3)
+        finally:
+            await client.aclose()
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("ConnectError", result.details)
+
+    async def test_retries_disabled_records_single_attempt(self):
+        runner, client, requests = await self._runner([(503, MEMORY_OVERLOADED_503)] * 3, max_retries=0)
+        try:
+            result = await self._run_one(runner, "GPT56-16")
+            self.assertEqual(len(requests), 1)
+        finally:
+            await client.aclose()
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("未启用重试", result.details)
+
+    async def test_definitive_model_not_found_is_not_retried(self):
+        """503 + code=model_not_found 是确定性结论，不是网关抖动：不重试，用例照常判通过。"""
+        runner, client, requests = await self._runner([(503, MODEL_NOT_FOUND_503)] * 3)
+        try:
+            result = await self._run_one(runner, "GPT56-23", priority="P1")
+            self.assertEqual(len(requests), 1, "确定性错误不得触发重试")
+            self.assertEqual(runner.transient_events, [])
+        finally:
+            await client.aclose()
+        self.assertEqual(result.status, "passed")
+
+    async def test_4xx_is_not_retried_and_not_downgraded(self):
+        runner, client, requests = await self._runner([(400, {"error": {"message": "bad request"}})] * 3)
+        try:
+            result = await self._run_one(runner, "GPT56-01")
+            self.assertEqual(len(requests), 1, "4xx 是确定性判定，不重试")
+        finally:
+            await client.aclose()
+        self.assertEqual(result.status, "failed")
+
+    async def test_mid_case_transient_downgrades_failed_case(self):
+        """故障发生在用例中途（最后一跳已 200）也要按 blocked 收口。"""
+        runner, client, _ = await self._runner([(503, MEMORY_OVERLOADED_503)] * 3 + [(200, OK_CHAT)] * 2)
+        try:
+            result = await self._run_one(runner, "GPT56-04")  # effort_levels：5 档循环
+        finally:
+            await client.aclose()
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("瞬时故障", result.details)
+
+    async def test_passed_case_is_never_downgraded(self):
+        """只有 failed/error 才降级：通过用例即便出现过瞬时故障也不得被改成 blocked。"""
+        runner, client, _ = await self._runner([(503, MEMORY_OVERLOADED_503)])
+
+        async def fake_basic(model):
+            await runner.request("chat/completions", {"model": model, "messages": [{"role": "user", "content": "hi"}]})
+            return True, "通过", {}
+
+        runner.case_basic = fake_basic  # 模拟"末跳瞬时故障但用例仍通过"的极端组合
+        try:
+            result = await self._run_one(runner, "GPT56-01")
+        finally:
+            await client.aclose()
+        self.assertEqual(runner.transient_events and len(runner.transient_events), 1)
+        self.assertEqual(result.status, "passed")
+
+    async def test_transient_reason_is_self_explanatory(self):
+        from gpt56.core import _transient_reason
+        text = _transient_reason({"path": "responses", "attempts": 3, "http_status": 503,
+                                  "transport_error": None, "message": "boom"}, 1)
+        for fragment in ("HTTP 503", "已重试 2 次仍失败", "boom", "blocked", "重跑"):
+            self.assertIn(fragment, text)
+
+
+class GPT56AdmissionExitCodeTests(unittest.IsolatedAsyncioTestCase):
+    """退出码必须以 finalize() 之后的磁盘结论为准。
+
+    回归：收尾前内存里的 summary 由 ``all_passed``（只算 failed+error）推出，
+    "整批只有 blocked、没有 failed"时是 True，于是 main_async 曾返回 0，
+    而磁盘 summary / Web 显示不准入（本轮瞬时故障场景实测 exit=0）。
+    """
+
+    async def _run_main(self, statuses):
+        from gpt56 import runner as runner_module
+        from gpt56.core import CaseResult
+
+        created = {}
+
+        class FakeRunner:
+            def __init__(self, config, audit_dir=None):
+                self.audit_dir = audit_dir
+                created["dir"] = audit_dir
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def run(self, models, priorities):
+                # 证据契约：结果目录必须有非空请求证据，否则整批不准入（与本用例无关，但要满足）。
+                self.audit_dir.mkdir(parents=True, exist_ok=True)
+                (self.audit_dir / "requests.jsonl").write_text(
+                    json.dumps({"case_id": "GPT56-01", "http_status": 200}) + "\n", encoding="utf-8")
+                return [CaseResult("GPT56-01", "基础对话", models[0], False, status, "说明")
+                        for status in statuses]
+
+        env = {"GPT_API_KEY": "key", "GPT_BASE_URL": "https://gw.example.com", "GPT_MODEL": "gpt-5.6-sol"}
+        saved = {k: os.environ.get(k) for k in env}
+        original = runner_module.GPT56Runner
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                runner_module.GPT56Runner = FakeRunner
+                os.environ.update(env)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = await runner_module.main_async(["GPT56_P0", "--output-root", tmp])
+            finally:
+                runner_module.GPT56Runner = original
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            disk = json.loads((Path(created["dir"]) / "summary.json").read_text(encoding="utf-8"))
+        return rc, disk
+
+    async def test_blocked_only_batch_is_not_admitted(self):
+        """只有 blocked、没有 failed：磁盘不准入，退出码必须是 2（修复前误为 0）。"""
+        rc, disk = await self._run_main(["blocked", "blocked"])
+        self.assertFalse(disk["admission_passed"])
+        self.assertEqual(disk["failed"], 0)  # 收尾前 all_passed 正是被这一项骗过
+        self.assertEqual(rc, 2)
+
+    async def test_all_passed_batch_still_admits(self):
+        rc, disk = await self._run_main(["passed"])
+        self.assertTrue(disk["admission_passed"])
+        self.assertEqual(rc, 0)
+
+    async def test_failed_batch_keeps_exit_code_2(self):
+        rc, disk = await self._run_main(["failed"])
+        self.assertFalse(disk["admission_passed"])
+        self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":

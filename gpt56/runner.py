@@ -30,7 +30,22 @@ def config_from_env() -> GPT56Config:
         timeout=float(os.getenv("GPT_REQUEST_TIMEOUT_SECONDS", "300")),
         verify_ssl=os.getenv("GPT_VERIFY_SSL", "true").lower() not in {"0", "false", "no"},
         trust_env=os.getenv("GPT_TRUST_ENV", "false").lower() in {"1", "true", "yes"},
+        # 瞬时故障（5xx / 连接错误）重试：默认 2 次、退避 1s/2s；置 0 可关闭（回归对照用）。
+        max_retries=int(os.getenv("GPT_MAX_RETRIES", "2")),
+        retry_backoff_seconds=float(os.getenv("GPT_RETRY_BACKOFF_SECONDS", "1.0")),
     )
+
+
+def read_finalized_summary(result_dir: Path) -> dict[str, object]:
+    """读回收尾后的 summary.json 作为权威结论。
+
+    ``finalize()``（common.finalizer.finalize_result_dir）会把统一证据/裁定校验
+    写回该文件，并可能**下调** ``admission_passed``——典型是"整批只有 blocked、
+    没有 failed"的批次：收尾前内存里的 summary 由 ``all_passed``（仅 failed+error）
+    推出 True，收尾后因 ``case_verdicts_complete`` 校验（blocked 属阻断）变为 False。
+    因此退出码与打印都必须用这份收尾后的结论，否则 CLI/CI 会把不准入的批次当成 0。
+    """
+    return json.loads((result_dir / "summary.json").read_text(encoding="utf-8"))
 
 
 async def main_async(argv: list[str] | None = None) -> int:
@@ -60,9 +75,12 @@ async def main_async(argv: list[str] | None = None) -> int:
     # write_report 已写入结果；补写 Web 聚合需要的扩展字段。
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     finalize(out)
+    # 收尾可能下调 admission_passed（如"整批只有 blocked"，或证据缺失），
+    # 退出码和打印一律以收尾后的磁盘结论为准。
+    summary = read_finalized_summary(out)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"结果目录: {out.resolve()}")
-    return 0 if summary["admission_passed"] else 2
+    return 0 if summary.get("admission_passed") else 2
 
 
 def main(argv: list[str] | None = None) -> int:
