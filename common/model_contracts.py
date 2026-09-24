@@ -26,6 +26,27 @@ def load_profile_data(family: str) -> dict[str, Any]:
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
 
+
+def model_matches_family(family: str, model: str) -> tuple[bool, str]:
+    """运行前门禁：配置的模型名必须属于该家族。
+
+    背景（2026-09-24）：把 gpt-5.6-sol 误配进 DS_V4_P0 后，所有正向用例被上游 400
+    "unknown model" 拒绝，而负向用例的「4xx 且非 404」断言恰好被这个 400 满足，产生假通过。
+    因此入口脚本在发任何请求前先校验模型名：须包含 family 名或该家族白名单令牌之一。
+    """
+    lowered = (model or "").strip().lower()
+    if not lowered:
+        return False, "模型名为空，请在界面配置模型后再运行"
+    data = load_profile_data(family)
+    tokens = [str(t).lower() for t in (data.get("model_tokens") or ())]
+    if family.lower() in lowered or any(t in lowered for t in tokens):
+        return True, ""
+    return False, (
+        f"模型名 {model!r} 不属于 {family} 家族（要求名称包含 “{family}” 或白名单令牌 {tokens} 之一）。"
+        f"误配模型会使所有正向用例被上游 400 拒绝，而负向用例的 4xx 断言恰好被该 400 满足产生假通过，"
+        f"本次运行已阻止。请修正模型名后重跑。"
+    )
+
 PROFILES = {
     "kvv": ModelProfile("kvv", "", {"thinking": {"type": "enabled"}}, {"thinking": {"type": "disabled"}}, ("kimi", "k3"), "KVV-CONTRACT-OK", "lookup_order", True),
     "deepseek": ModelProfile("deepseek", "", {"thinking": {"type": "enabled"}}, {"thinking": {"type": "disabled"}}, ("deepseek-v4",), "DS-CONTRACT-OK", "lookup_order", True),

@@ -154,6 +154,49 @@ class HttpExecutor:
                       "ttfc_ms": (first_content-started)*1000 if first_content else None,
                       "e2e_ms": (ended-started)*1000}
         return rec
+    async def execute_raw(self, *, case_id: str, method: str, url: str, headers: dict[str, str],
+                          params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None,
+                          files: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> ExecutionRecord:
+        """非 JSON-POST 通道（GET / DELETE / multipart 上传）。
+
+        与 execute 共享同一套 ExecutionRecord 与证据写入逻辑，便于统一审计：
+        GET（模型列表、余额）与 multipart（文件上传）无法走 execute 的 json=payload 路径。
+        """
+        assert self.client is not None
+        rid = headers.get("X-Request-ID") or headers.get("x-request-id") or f"{case_id}-{uuid.uuid4().hex[:12]}"
+        started_epoch, started = time.time(), time.perf_counter()
+        payload: dict[str, Any] = json_body if json_body is not None else {"_form": data or {}, "_files": sorted((files or {}).keys())}
+        send_headers = dict(headers)
+        if files is not None:
+            # httpx 会从 Content-Type 头里**回读 boundary** 来编码 multipart body。
+            # 若这里沿用客户端默认头（如 runner 建 client 时设的 application/json），
+            # 结果就是 body 用了随机 boundary、而头仍写 application/json（无 boundary），
+            # 上游（DeepSeek Files API）直接 400 `Invalid boundary for multipart/form-data request`。
+            # 因此显式剔除内容类型并写入自生成的 boundary，保证头与 body 一致。
+            send_headers = {k: v for k, v in send_headers.items() if k.lower() != "content-type"}
+            send_headers["Content-Type"] = f"multipart/form-data; boundary={uuid.uuid4().hex}"
+        rec = ExecutionRecord(case_id, rid, payload, {k:v for k,v in send_headers.items() if k.lower() != "authorization"}, time.strftime("%Y-%m-%dT%H:%M:%S%z"), started_epoch)
+        rec.request["_method"] = method.upper()
+        rec.request["_url"] = url
+        if params:
+            rec.request["_params"] = dict(params)
+        try:
+            response = await self.client.request(method, url, params=params, json=json_body, files=files, data=data, headers=send_headers)
+            rec.http_status, rec.response_headers = response.status_code, dict(response.headers)
+            rec.timing["content_type"] = response.headers.get("content-type")
+            rec.response_text = response.text
+            rec.raw_response_body = response.content.decode("utf-8", "replace")
+            try: rec.response_body = response.json()
+            except (ValueError, json.JSONDecodeError): rec.response_body = None
+            rec.usage = (rec.response_body or {}).get("usage") if isinstance(rec.response_body, dict) else None
+            rec.provider_request_id = self._provider_id(response.headers, rec.response_body)
+            rec.transport_status = "completed"
+        except Exception as exc:
+            rec.transport_status = "error"
+            rec.transport_error = {"type": type(exc).__name__, "message": str(exc)}
+        rec.timing["e2e_ms"] = (time.perf_counter() - started) * 1000
+        return rec
+
     @staticmethod
     def _provider_id(headers, body):
         return headers.get("x-request-id") or headers.get("request-id") or headers.get("x-trace-id") or headers.get("x-oneapi-request-id") or ((body or {}).get("id") if isinstance(body,dict) else None)

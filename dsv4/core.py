@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import struct
 import time
 import uuid
+import zlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,7 +19,11 @@ from typing import Any
 import httpx
 from common.test_framework import HttpExecutor, ResultLog
 
-MODELS = ("deepseek-v4-pro", "deepseek-v4-flash")
+# 官方文档当前主推的模型名（Models & Pricing / Vision / Files API 一致）。
+# deepseek-v4-flash 与 deepseek-v4-flash-vision-exp 已退休但仍被接受，请求由最新 Flash 模型服务。
+PRIMARY_MODELS = ("deepseek-v4-pro", "deepseek-flash")
+RETIRED_ALIASES = ("deepseek-v4-flash",)
+MODELS = PRIMARY_MODELS
 
 # 官方文档：Beta 与 Anthropic 兼容端点挂在**根域**下，不带版本后缀。
 #   beta      -> https://api.deepseek.com/beta      （chat prefix / FIM / strict tool）
@@ -68,6 +75,9 @@ class DeepSeekConfig:
             root = (self.beta_base_url or f"{_api_parent(base)}/beta").rstrip("/")
         elif family == "anthropic":
             root = (self.anthropic_base_url or f"{_api_parent(base)}/anthropic").rstrip("/")
+        elif family == "root":
+            # 官方文档：GET /models、/user/balance、POST /files 均挂在根域下，不带版本后缀。
+            root = _api_parent(base)
         else:
             root = base
         return f"{root}/{path.lstrip('/')}"
@@ -142,6 +152,33 @@ CASE_SPECS = (
     CaseSpec("DS-V4-33", "Tool Choice required", "P2", "tool_choice_required"),
     CaseSpec("DS-V4-34", "Responses API 基础响应", "P2", "responses_basic"),
     CaseSpec("DS-V4-35", "Anthropic API 基础响应", "P2", "anthropic_basic"),
+    # ---- 2026-09-24 覆盖度评审补充：多模态、端点面、参数面、错误契约、跨协议矩阵 ----
+    CaseSpec("DS-V4-36", "图片输入识别（内联 base64）", "P0", "image_input"),
+    CaseSpec("DS-V4-37", "模型别名口径与退休别名路由", "P0", "model_alias"),
+    CaseSpec("DS-V4-38", "思考强度全集与关闭语义", "P0", "effort_full_set"),
+    CaseSpec("DS-V4-39", "max_tokens 上限与越界拒绝", "P0", "max_tokens_bounds"),
+    CaseSpec("DS-V4-40", "无效 API Key 鉴权契约", "P0", "invalid_api_key"),
+    CaseSpec("DS-V4-41", "Files API 上传与 file_id 引用闭环", "P0", "files_lifecycle", destructive=True),
+    CaseSpec("DS-V4-42", "图片出现在非 user 消息应被拒", "P1", "image_wrong_role"),
+    CaseSpec("DS-V4-43", "模型列表端点与声明一致性", "P1", "models_listing"),
+    CaseSpec("DS-V4-44", "stream_options 缺少 stream 的契约", "P1", "stream_options_without_stream"),
+    CaseSpec("DS-V4-45", "logprobs / top_logprobs 结构", "P1", "logprobs_structure"),
+    CaseSpec("DS-V4-46", "top_p 边界与思考模式钳制", "P1", "top_p_bounds"),
+    CaseSpec("DS-V4-47", "FIM 与思考模式互斥", "P1", "fim_thinking_conflict"),
+    CaseSpec("DS-V4-48", "Anthropic system 与 stop_sequences", "P1", "anthropic_system_stop"),
+    CaseSpec("DS-V4-49", "Anthropic thinking 与 output_config", "P1", "anthropic_thinking"),
+    CaseSpec("DS-V4-50", "Responses API 流式语义事件", "P1", "responses_stream"),
+    CaseSpec("DS-V4-51", "Responses 不支持字段静默忽略", "P1", "responses_ignored_fields"),
+    CaseSpec("DS-V4-52", "并行工具调用观测", "P1", "parallel_tool_calls"),
+    CaseSpec("DS-V4-53", "图片 detail 档位", "P2", "image_detail_levels"),
+    CaseSpec("DS-V4-54", "Files API 列表与检索结构", "P2", "files_listing"),
+    CaseSpec("DS-V4-55", "账户余额端点", "P2", "user_balance"),
+    CaseSpec("DS-V4-56", "stop 多序列与上限边界", "P2", "stop_multi_sequences"),
+    CaseSpec("DS-V4-57", "废弃采样参数静默忽略", "P2", "deprecated_penalties"),
+    CaseSpec("DS-V4-58", "FIM 与 JSON mode 互斥", "P2", "fim_json_conflict"),
+    CaseSpec("DS-V4-59", "prefix 缺少 prefix 标志的契约", "P2", "prefix_without_flag", beta=True),
+    CaseSpec("DS-V4-60", "Anthropic tool_choice 与工具闭环", "P2", "anthropic_tool_loop"),
+    CaseSpec("DS-V4-61", "Responses 工具类型矩阵", "P2", "responses_tool_matrix"),
 )
 
 
@@ -170,6 +207,59 @@ def _cache_tokens(body: dict[str, Any] | None) -> int:
     usage = _usage(body)
     details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     return int(usage.get("prompt_cache_hit_tokens") or details.get("cached_tokens") or 0)
+
+
+def _error_body(r: "ApiResponse") -> dict[str, Any]:
+    """取错误体，兼容 {error:{message,type,code}} 与裸 {message}。"""
+    body = r.body if isinstance(r.body, dict) else {}
+    err = body.get("error")
+    return err if isinstance(err, dict) else body
+
+
+def _anthropic_text(r: "ApiResponse", block_type: str = "text") -> str:
+    """拼接 Anthropic content 数组中指定类型块的可读文本。"""
+    parts: list[str] = []
+    for block in (r.body or {}).get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != block_type:
+            continue
+        parts.append(str(block.get("text") or block.get("thinking") or ""))
+    return "".join(parts)
+
+
+def _anthropic_block_types(r: "ApiResponse") -> list[str]:
+    return [str(b.get("type")) for b in (r.body or {}).get("content") or [] if isinstance(b, dict)]
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# 图片识别用例使用固定纯色，避免依赖外部 URL、联网下载与随机图案。
+IMAGE_TOP_RGB = (220, 20, 20)      # 红
+IMAGE_BOTTOM_RGB = (20, 20, 220)   # 蓝
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+
+
+def png_bands(top_rgb: tuple[int, int, int] = IMAGE_TOP_RGB, bottom_rgb: tuple[int, int, int] = IMAGE_BOTTOM_RGB,
+              width: int = 64, height: int = 64) -> bytes:
+    """生成上/下两色的 PNG（纯标准库实现，无 Pillow 依赖）。"""
+    raw = b""
+    for y in range(height):
+        rgb = top_rgb if y < height // 2 else bottom_rgb
+        raw += b"\x00" + bytes(rgb) * width
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return PNG_SIGNATURE + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", zlib.compress(raw, 9)) + _png_chunk(b"IEND", b"")
+
+
+def png_data_url(**kwargs: Any) -> str:
+    return "data:image/png;base64," + base64.b64encode(png_bands(**kwargs)).decode("ascii")
+
+
+def image_part(url: str, detail: str | None = None) -> dict[str, Any]:
+    block: dict[str, Any] = {"url": url}
+    if detail:
+        block["detail"] = detail
+    return {"type": "image_url", "image_url": block}
 
 
 class DeepSeekV4Runner:
@@ -208,16 +298,20 @@ class DeepSeekV4Runner:
         if self._external_client is None and self.client:
             await self.client.aclose()
 
+    def _request_headers(self, family: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+        request_headers = {"X-Request-ID": f"DSV4-{uuid.uuid4().hex[:16]}"}
+        if family == "anthropic":
+            request_headers.update({"x-api-key": self.config.api_key, "anthropic-version": "2023-06-01"})
+        if extra:
+            request_headers.update(extra)
+        return request_headers
+
     async def request(self, path: str, payload: dict[str, Any], *, family: str = "openai", stream: bool = False, headers: dict[str, str] | None = None) -> ApiResponse:
         if self.executor is None:
             self.executor = HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
             await self.executor.__aenter__()
-        request_headers = {"X-Request-ID": f"DSV4-{uuid.uuid4().hex[:16]}"}
-        if family == "anthropic":
-            request_headers.update({"x-api-key": self.config.api_key, "anthropic-version": "2023-06-01"})
-        if headers:
-            request_headers.update(headers)
-        record = await self.executor.execute(case_id=payload.get("_case_id") or self.current_case_id or "DSV4-request", url=self.config.url(path, family), payload={k:v for k,v in payload.items() if k != "_case_id"}, headers=request_headers, stream=stream)
+        request_headers = self._request_headers(family, headers)
+        record = await self.executor.execute(case_id=payload.get("_case_id") or self.current_case_id or "DSV4-request", url=self.config.url(path, family), payload={k:v for k,v in payload.items() if not k.startswith("_")}, headers=request_headers, stream=stream)
         if self.log:
             await self.log.write(record)
         if not stream:
@@ -225,10 +319,36 @@ class DeepSeekV4Runner:
         info = {"reasoning_content": record.reasoning, "content": record.content, "usage": record.usage or {}, "done": record.done_received, "invalid_events": record.invalid_sse_events, "finish_reasons": record.finish_reasons, "raw_sse_lines": record.raw_sse_lines, "raw_sse_events": record.raw_sse_events, "received_events": record.parsed_sse_events}
         return ApiResponse(record.http_status or 0, None, record.raw_response_body or record.response_text, record.timing.get("e2e_ms", 0)/1000, record.response_headers, record.provider_request_id, stream=info)
 
+    async def request_raw(self, method: str, path: str, *, family: str = "openai", params: dict[str, Any] | None = None,
+                          json_body: dict[str, Any] | None = None, files: dict[str, Any] | None = None,
+                          data: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> ApiResponse:
+        """GET / DELETE / multipart 通道，证据同样写入 requests.jsonl。"""
+        if self.executor is None:
+            self.executor = HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
+            await self.executor.__aenter__()
+        request_headers = self._request_headers(family, headers)
+        record = await self.executor.execute_raw(case_id=self.current_case_id or "DSV4-request", method=method, url=self.config.url(path, family),
+                                                 headers=request_headers, params=params, json_body=json_body, files=files, data=data)
+        if self.log:
+            await self.log.write(record)
+        return ApiResponse(record.http_status or 0, record.response_body if isinstance(record.response_body, dict) else None, record.response_text, record.timing.get("e2e_ms", 0)/1000, record.response_headers, record.provider_request_id)
+
+    async def root_request(self, method: str, path: str, **kwargs: Any) -> ApiResponse:
+        """根域端点（/models、/user/balance、/files）。
+
+        文档口径是根域地址，但部分中网关只暴露带版本前缀的路径。
+        先打根域，仅在 404 时回退到带版本地址，并把实际命中的地址写进证据，避免把网关差异读成能力缺失。
+        """
+        response = await self.request_raw(method, path, family="root", **kwargs)
+        if response.status != 404:
+            return response
+        return await self.request_raw(method, path, family="openai", **kwargs)
+
     async def chat(self, model: str, messages: list[dict[str, Any]], **kwargs: Any) -> ApiResponse:
         payload = {"model": model, "messages": messages, "max_tokens": 2048, **kwargs}
         family = payload.pop("_family", "openai")
-        return await self.request("chat/completions", payload, family=family, stream=bool(payload.get("stream")))
+        headers = payload.pop("_headers", None)
+        return await self.request("chat/completions", payload, family=family, stream=bool(payload.get("stream")), headers=headers)
 
     async def run(self, models: tuple[str, ...] = MODELS, priorities: tuple[str, ...] = ("P0", "P1"), case_ids: set[str] | None = None) -> list[CaseResult]:
         results: list[CaseResult] = []
@@ -538,6 +658,12 @@ class DeepSeekV4Runner:
 
 
 
+    async def case_responses_basic(self, model: str):
+        r = await self.request("responses", {"model": model, "input": "只回复 OK", "max_output_tokens": 32})
+        body = r.body or {}
+        output = body.get("output")
+        return r.status == 200 and isinstance(body.get("id"), str) and isinstance(output, list), "Responses API 应返回 id 与 output 数组", {"id": body.get("id"), "output_items": len(output or [])}
+
     async def case_usage_nonstream(self, model: str):
         r = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"})
         usage = _usage(r.body)
@@ -590,11 +716,344 @@ class DeepSeekV4Runner:
         calls = _message(r.body).get("tool_calls") or []
         return r.status == 200 and bool(calls) and calls[0].get("function", {}).get("name") == "get_number", "tool_choice=required 必须调用声明的工具", {"tool_calls": calls[:1]}
 
-    async def case_responses_basic(self, model: str):
-        r = await self.request("responses", {"model": model, "input": "只回复 OK", "max_output_tokens": 32})
+    # ==================================================================================
+    # 2026-09-24 覆盖度评审补充用例（DS-V4-36 ~ DS-V4-61）
+    #
+    # 判定口径（与既有约定一致，先例 DS-V4-09 / DS-V4-22）：
+    #   - 文档明确承诺 4xx 的负向用例：4xx → passed；宽松放行 200 → warning（保留"上游未执行
+    #     承诺"的观察，不阻断准入）；5xx → failed；404 → blocked（端点不存在，不算拒绝）。
+    #   - 文档承诺支持的正向用例：200 且满足断言 → passed；4xx → failed；404 → blocked。
+    #   - 文档未承诺的边界（如 stop 超过 16 条）：宽松接受记 warning，不判失败。
+    # ==================================================================================
+
+    async def case_image_input(self, model: str):
+        """图片输入识别：与同提示的纯文本请求对比 prompt_tokens，确认图片真的被计入。"""
+        prompt = "这张图上半部分和下半部分分别是什么颜色？只回答两个颜色词，用中文。"
+        baseline = await self.chat(model, [{"role": "user", "content": prompt}], thinking={"type": "disabled"}, max_tokens=32)
+        with_image = await self.chat(model, [{"role": "user", "content": [{"type": "text", "text": prompt}, image_part(png_data_url())]}],
+                                     thinking={"type": "disabled"}, max_tokens=32)
+        content = str(_message(with_image.body).get("content") or "")
+        base_tokens = _usage(baseline.body).get("prompt_tokens")
+        image_tokens = _usage(with_image.body).get("prompt_tokens")
+        observations = {"http_status": with_image.status, "content": content[:200], "baseline_prompt_tokens": base_tokens, "image_prompt_tokens": image_tokens}
+        missing = _endpoint_missing_reason(with_image.status, "openai")
+        if missing:
+            return False, missing, observations, "blocked"
+        identified = "红" in content and "蓝" in content
+        counted = isinstance(base_tokens, int) and isinstance(image_tokens, int) and image_tokens > base_tokens
+        if with_image.status == 200 and identified and counted:
+            return True, "图片被识别（上红下蓝）且 prompt_tokens 高于同提示的纯文本请求（图片已计入）", observations
+        if with_image.status == 200 and not identified:
+            return False, f"图片请求返回 200 但未正确识别图像内容（期望同时出现「红」「蓝」）：{content[:120]}", observations
+        if with_image.status == 200 and not counted:
+            return False, f"图片请求返回 200 但 prompt_tokens 未高于纯文本基线（疑似图片被丢弃）：{base_tokens} -> {image_tokens}", observations
+        return False, f"图片输入请求返回非预期状态 HTTP {with_image.status}（文本请求 HTTP {baseline.status}）", observations
+
+    async def case_model_alias(self, model: str):
+        """模型别名口径与退休别名路由。"""
+        primary = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, max_tokens=8)
+        alias = RETIRED_ALIASES[0]
+        retired = await self.chat(alias, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, max_tokens=8)
+        drifted = model not in PRIMARY_MODELS and model not in RETIRED_ALIASES
+        observations = {"configured_model": model, "configured_response_model": (primary.body or {}).get("model"),
+                        "retired_alias": alias, "retired_status": retired.status, "retired_response_model": (retired.body or {}).get("model"),
+                        "primary_models_per_doc": list(PRIMARY_MODELS), "configured_model_off_doc": drifted}
+        missing = _endpoint_missing_reason(primary.status, "openai")
+        if missing:
+            return False, missing, observations, "blocked"
+        if primary.status != 200:
+            return False, f"配置的模型名 {model} 请求失败（HTTP {primary.status}）", observations
+        if retired.status == 200:
+            note = f"；注意：当前配置模型 {model} 不在官方主推名 {list(PRIMARY_MODELS)} 内（口径漂移，建议核对）" if drifted else ""
+            return True, f"配置模型可调用，退休别名 {alias} 仍被接受（由最新 Flash 模型服务）{note}", observations
+        if retired.status == 404:
+            # 同一端点上配置模型请求成功，故 404 表示"模型/别名不存在"，不是端点缺失。
+            return True, f"退休别名 {alias} 已不可用（HTTP 404 模型不存在；同端点配置模型正常，故非端点缺失），与文档「仍被接受」不符", observations, "warning"
+        if _is_rejection(retired.status):
+            return True, f"退休别名 {alias} 已被拒绝（HTTP {retired.status}）：文档称仍接受，属文档/线上差异", observations, "warning"
+        return False, f"退休别名 {alias} 返回非预期状态 HTTP {retired.status}", observations
+
+    async def case_effort_full_set(self, model: str):
+        """effort 全集：none 关闭思考；low/high/max 开启；minimal/ultra 为兼容别名。"""
+        rows: dict[str, Any] = {}
+        for effort in ("none", "low", "high", "max", "minimal", "ultra"):
+            r = await self.chat(model, [{"role": "user", "content": "计算 23*17，只给最终答案。"}],
+                                thinking={"type": "enabled"}, reasoning_effort=effort, max_tokens=512)
+            rows[effort] = {"status": r.status, "reasoning_chars": len(str(_message(r.body).get("reasoning_content") or ""))}
+        none_row = rows["none"]
+        enables = [e for e in ("low", "high", "max", "minimal", "ultra") if rows[e]["status"] != 200]
+        if any(rows[e]["status"] == 404 for e in rows):
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", rows, "blocked"
+        if enables:
+            return False, f"以下 effort 档位未被接受：{ {e: rows[e]['status'] for e in enables} }", rows
+        if none_row["status"] != 200:
+            return False, f"reasoning_effort=none 未被接受（HTTP {none_row['status']}）", rows
+        if none_row["reasoning_chars"] > 0:
+            return True, f"各档位均被接受；none 档仍返回 reasoning_content（{none_row['reasoning_chars']} 字符），与文档「none 关闭思考」的描述存在差异", rows, "warning"
+        return True, "none 正确关闭思考模式（reasoning_content 为空），其余档位与兼容别名 minimal/ultra 均被接受", rows
+
+    async def case_max_tokens_bounds(self, model: str):
+        """max_tokens 文档范围为 1–384K(393216)：上限应接受，0 与越界应被拒。"""
+        upper = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, max_tokens=393216)
+        zero = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, max_tokens=0)
+        over = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, max_tokens=393217)
+        observations = {"upper_status": upper.status, "zero_status": zero.status, "over_status": over.status, "zero_error": _error_body(zero).get("message"), "over_error": _error_body(over).get("message")}
+        missing = _endpoint_missing_reason(upper.status, "openai")
+        if missing:
+            return False, missing, observations, "blocked"
+        if upper.status != 200:
+            return False, f"文档上限 393216 未被接受（HTTP {upper.status}）：{_error_body(upper).get('message')}", observations
+        rejects = (_is_rejection(zero.status), _is_rejection(over.status))
+        if all(rejects):
+            return True, "上限 393216 被接受，0 与 393217 均被 4xx 拒绝", observations
+        lenient = [name for name, status, rejected in (("0", zero.status, rejects[0]), ("393217", over.status, rejects[1])) if not rejected]
+        if lenient:
+            return True, f"max_tokens={','.join(lenient)} 未被拒绝（HTTP {'/'.join(str(s) for s in (zero.status, over.status))}）：文档给出 1–393216 范围，属宽松放行", observations, "warning"
+        return False, "max_tokens 边界返回非预期状态", observations
+
+    async def case_invalid_api_key(self, model: str):
+        """鉴权契约：无效 Key 应返回 401，且错误体含 message/type。"""
+        r = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, max_tokens=8,
+                            _headers={"Authorization": "Bearer sk-invalid-dsv4-admission-probe"})
+        err = _error_body(r)
+        observations = {"http_status": r.status, "error_type": err.get("type"), "error_code": err.get("code"), "error_message": str(err.get("message"))[:200]}
+        missing = _endpoint_missing_reason(r.status, "openai")
+        if missing:
+            return False, missing, observations, "blocked"
+        if r.status == 401:
+            if err.get("message"):
+                return True, "无效 API Key 返回 401 且错误体包含 message", observations
+            return True, "无效 API Key 返回 401，但错误体缺少 message 字段", observations, "warning"
+        if r.status == 200:
+            return False, "无效 API Key 竟返回 200：鉴权未生效（严重）", observations
+        return False, f"无效 API Key 返回非预期状态 HTTP {r.status}（期望 401）", observations
+
+    async def case_files_lifecycle(self, model: str):
+        """Files API 全链路：上传 → 以 file_id 引用 → 删除。
+
+        属破坏性用例（占用账号配额）：无论成败都在 finally 中尝试删除，并带 1 小时过期兜底。
+        """
+        png = png_bands()
+        upload = await self.root_request("POST", "files", files={"file": ("dsv4-probe.png", png, "image/png")},
+                                         data={"purpose": "user_data", "expires_after[anchor]": "created_at", "expires_after[seconds]": "3600"})
+        file_id = str((upload.body or {}).get("id") or "")
+        observations: dict[str, Any] = {"upload_status": upload.status, "file_id": file_id, "upload_response": (upload.text or "")[:300]}
+        if upload.status == 404:
+            return False, _endpoint_missing_reason(404, "root") or "Files 端点不存在", observations, "blocked"
+        if upload.status != 200 or not file_id.startswith("file-api-"):
+            return False, f"文件上传失败（HTTP {upload.status}，file_id={file_id or '空'}）", observations
+        chat: ApiResponse | None = None
+        deleted: ApiResponse | None = None
+        try:
+            prompt = "这张图上半部分和下半部分分别是什么颜色？只回答两个颜色词，用中文。"
+            chat = await self.chat(model, [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "file", "file_id": file_id}]}],
+                                   thinking={"type": "disabled"}, max_tokens=32)
+        finally:
+            deleted = await self.root_request("DELETE", f"files/{file_id}")
+        content = str(_message((chat.body if chat else None)).get("content") or "")
+        observations.update({"chat_status": chat.status if chat else None, "content": content[:200],
+                             "delete_status": deleted.status if deleted else None, "deleted_flag": (deleted.body or {}).get("deleted") if deleted else None})
+        if chat is None or chat.status != 200:
+            return False, f"以 file_id 引用上传文件失败（HTTP {chat.status if chat else 'n/a'}）", observations
+        if not ("红" in content and "蓝" in content):
+            return False, f"file_id 引用返回 200 但未识别图片内容：{content[:120]}", observations
+        if deleted and deleted.status == 200 and (deleted.body or {}).get("deleted") is True:
+            return True, "上传 → file_id 引用识别 → 删除全链路通过，且返回 deleted=true", observations
+        return True, f"上传与引用识别通过，但删除返回异常（HTTP {deleted.status if deleted else 'n/a'}），文件可能残留并占用配额", observations, "warning"
+
+
+    async def case_image_wrong_role(self, model: str):
+        """文档承诺：图片只允许出现在 user 消息中，放在 system/assistant 返回 400。"""
+        r = await self.chat(model, [{"role": "system", "content": [{"type": "text", "text": "你是助手"}, image_part(png_data_url())]},
+                                    {"role": "user", "content": "描述这张图。"}], thinking={"type": "disabled"}, max_tokens=32)
+        observations = {"http_status": r.status, "content": str(_message(r.body).get("content") or "")[:150], "error": str(_error_body(r).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", observations, "blocked"
+        if _is_rejection(r.status):
+            return True, f"图片放在 system 消息中被 4xx 拒绝（HTTP {r.status}），符合文档承诺", observations
+        if r.status == 200:
+            return True, "图片放在 system 消息中未被拒绝（HTTP 200）：文档明确承诺返回 400，属宽松放行，模型可能忽略了该图片", observations, "warning"
+        return False, f"图片放在 system 消息中返回非预期状态 HTTP {r.status}", observations
+
+    async def case_models_listing(self, model: str):
+        r = await self.root_request("GET", "models")
         body = r.body or {}
-        output = body.get("output")
-        return r.status == 200 and isinstance(body.get("id"), str) and isinstance(output, list), "Responses API 应返回 id 与 output 数组", {"id": body.get("id"), "output_items": len(output or [])}
+        data = body.get("data") if isinstance(body.get("data"), list) else []
+        ids = [str(x.get("id")) for x in data if isinstance(x, dict)]
+        fields_ok = all(isinstance(x.get("id"), str) and "object" in x for x in data if isinstance(x, dict))
+        family_token = model.split("-")[0]
+        observations = {"http_status": r.status, "object": body.get("object"), "model_ids": ids[:20],
+                        "configured_model_listed": model in ids, "family_token_listed": any(family_token in i for i in ids)}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "root") or "模型列表端点不存在", observations, "blocked"
+        if r.status == 200 and body.get("object") == "list" and data and fields_ok:
+            if not any(PRIMARY_MODELS[1] in i or "flash" in i.lower() for i in ids):
+                return True, f"模型列表结构正确，但未出现 Flash 系列模型名（返回 {ids[:8]}），与文档主推口径存在差异", observations, "warning"
+            return True, f"GET /models 返回 {len(ids)} 个模型，object=list 且条目字段完整", observations
+        return False, f"模型列表响应结构不符合预期（HTTP {r.status}，object={body.get('object')}，条目数={len(data)}）", observations
+
+    async def case_stream_options_without_stream(self, model: str):
+        """文档明确：stream_options 必须与 stream=true 同用，否则返回 400。"""
+        r = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"},
+                            stream_options={"include_usage": True}, max_tokens=16)
+        observations = {"http_status": r.status, "error": str(_error_body(r).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", observations, "blocked"
+        if _is_rejection(r.status):
+            return True, f"未设置 stream 却传 stream_options 被拒绝（HTTP {r.status}），符合文档承诺", observations
+        if r.status == 200:
+            return True, "未设置 stream 却传 stream_options 未被拒绝（HTTP 200）：文档承诺返回 400，属宽松放行", observations, "warning"
+        return False, f"stream_options 缺少 stream 时返回非预期状态 HTTP {r.status}", observations
+
+    async def case_logprobs_structure(self, model: str):
+        """logprobs/top_logprobs：非思考模式应返回对数概率；思考模式按文档不生效但不报错。"""
+        r = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"},
+                            logprobs=True, top_logprobs=5, max_tokens=16)
+        choice = ((r.body or {}).get("choices") or [{}])[0]
+        content = ((choice.get("logprobs") or {}).get("content") or [])
+        samples = [c for c in content if isinstance(c, dict)]
+        has_tokens = bool(samples) and all("token" in c and "logprob" in c for c in samples[:3])
+        thinking = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "enabled"},
+                                   logprobs=True, top_logprobs=5, max_tokens=16)
+        thinking_lp = ((((thinking.body or {}).get("choices") or [{}])[0]).get("logprobs") or {}).get("content") or []
+        observations = {"http_status": r.status, "logprob_items": len(samples), "sample": samples[:1], "thinking_status": thinking.status, "thinking_logprob_items": len(thinking_lp)}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"非思考模式 logprobs 请求失败（HTTP {r.status}）：{str(_error_body(r).get('message'))[:150]}", observations
+        if not has_tokens:
+            return False, f"logprobs=true 但未返回 token 级对数概率（items={len(samples)}）", observations
+        if thinking.status != 200:
+            return True, f"非思考模式对数概率正常（{len(samples)} 项）；思考模式下传 logprobs 返回 HTTP {thinking.status}，文档称「不报错但不生效」，属线上差异", observations, "warning"
+        return True, f"非思考模式返回 {len(samples)} 项 token 级对数概率；思考模式下按文档不生效且不报错（items={len(thinking_lp)}）", observations
+
+    async def case_top_p_bounds(self, model: str):
+        """top_p 越界应拒；思考模式下限 0.95，非思考模式恒 1.0（均表现为不报错）。"""
+        over = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, top_p=1.2, max_tokens=16)
+        thinking = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "enabled"}, top_p=0.5, max_tokens=16)
+        plain = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, top_p=0.5, max_tokens=16)
+        observations = {"over_status": over.status, "thinking_status": thinking.status, "plain_status": plain.status, "over_error": str(_error_body(over).get("message"))[:200]}
+        if over.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", observations, "blocked"
+        if _is_rejection(over.status):
+            if thinking.status == 200 and plain.status == 200:
+                return True, f"top_p=1.2 被 4xx 拒绝；top_p=0.5 在思考（按下限 0.95 处理）与非思考（恒 1.0 忽略）模式下均被接受", observations
+            return False, f"top_p 合法值被拒（思考 {thinking.status} / 非思考 {plain.status}）", observations
+        if over.status == 200:
+            return True, "top_p=1.2 超出文档上限 1 但未被拒绝（HTTP 200），属宽松放行", observations, "warning"
+        return False, f"top_p 越界返回非预期状态 HTTP {over.status}", observations
+
+    async def case_fim_thinking_conflict(self, model: str):
+        r = await self.request("completions", {"model": model, "prompt": "def fib(n):\n", "suffix": "\n    return fib(n-1)+fib(n-2)", "max_tokens": 32, "thinking": {"type": "enabled"}}, family="beta")
+        observations = {"http_status": r.status, "error": str(_error_body(r).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "beta") or "beta 端点不存在", observations, "blocked"
+        if _is_rejection(r.status):
+            return True, f"FIM 携带思考模式被 4xx 拒绝（HTTP {r.status}），符合文档「FIM 仅支持非思考模式」", observations
+        if r.status == 200:
+            return True, "FIM 携带思考模式未被拒绝（HTTP 200）：文档称 FIM 仅支持非思考模式，属宽松放行（thinking 可能被静默忽略）", observations, "warning"
+        return False, f"FIM + thinking 返回非预期状态 HTTP {r.status}", observations
+
+    async def case_anthropic_system_stop(self, model: str):
+        marker = "<END>"
+        payload = {"model": model, "max_tokens": 64, "system": "你只输出用户指定的字符串，不要解释、不要加引号。",
+                   "messages": [{"role": "user", "content": [{"type": "text", "text": f"严格输出 ABC{marker}XYZ"}]}],
+                   "stop_sequences": [marker]}
+        r = await self.request("v1/messages", payload, family="anthropic")
+        text = _anthropic_text(r)
+        observations = {"http_status": r.status, "block_types": _anthropic_block_types(r), "text": text[:200], "stop_reason": (r.body or {}).get("stop_reason")}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "anthropic") or "anthropic 端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"Anthropic system/stop_sequences 请求失败（HTTP {r.status}）：{str(_error_body(r).get('message'))[:150]}", observations
+        if marker in text or "XYZ" in text:
+            return False, f"stop_sequences 未生效：输出仍包含停止串或其后续内容（{text[:80]}）", observations
+        return True, "Anthropic 顶层 system 生效且 stop_sequences 命中后正确截断", observations
+
+    async def case_anthropic_thinking(self, model: str):
+        payload = {"model": model, "max_tokens": 1024,
+                   "thinking": {"type": "enabled", "budget_tokens": 1024},
+                   "output_config": {"effort": "high"},
+                   "messages": [{"role": "user", "content": [{"type": "text", "text": "计算 27*31，只给答案。"}]}]}
+        r = await self.request("v1/messages", payload, family="anthropic")
+        types = _anthropic_block_types(r)
+        observations = {"http_status": r.status, "block_types": types, "error": str(_error_body(r).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "anthropic") or "anthropic 端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"Anthropic thinking/output_config 请求失败（HTTP {r.status}）：budget_tokens 应被忽略且 thinking 受支持", observations
+        if "thinking" in types:
+            return True, "Anthropic thinking 块正常返回，budget_tokens 被忽略、output_config.effort 被接受", observations
+        return True, "请求成功但响应未包含 thinking 块（文档称 thinking 受支持，仅 budget_tokens 被忽略）", observations, "warning"
+
+    async def case_responses_stream(self, model: str):
+        """Responses 流式是语义事件流：event + sequence_number，结束于 response.completed，无 [DONE]。"""
+        r = await self.request("responses", {"model": model, "input": "只回复 OK", "max_output_tokens": 32, "stream": True}, stream=True)
+        info = r.stream or {}
+        events = [e for e in (info.get("received_events") or []) if isinstance(e, dict)]
+        types = [str(e.get("type")) for e in events]
+        seqs = [e.get("sequence_number") for e in events if isinstance(e.get("sequence_number"), int)]
+        monotonic = bool(seqs) and all(b > a for a, b in zip(seqs, seqs[1:]))
+        text = "".join(str(e.get("delta") or "") for e in events if e.get("type") == "response.output_text.delta")
+        raw = info.get("raw_sse_events") or []
+        observations = {"http_status": r.status, "event_types": types[:12], "event_count": len(events),
+                        "sequence_monotonic": monotonic, "text": text[:120], "has_done_marker": "[DONE]" in raw}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "Responses 端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"Responses 流式请求失败（HTTP {r.status}）", observations
+        if "response.failed" in types:
+            return False, f"流式以 response.failed 结束：{str(events[-1].get('response', {}).get('error'))[:150]}", observations
+        problems: list[str] = []
+        if "response.created" not in types:
+            problems.append("缺少首事件 response.created")
+        if "response.completed" not in types:
+            problems.append(f"未以 response.completed 结束（实际 {types[-1] if types else '无事件'}）")
+        if not monotonic:
+            problems.append("sequence_number 非单调递增")
+        if "[DONE]" in raw:
+            problems.append("出现 [DONE]（Responses 规范无该结束标记）")
+        if not text:
+            problems.append("未收到 response.output_text.delta 文本")
+        if problems:
+            return False, "；".join(problems), observations
+        return True, f"语义事件流正常：{len(events)} 个事件、sequence_number 单调递增、以 response.completed 收尾且无 [DONE]", observations
+
+    async def case_responses_ignored_fields(self, model: str):
+        """文档：不支持的顶层参数一律静默忽略，响应固定 store=false / previous_response_id=null / parallel_tool_calls=true。"""
+        ignored = {"previous_response_id": "resp_nonexistent", "conversation": "conv_dsv4", "store": True,
+                   "metadata": {"probe": "dsv4"}, "include": ["reasoning.encrypted_content"],
+                   "prompt": {"id": "pmt_dsv4"}, "truncation": "auto", "service_tier": "auto",
+                   "stream_options": {"include_usage": True}, "prompt_cache_key": "dsv4-key",
+                   "prompt_cache_retention": "24h", "background": True, "safety_identifier": "dsv4",
+                   "max_tool_calls": 3, "context_management": {"type": "auto"}}
+        r = await self.request("responses", {"model": model, "input": "只回复 OK", "max_output_tokens": 32, **ignored})
+        body = r.body or {}
+        observations = {"http_status": r.status, "store": body.get("store"), "previous_response_id": body.get("previous_response_id"),
+                        "parallel_tool_calls": body.get("parallel_tool_calls"), "injected_fields": sorted(ignored), "error": str(_error_body(r).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "Responses 端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"不支持的字段未被静默忽略（HTTP {r.status}）：{str(_error_body(r).get('message'))[:150]}", observations
+        fixed_ok = body.get("store") is False and body.get("previous_response_id") is None and body.get("parallel_tool_calls") is True
+        if fixed_ok:
+            return True, f"{len(ignored)} 个不支持字段全部被静默忽略，固定值 store=false / previous_response_id=null / parallel_tool_calls=true", observations
+        return False, f"不支持字段虽未报错，但响应固定值不符：store={body.get('store')}、previous_response_id={body.get('previous_response_id')}、parallel_tool_calls={body.get('parallel_tool_calls')}", observations
+
+    async def case_parallel_tool_calls(self, model: str):
+        tools = self.tools() + [{"type": "function", "function": {"name": "get_text", "description": "返回测试文本", "parameters": {"type": "object", "properties": {}, "required": []}}}]
+        r = await self.chat(model, [{"role": "user", "content": "必须一次性同时调用 get_number 和 get_text 两个工具，不要只调用其中一个。"}],
+                            tools=tools, tool_choice="required", thinking={"type": "disabled"}, max_tokens=256)
+        calls = _message(r.body).get("tool_calls") or []
+        names = [str((c.get("function") or {}).get("name")) for c in calls]
+        observations = {"http_status": r.status, "tool_call_count": len(calls), "names": names}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"并行工具调用请求失败（HTTP {r.status}）", observations
+        if len(calls) >= 2:
+            return True, f"单轮返回 {len(calls)} 个工具调用（{names}），并行工具调用可用", observations
+        return True, f"单轮仅返回 {len(calls)} 个工具调用（{names}）：chat 端点未承诺并行调用，仅作观测", observations, "warning"
 
     async def case_anthropic_basic(self, model: str):
         payload = {"model": model, "max_tokens": 32, "messages": [{"role": "user", "content": "只回复 OK"}]}
@@ -605,6 +1064,284 @@ class DeepSeekV4Runner:
         if missing:
             return False, missing, observations, "blocked"
         return r.status == 200 and body.get("role") == "assistant" and isinstance(body.get("content"), list), "Anthropic Messages 应返回 assistant 与 content 数组", observations
+
+    async def case_image_detail_levels(self, model: str):
+        url = png_data_url()
+        prompt = "这张图上半部分和下半部分分别是什么颜色？只回答两个颜色词，用中文。"
+        rows: dict[str, Any] = {}
+        for detail in ("low", "high", "original", "auto"):
+            r = await self.chat(model, [{"role": "user", "content": [{"type": "text", "text": prompt}, image_part(url, detail)]}],
+                                thinking={"type": "disabled"}, max_tokens=32)
+            content = str(_message(r.body).get("content") or "")
+            rows[detail] = {"status": r.status, "recognized": "红" in content and "蓝" in content}
+        if any(v["status"] == 404 for v in rows.values()):
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", rows, "blocked"
+        failed = {k: v["status"] for k, v in rows.items() if v["status"] != 200}
+        if failed:
+            return False, f"以下 detail 档位未被接受：{failed}", rows
+        unrecognized = [k for k, v in rows.items() if not v["recognized"]]
+        if unrecognized:
+            return False, f"detail={'/'.join(unrecognized)} 返回 200 但未识别图像内容", rows
+        return True, "detail=low/high/original/auto 四档均被接受且都能正确识别图像内容", rows
+
+    async def case_files_listing(self, model: str):
+        listing = await self.root_request("GET", "files", params={"limit": 5})
+        body = listing.body or {}
+        data = body.get("data") if isinstance(body.get("data"), list) else []
+        items_ok = all(isinstance(x.get("id"), str) and "filename" in x and "purpose" in x for x in data if isinstance(x, dict))
+        observations: dict[str, Any] = {"list_status": listing.status, "object": body.get("object"), "count": len(data),
+                                        "has_more": body.get("has_more"), "first_item": data[:1]}
+        if listing.status == 404:
+            return False, _endpoint_missing_reason(404, "root") or "Files 端点不存在", observations, "blocked"
+        if listing.status != 200 or body.get("object") != "list" or not items_ok:
+            return False, f"文件列表结构不符合预期（HTTP {listing.status}，object={body.get('object')}）", observations
+        if not data:
+            return True, "文件列表可访问且结构正确（当前账号无已上传文件，未校验单文件检索）", observations
+        file_id = str(data[0].get("id"))
+        detail = await self.root_request("GET", f"files/{file_id}")
+        detail_body = detail.body or {}
+        observations.update({"retrieve_status": detail.status, "retrieve_fields": sorted(detail_body)})
+        if detail.status == 200 and detail_body.get("id") == file_id and "bytes" in detail_body:
+            return True, f"列表返回 {len(data)} 个文件且字段完整；单文件检索也返回正确记录", observations
+        return False, f"单文件检索不符合预期（HTTP {detail.status}，字段={sorted(detail_body)}）", observations
+
+    async def case_user_balance(self, model: str):
+        r = await self.root_request("GET", "user/balance")
+        body = r.body or {}
+        infos = body.get("balance_infos") if isinstance(body.get("balance_infos"), list) else []
+        required = {"currency", "total_balance", "granted_balance", "topped_up_balance"}
+        infos_ok = all(required.issubset(set(x)) for x in infos if isinstance(x, dict)) if infos else False
+        observations = {"http_status": r.status, "is_available": body.get("is_available"), "currencies": [x.get("currency") for x in infos if isinstance(x, dict)]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "root") or "余额端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"余额端点返回非预期状态 HTTP {r.status}", observations
+        if not isinstance(body.get("is_available"), bool):
+            return False, f"余额响应缺少布尔字段 is_available（{body.get('is_available')}）", observations
+        if not infos_ok:
+            return False, f"balance_infos 结构不完整（需要 {sorted(required)}）：{infos[:1]}", observations
+        if body.get("is_available") is False:
+            return True, "余额端点可用，但账号余额不足（is_available=false）——准入前需先充值", observations, "warning"
+        return True, f"余额端点返回 is_available=true 且 balance_infos 字段完整（币种 {observations['currencies']}）", observations
+
+    async def case_stop_multi_sequences(self, model: str):
+        markers = ["<A>", "<B>", "<C>"]
+        r = await self.chat(model, [{"role": "user", "content": "严格按顺序输出：AB<A>Q1<B>Q2<C>Q3"}],
+                            thinking={"type": "disabled"}, stop=markers, max_tokens=64)
+        content = str(_message(r.body).get("content") or "")
+        over = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"},
+                               stop=[f"<S{i}>" for i in range(17)], max_tokens=16)
+        observations = {"multi_status": r.status, "content": content, "over_limit_status": over.status,
+                        "over_limit_error": str(_error_body(over).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", observations, "blocked"
+        if r.status != 200:
+            return False, f"多序列 stop 请求失败（HTTP {r.status}）", observations
+        hit = [m for m in markers if m in content]
+        leaked = "Q1" in content or "Q2" in content or "Q3" in content
+        if hit or leaked:
+            return False, f"多序列 stop 未生效（命中串={hit}，后续内容泄漏={leaked}）：{content[:120]}", observations
+        if _is_rejection(over.status):
+            return True, f"多序列 stop 命中即截断；超过 16 条（17 条）被 4xx 拒绝（HTTP {over.status}），符合文档上限", observations
+        if over.status == 200:
+            return True, "多序列 stop 命中即截断；17 个停止序列未被拒绝（文档仅写 up to 16，属宽松放行）", observations, "warning"
+        return False, f"超过 16 条停止序列时返回非预期状态 HTTP {over.status}", observations
+
+    async def case_deprecated_penalties(self, model: str):
+        """文档：frequency_penalty / presence_penalty 已废弃，传入不产生任何效果（也不应报错）。"""
+        prompt = "只回复 OK"
+        base = await self.chat(model, [{"role": "user", "content": prompt}], thinking={"type": "disabled"}, max_tokens=16)
+        penalized = await self.chat(model, [{"role": "user", "content": prompt}], thinking={"type": "disabled"},
+                                    max_tokens=16, frequency_penalty=1.8, presence_penalty=-1.8)
+        observations = {"baseline_status": base.status, "penalized_status": penalized.status,
+                        "baseline_content": str(_message(base.body).get("content") or "")[:40],
+                        "penalized_content": str(_message(penalized.body).get("content") or "")[:40]}
+        if penalized.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "端点不存在", observations, "blocked"
+        if penalized.status == 200 and base.status == 200:
+            return True, "已废弃的 frequency_penalty / presence_penalty 在非思考模式下被静默接受（按文档不产生效果）", observations
+        if _is_rejection(penalized.status):
+            return True, f"已废弃的采样参数被 4xx 拒绝（HTTP {penalized.status}）：文档称传入不报错、无效果，属线上差异", observations, "warning"
+        return False, f"已废弃采样参数返回非预期状态 HTTP {penalized.status}", observations
+
+    async def case_fim_json_conflict(self, model: str):
+        r = await self.request("completions", {"model": model, "prompt": "def fib(n):\n", "suffix": "\n    return fib(n-1)+fib(n-2)",
+                                              "max_tokens": 32, "response_format": {"type": "json_object"}}, family="beta")
+        observations = {"http_status": r.status, "error": str(_error_body(r).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "beta") or "beta 端点不存在", observations, "blocked"
+        if _is_rejection(r.status):
+            return True, f"FIM 与 JSON mode 同时使用被 4xx 拒绝（HTTP {r.status}），符合文档「二者不支持同时使用」", observations
+        if r.status == 200:
+            return True, "FIM 与 JSON mode 同时使用未被拒绝（HTTP 200）：文档称二者不支持同时使用，属宽松放行", observations, "warning"
+        return False, f"FIM + JSON mode 返回非预期状态 HTTP {r.status}", observations
+
+    async def case_prefix_without_flag(self, model: str):
+        """文档 422 场景之一：期望前缀续写但最后一条 assistant 消息未设 prefix=true。"""
+        r = await self.chat(model, [{"role": "user", "content": "写一个 Python 加法函数，只输出代码。"},
+                                    {"role": "assistant", "content": "def add(a, b):\n"}], _family="beta", thinking={"type": "disabled"}, max_tokens=32)
+        content = str(_message(r.body).get("content") or "")
+        observations = {"http_status": r.status, "content": content[:200], "error": str(_error_body(r).get("message"))[:200]}
+        if r.status == 404:
+            return False, _endpoint_missing_reason(404, "beta") or "beta 端点不存在", observations, "blocked"
+        if _is_rejection(r.status):
+            return True, f"末条 assistant 消息缺少 prefix=true 时被 4xx 拒绝（HTTP {r.status}），符合文档 422 场景", observations
+        if r.status == 200:
+            return True, "末条 assistant 消息缺少 prefix=true 时未被拒绝（HTTP 200）：文档未承诺拒绝（属调用方义务），记为观测", observations, "warning"
+        return False, f"prefix 缺少标志时返回非预期状态 HTTP {r.status}", observations
+
+    async def case_anthropic_tool_loop(self, model: str):
+        tool = {"name": "lookup_order", "description": "查询订单状态",
+                "input_schema": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}
+        first = await self.request("v1/messages", {"model": model, "max_tokens": 256, "tools": [tool],
+                                                    "tool_choice": {"type": "any"},
+                                                    "messages": [{"role": "user", "content": [{"type": "text", "text": "查询订单 ORD-731 的状态，必须调用工具。"}]}]}, family="anthropic")
+        blocks = (first.body or {}).get("content") or []
+        tool_uses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+        observations: dict[str, Any] = {"first_status": first.status, "block_types": _anthropic_block_types(first), "tool_use_count": len(tool_uses)}
+        if first.status == 404:
+            return False, _endpoint_missing_reason(404, "anthropic") or "anthropic 端点不存在", observations, "blocked"
+        if first.status != 200:
+            return False, f"Anthropic tool_choice=any 请求失败（HTTP {first.status}）：{str(_error_body(first).get('message'))[:150]}", observations
+        if not tool_uses:
+            return False, f"tool_choice=any 未产生 tool_use 块（块类型 {observations['block_types']}）", observations
+        call = tool_uses[0]
+        observations["tool_name"] = call.get("name")
+        if call.get("name") != "lookup_order":
+            return False, f"tool_use 名称不符：{call.get('name')}", observations
+        second = await self.request("v1/messages", {"model": model, "max_tokens": 256, "tools": [tool],
+                                                     "messages": [{"role": "user", "content": [{"type": "text", "text": "查询订单 ORD-731 的状态，必须调用工具。"}]},
+                                                                  {"role": "assistant", "content": blocks},
+                                                                  {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call.get("id"), "content": "已发货"}]}]}, family="anthropic")
+        text = _anthropic_text(second)
+        observations.update({"second_status": second.status, "second_blocks": _anthropic_block_types(second), "text": text[:120]})
+        if second.status == 200 and text:
+            return True, "Anthropic tool_choice=any 触发 tool_use，tool_result 回传后模型正常作答（闭环成立）", observations
+        return False, f"工具结果回传后未正常作答（HTTP {second.status}，块类型 {observations['second_blocks']}）", observations
+
+    # Responses 侧工具矩阵。
+    #
+    # 官方文档两处关键口径：
+    #   1) 《Thinking Mode》控制参数表：Responses 形态的思考开关是
+    #      `{"reasoning": {"effort": "none/low/high/max"}}`，**`none` 关闭思考模式**；
+    #      思考默认开启，默认档位 high。
+    #   2) 《Chat Completions API》tool_choice 段：「思考模式下不支持 required 和指定具体 tool 的用法，
+    #      API 会返回 400 错误。请先关闭思考模式。」
+    #
+    # 即「默认思考模式下 required/指定工具被 4xx 拒绝」是**文档承诺的负向行为**，
+    # 「先关闭思考再强制调用」是**文档给出的解法**。因此本用例做两面对称验证，而不是把 400 当成缺陷：
+    #   - 负向（文档承诺）：默认思考模式下 required 与指定工具均应 4xx（放宽记 warning）；
+    #   - 正向（文档解法）：`reasoning.effort=none` 关闭思考后 required 应稳定触发 function_call。
+    # 与 Chat 侧 DS-V4-33「关思考 + required」同一口径，不因该限制本身记 warning。
+    #
+    # 2026-09-24 15:10 真实批次证据（results/DS_V4_P2-20260924-151006）：
+    #   required + 默认思考模式 → 400 "Thinking mode does not support this tool_choice"
+    #   required + reasoning.effort=none → 200 且 output=['function_call']（响应回显 reasoning.effort=none）
+    RESPONSES_TOOL_PRIMING_PROMPTS = (
+        "必须调用 get_number 获取测试数字，不要自行回答。",
+        "禁止直接回答。请先调用 get_number 工具获取测试数字，再基于工具返回结果作答。",
+    )
+    # 思考模式下推理内容会占用 max_output_tokens；给足额度，避免 function_call 被截断成假失败
+    # （DS-V4-34 用 32 时 output 只剩一个 reasoning 项且 status=incomplete）。
+    RESPONSES_TOOL_MAX_OUTPUT = 1024
+    # Responses 形态的思考开关：effort=none 即关闭思考（文档《Thinking Mode》控制参数表）。
+    RESPONSES_THINKING_OFF = {"effort": "none"}
+
+    @staticmethod
+    def _responses_output_types(r: ApiResponse) -> list[str]:
+        return [str(i.get("type")) for i in ((r.body or {}).get("output") or []) if isinstance(i, dict)]
+
+    @classmethod
+    def _responses_function_call(cls, r: ApiResponse) -> bool:
+        return r.status == 200 and "function_call" in cls._responses_output_types(r)
+
+    async def case_responses_tool_matrix(self, model: str):
+        fn_tool = {"type": "function", "name": "get_number", "description": "返回测试数字", "parameters": {"type": "object", "properties": {}, "required": []}}
+        pinned_choice = {"type": "function", "name": "get_number"}
+        base = {"model": model, "input": self.RESPONSES_TOOL_PRIMING_PROMPTS[0],
+                "max_output_tokens": self.RESPONSES_TOOL_MAX_OUTPUT, "tools": [fn_tool]}
+
+        # 负向 1/2：默认（思考）模式下 required 与指定工具都应被 4xx 拒绝（文档承诺）
+        default_required = await self.request("responses", {**base, "tool_choice": "required"})
+        if default_required.status == 404:
+            return False, _endpoint_missing_reason(404, "openai") or "Responses 端点不存在", {"required_status": 404}, "blocked"
+        default_pinned = await self.request("responses", {**base, "tool_choice": pinned_choice})
+
+        # 正向：关闭思考（reasoning.effort=none）后 required 应强制触发 function_call
+        forced = await self.request("responses", {**base, "tool_choice": "required", "reasoning": self.RESPONSES_THINKING_OFF})
+        ladder: list[tuple[str, ApiResponse]] = [("required+effort=none", forced)]
+        trigger = "required+effort=none" if self._responses_function_call(forced) else None
+
+        # 兜底 1：指定工具 + 关思考
+        if trigger is None:
+            fallback_pinned = await self.request("responses", {**base, "tool_choice": pinned_choice, "reasoning": self.RESPONSES_THINKING_OFF})
+            ladder.append(("指定工具+effort=none", fallback_pinned))
+            if self._responses_function_call(fallback_pinned):
+                trigger = "指定工具+effort=none"
+        # 兜底 2：auto + 强提示诱导（与 Chat 侧 DS-V4-08 同一手法，两轮递增）
+        if trigger is None:
+            for prompt in self.RESPONSES_TOOL_PRIMING_PROMPTS:
+                auto = await self.request("responses", {**base, "input": prompt, "tool_choice": "auto"})
+                ladder.append(("auto+强提示", auto))
+                if self._responses_function_call(auto):
+                    trigger = "auto+强提示"
+                    break
+
+        # 矩阵其余两格：custom 非 apply_patch 必须被拒绝；内置工具必须被静默忽略（都不依赖思考开关）
+        bad = await self.request("responses", {"model": model, "input": "执行 patch", "max_output_tokens": 64,
+                                                "tools": [{"type": "custom", "name": "not_apply_patch"}]})
+        ignored = await self.request("responses", {"model": model, "input": "只回复 OK",
+                                                    "max_output_tokens": self.RESPONSES_TOOL_MAX_OUTPUT,
+                                                    "tools": [{"type": "web_search"}]})
+        ignored_types = self._responses_output_types(ignored)
+        observations = {"tool_choice_ladder": {name: r.status for name, r in ladder}, "triggered_by": trigger,
+                        "default_required": {"status": default_required.status,
+                                             "output_types": self._responses_output_types(default_required),
+                                             "error": str(_error_body(default_required).get("message"))[:200]},
+                        "default_pinned": {"status": default_pinned.status,
+                                           "output_types": self._responses_output_types(default_pinned),
+                                           "error": str(_error_body(default_pinned).get("message"))[:200]},
+                        "custom_bad_status": bad.status, "custom_bad_error": str(_error_body(bad).get("message"))[:200],
+                        "builtin_ignored_status": ignored.status, "builtin_ignored_output_types": ignored_types}
+
+        problems: list[str] = []
+        notes: list[str] = []
+        # 文档承诺「思考模式下 required / 指定工具 → 400」。线上若未按承诺拒绝，按项目既有口径记 warning
+        # （先例 DS-V4-58/59：文档承诺的 4xx 没被执行属"文档/线上差异"，不升级为 failed）。
+        # 但要区分两种 200：直接触发（能力具备，只是没报错）vs 静默忽略（强制调用失效）。
+        for label, probe in (("required", default_required), ("指定工具", default_pinned)):
+            if self._responses_function_call(probe):
+                notes.append(f"默认（思考）模式下 tool_choice={label} 已被上游直接放行并触发 function_call，"
+                             "未按文档返回 400——文档/线上差异，能力本身具备")
+            elif probe.status == 200:
+                notes.append(f"默认（思考）模式下 tool_choice={label} 未按文档返回 4xx，且未触发 function_call"
+                             f"（HTTP 200，output {self._responses_output_types(probe)}）：强制调用被静默忽略"
+                             "——文档/线上差异，需人工判断影响面")
+        if trigger is None:
+            problems.append("关闭思考后 function 工具仍未被触发（"
+                            + "、".join(f"{name}→HTTP {r.status}" for name, r in ladder)
+                            + "）：文档承诺「请先关闭思考模式」后即可强制调用")
+        if not _is_rejection(bad.status):
+            problems.append(f"custom 非 apply_patch 未被拒绝（HTTP {bad.status}，文档承诺 400）")
+        if ignored.status != 200:
+            problems.append(f"内置工具 web_search 未被忽略（HTTP {ignored.status}）")
+        elif "web_search_call" in ignored_types:
+            problems.append("内置工具 web_search 被执行（output 出现 web_search_call，文档承诺忽略）")
+        if problems:
+            return False, "；".join(problems), observations
+
+        if trigger == "required+effort=none" and not notes:
+            detail = ("关闭思考（reasoning.effort=none）后 tool_choice=required 稳定触发 function_call；"
+                      "默认思考模式下 required 与指定工具按文档返回 4xx；custom 非 apply_patch 被 4xx 拒绝；"
+                      "内置 web_search 被静默忽略（无 web_search_call）")
+            return True, detail, observations
+        if trigger == "required+effort=none":
+            return True, ("关闭思考后 tool_choice=required 触发 function_call；custom 非 apply_patch 被 4xx 拒绝；"
+                          "内置 web_search 被静默忽略；" + "；".join(notes)), observations, "warning"
+        detail = (f"function 工具经 {trigger} 触发 function_call、custom 非 apply_patch 被 4xx 拒绝、内置工具被静默忽略；"
+                  f"但文档解法（reasoning.effort=none 关思考 + required）未生效（HTTP {forced.status}："
+                  f"{str(_error_body(forced).get('message'))[:120]}），属文档/线上差异")
+        return True, detail, observations, "warning"
 
 
 def _invalid_json(text: str) -> bool:

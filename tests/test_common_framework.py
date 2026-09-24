@@ -29,3 +29,52 @@ class ValidatorContractTests(unittest.TestCase):
         from common.validators import aggregate_percentile
         r=aggregate_percentile('ttft_p95',[10],p=.95,maximum=100,minimum_samples=2)
         self.assertFalse(r.passed)
+
+
+class RawChannelMultipartTests(unittest.IsolatedAsyncioTestCase):
+    """execute_raw 的 multipart 头必须带 boundary（2026-09-24 Files 上传 400 事故）。"""
+
+    async def _executor_with_capture(self, headers):
+        import httpx
+        from common.test_framework import HttpExecutor
+
+        seen = {}
+
+        async def handler(request):
+            seen["content_type"] = request.headers.get("content-type")
+            seen["body"] = request.content
+            seen["url"] = str(request.url)
+            return httpx.Response(200, json={"id": "file-api-mock1", "deleted": True})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler), headers=headers)
+        executor = HttpExecutor(client=client)
+        await executor.__aenter__()
+        return executor, client, seen
+
+    async def test_multipart_gets_boundary_despite_json_client_default(self):
+        # 复现事故条件：客户端默认头带 application/json（dsv4 runner 的写法）
+        executor, client, seen = await self._executor_with_capture(
+            {"Authorization": "Bearer k", "Content-Type": "application/json"})
+        try:
+            rec = await executor.execute_raw(case_id="DS-V4-41", method="POST", url="https://api.deepseek.com/files",
+                                             headers={"X-Request-ID": "rid"},
+                                             files={"file": ("a.png", b"\x89PNG", "image/png")},
+                                             data={"purpose": "user_data"})
+        finally:
+            await client.aclose()
+        ct = seen["content_type"]
+        self.assertTrue(ct.startswith("multipart/form-data; boundary="), ct)
+        boundary = ct.split("boundary=", 1)[1].encode()
+        self.assertIn(boundary, seen["body"], "body 必须使用与 Content-Type 一致的 boundary")
+        self.assertEqual(rec.http_status, 200)
+        self.assertEqual(rec.request["_method"], "POST")
+        self.assertEqual(rec.request["_url"], "https://api.deepseek.com/files")
+
+    async def test_json_post_still_application_json(self):
+        executor, client, seen = await self._executor_with_capture({"Content-Type": "application/json"})
+        try:
+            await executor.execute_raw(case_id="x", method="POST", url="https://api.deepseek.com/v1/chat/completions",
+                                       headers={}, json_body={"model": "deepseek-flash"})
+        finally:
+            await client.aclose()
+        self.assertIn("application/json", seen["content_type"])

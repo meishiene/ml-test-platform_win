@@ -1,17 +1,22 @@
+import inspect
 import json
 import unittest
 
 import httpx
 
+from common.model_contracts import model_matches_family
 from dsv4.cases import CASES
-from dsv4.core import CaseResult, DeepSeekConfig, DeepSeekV4Runner, _cache_tokens, summarize_results
+from dsv4.core import (PRIMARY_MODELS, RETIRED_ALIASES, CaseResult, DeepSeekConfig, DeepSeekV4Runner,
+                       _cache_tokens, png_bands, png_data_url, summarize_results)
 
 
 class DeepSeekV4Tests(unittest.TestCase):
     def test_ui_suites(self):
         self.assertEqual(set(CASES), {"DS_V4_P0", "DS_V4_P1", "DS_V4_P2", "DS_V4_FINGERPRINT"})
-        self.assertEqual(CASES["DS_V4_P0"].request_count,18)
-        self.assertEqual(CASES["DS_V4_P2"].request_count,10)
+        # 2026-09-24 覆盖度评审后：P0 由 18 → 24，P1 由 7 → 18，P2 由 10 → 19
+        self.assertEqual(CASES["DS_V4_P0"].request_count,24)
+        self.assertEqual(CASES["DS_V4_P1"].request_count,18)
+        self.assertEqual(CASES["DS_V4_P2"].request_count,19)
 
     def test_config_urls(self):
         config=DeepSeekConfig("key", "https://api.deepseek.com/")
@@ -241,3 +246,547 @@ class DeepSeekV4OutcomeTests(unittest.IsolatedAsyncioTestCase):
         finally: await client.aclose()
         self.assertFalse(outcome[0])
         self.assertEqual(outcome[3],"blocked")
+
+
+class DeepSeekV4SupplementTests(unittest.IsolatedAsyncioTestCase):
+    """2026-09-24 覆盖度评审补充用例（DS-V4-36 ~ DS-V4-61）的行为测试。"""
+
+    async def _runner(self, responses, base_url="https://api.deepseek.com/v1"):
+        queue=list(responses); seen=[]
+        async def handler(request):
+            body=None
+            if request.content:
+                text=request.content.decode("utf-8","replace")
+                try: body=json.loads(text)
+                except json.JSONDecodeError: body={"_raw":text[:120]}   # multipart 上传内容非 JSON
+            seen.append({"method":request.method,"path":request.url.path,"body":body,
+                         "auth":request.headers.get("authorization"),"query":dict(request.url.params)})
+            item=queue.pop(0)
+            if not callable(item): return httpx.Response(item[0],json=item[1])
+            result=item(request)
+            return await result if inspect.isawaitable(result) else result
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return DeepSeekV4Runner(DeepSeekConfig("key",base_url),client),client,seen
+
+    @staticmethod
+    def _chat(content="OK",prompt_tokens=10):
+        return {"choices":[{"message":{"role":"assistant","content":content}}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":3,"total_tokens":prompt_tokens+3}}
+
+    def test_png_generator_is_valid_and_deterministic(self):
+        import struct
+        raw=png_bands()
+        self.assertTrue(raw.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(struct.unpack(">II",raw[16:24]),(64,64))
+        self.assertEqual(raw,png_bands())          # 固定图案，避免随机图导致识别用例不稳定
+        self.assertTrue(png_data_url().startswith("data:image/png;base64,"))
+        self.assertNotEqual(png_bands(top_rgb=(0,0,0),bottom_rgb=(255,255,255)),raw)
+
+    def test_root_endpoints_stay_on_domain_root(self):
+        config=DeepSeekConfig("key","https://api.deepseek.com/v1")
+        self.assertEqual(config.url("models","root"),"https://api.deepseek.com/models")
+        self.assertEqual(config.url("user/balance","root"),"https://api.deepseek.com/user/balance")
+        self.assertEqual(config.url("files","root"),"https://api.deepseek.com/files")
+        self.assertEqual(config.url("files","openai"),"https://api.deepseek.com/v1/files")
+
+    async def test_root_request_falls_back_to_versioned_path_on_404(self):
+        body={"object":"list","data":[{"id":"deepseek-flash","object":"model","owned_by":"deepseek"}]}
+        runner,client,seen=await self._runner([(404,{"error":{"message":"not found"}}),(200,body)])
+        try: outcome=await runner.case_models_listing("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual([s["path"] for s in seen],["/models","/v1/models"])
+
+    async def test_models_listing_without_flash_is_warning(self):
+        body={"object":"list","data":[{"id":"deepseek-v4-pro","object":"model","owned_by":"deepseek"}]}
+        runner,client,_=await self._runner([(200,body)])
+        try: outcome=await runner.case_models_listing("deepseek-v4-pro")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+    async def test_image_input_requires_content_and_token_growth(self):
+        runner,client,seen=await self._runner([(200,self._chat("OK",10)),(200,self._chat("上半部分是红色，下半部分是蓝色",210))])
+        try: outcome=await runner.case_image_input("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        # 第二次请求必须真的带图（content 数组 + data URL）
+        parts=seen[1]["body"]["messages"][0]["content"]
+        self.assertIsInstance(parts,list)
+        self.assertTrue(parts[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+        runner,client,_=await self._runner([(200,self._chat("OK",10)),(200,self._chat("这是一张图片",210))])
+        try: outcome=await runner.case_image_input("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("未正确识别",outcome[1])
+
+    async def test_image_input_token_not_counted_is_failed(self):
+        # 200 但 prompt_tokens 与纯文本基线一致 → 图片被丢弃，不能算通过
+        runner,client,_=await self._runner([(200,self._chat("OK",10)),(200,self._chat("上半部分红色，下半部分蓝色",10))])
+        try: outcome=await runner.case_image_input("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("prompt_tokens",outcome[1])
+
+    async def test_image_wrong_role_lenient_200_is_warning(self):
+        runner,client,_=await self._runner([(200,self._chat("看到了")),(200,self._chat("看到了"))])
+        try: outcome=await runner.case_image_wrong_role("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+        runner,client,_=await self._runner([(400,{"error":{"message":"images are only allowed in user messages"}})])
+        try: outcome=await runner.case_image_wrong_role("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(len(outcome),3)   # 4xx 拒绝 → 无显式裁定，按 passed 收口
+
+    async def test_effort_full_set_none_still_reasoning_is_warning(self):
+        bodies=[{"choices":[{"message":{"content":"391","reasoning_content":""}}]},
+                *[{"choices":[{"message":{"content":"391","reasoning_content":"思考"}}]} for _ in range(5)]]
+        runner,client,seen=await self._runner([(200,b) for b in bodies])
+        try: outcome=await runner.case_effort_full_set("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual([s["body"]["reasoning_effort"] for s in seen],["none","low","high","max","minimal","ultra"])
+
+        bodies[0]={"choices":[{"message":{"content":"391","reasoning_content":"仍然思考了"}}]}
+        runner,client,_=await self._runner([(200,b) for b in bodies])
+        try: outcome=await runner.case_effort_full_set("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+    async def test_max_tokens_lenient_bounds_are_warning(self):
+        runner,client,seen=await self._runner([(200,self._chat()), (200,self._chat()), (200,self._chat())])
+        try: outcome=await runner.case_max_tokens_bounds("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+        self.assertEqual([s["body"]["max_tokens"] for s in seen],[393216,0,393217])
+
+        runner,client,_=await self._runner([(400,{"error":{"message":"max_tokens must be between 1 and 393216"}})])
+        try: outcome=await runner.case_max_tokens_bounds("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("393216",outcome[1])
+
+    async def test_invalid_api_key_contract(self):
+        runner,client,seen=await self._runner([(401,{"error":{"message":"Invalid API key provided","type":"invalid_request_error","code":"invalid_api_key"}})])
+        try: outcome=await runner.case_invalid_api_key("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[2]["error_type"],"invalid_request_error")
+        self.assertTrue(seen[0]["auth"].startswith("Bearer sk-invalid"))
+
+        runner,client,_=await self._runner([(200,self._chat())])
+        try: outcome=await runner.case_invalid_api_key("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])   # 无效 Key 返回 200 → 鉴权未生效
+
+    async def test_files_lifecycle_uploads_references_and_deletes(self):
+        runner,client,seen=await self._runner([
+            (200,{"id":"file-api-abc123","object":"file","bytes":1024,"filename":"dsv4-probe.png","purpose":"user_data"}),
+            (200,self._chat("上半部分红色，下半部分蓝色")),
+            (200,{"id":"file-api-abc123","object":"file","deleted":True}),
+        ])
+        try: outcome=await runner.case_files_lifecycle("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual([(s["method"],s["path"]) for s in seen],
+                         [("POST","/files"),("POST","/v1/chat/completions"),("DELETE","/files/file-api-abc123")])
+        self.assertEqual(seen[1]["body"]["messages"][0]["content"][1]["file_id"],"file-api-abc123")
+
+    async def test_files_lifecycle_warns_when_delete_fails(self):
+        runner,client,seen=await self._runner([
+            (200,{"id":"file-api-abc123","object":"file"}),
+            (200,self._chat("上半部分是红色，下半部分是蓝色")),
+            (500,{"error":{"message":"boom"}}),
+        ])
+        try: outcome=await runner.case_files_lifecycle("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+        self.assertEqual(seen[-1]["method"],"DELETE")   # 失败也必须尝试清理
+
+    async def test_files_lifecycle_upload_404_is_blocked(self):
+        runner,client,_=await self._runner([(404,{"error":{"message":"not found"}}),(404,{"error":{"message":"not found"}})])
+        try: outcome=await runner.case_files_lifecycle("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3],"blocked")
+
+    async def test_files_listing_and_retrieve(self):
+        listing={"object":"list","data":[{"id":"file-api-1","object":"file","bytes":10,"filename":"a.png","purpose":"user_data"}],"has_more":False}
+        detail={"id":"file-api-1","object":"file","bytes":10,"filename":"a.png","purpose":"user_data"}
+        runner,client,seen=await self._runner([(200,listing),(200,detail)])
+        try: outcome=await runner.case_files_listing("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(seen[0]["query"].get("limit"),"5")
+        self.assertEqual(seen[1]["path"],"/files/file-api-1")
+
+        empty={"object":"list","data":[],"has_more":False}
+        runner,client,_=await self._runner([(200,empty)])
+        try: outcome=await runner.case_files_listing("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])   # 无文件时不校验单文件检索，但结构断言仍生效
+
+    async def test_user_balance_shapes(self):
+        runner,client,_=await self._runner([(200,{"is_available":True,"balance_infos":[{"currency":"CNY","total_balance":"110.00","granted_balance":"10.00","topped_up_balance":"100.00"}]})])
+        try: outcome=await runner.case_user_balance("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+
+        runner,client,_=await self._runner([(200,{"is_available":False,"balance_infos":[{"currency":"CNY","total_balance":"0","granted_balance":"0","topped_up_balance":"0"}]})])
+        try: outcome=await runner.case_user_balance("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+        runner,client,_=await self._runner([(200,{"balance_infos":[{"currency":"CNY"}]})])
+        try: outcome=await runner.case_user_balance("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+
+    async def test_stream_options_without_stream_contract(self):
+        runner,client,seen=await self._runner([(400,{"error":{"message":"stream_options requires stream=true"}})])
+        try: outcome=await runner.case_stream_options_without_stream("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertNotIn("stream",seen[0]["body"] or {})
+
+        runner,client,_=await self._runner([(200,self._chat())])
+        try: outcome=await runner.case_stream_options_without_stream("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+    async def test_logprobs_structure(self):
+        good={"choices":[{"message":{"content":"OK"},"logprobs":{"content":[{"token":"O","logprob":-0.1,"top_logprobs":[]}]}}]}
+        runner,client,_=await self._runner([(200,good),(200,self._chat())])
+        try: outcome=await runner.case_logprobs_structure("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+
+        runner,client,_=await self._runner([(200,self._chat()), (200,self._chat())])
+        try: outcome=await runner.case_logprobs_structure("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])   # 200 但无 token 级对数概率
+
+    async def test_top_p_bounds(self):
+        runner,client,seen=await self._runner([(400,{"error":{"message":"top_p must be <= 1"}}),(200,self._chat()),(200,self._chat())])
+        try: outcome=await runner.case_top_p_bounds("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual([s["body"]["top_p"] for s in seen],[1.2,0.5,0.5])
+
+        runner,client,_=await self._runner([(200,self._chat())])
+        try: outcome=await runner.case_top_p_bounds("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+    async def test_fim_thinking_conflict(self):
+        runner,client,seen=await self._runner([(422,{"error":{"message":"FIM mode with thinking enabled"}})])
+        try: outcome=await runner.case_fim_thinking_conflict("deepseek-v4-pro")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(seen[0]["path"],"/beta/completions")
+
+        runner,client,_=await self._runner([(200,{"choices":[{"text":"ok"}]})])
+        try: outcome=await runner.case_fim_thinking_conflict("deepseek-v4-pro")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+        runner,client,_=await self._runner([(404,{"error":{"message":"not found"}})])
+        try: outcome=await runner.case_fim_thinking_conflict("deepseek-v4-pro")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3],"blocked")
+
+    async def test_anthropic_system_and_stop_sequences(self):
+        ok={"role":"assistant","content":[{"type":"text","text":"ABC"}],"stop_reason":"stop_sequence"}
+        runner,client,seen=await self._runner([(200,ok)])
+        try: outcome=await runner.case_anthropic_system_stop("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertIn("system",seen[0]["body"])
+        self.assertEqual(seen[0]["path"],"/anthropic/v1/messages")
+
+        leaked={"role":"assistant","content":[{"type":"text","text":"ABC<END>XYZ"}]}
+        runner,client,_=await self._runner([(200,leaked)])
+        try: outcome=await runner.case_anthropic_system_stop("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+
+    async def test_anthropic_thinking_block(self):
+        with_thinking={"role":"assistant","content":[{"type":"thinking","thinking":"推理"},{"type":"text","text":"837"}]}
+        runner,client,seen=await self._runner([(200,with_thinking)])
+        try: outcome=await runner.case_anthropic_thinking("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(seen[0]["body"]["thinking"],{"type":"enabled","budget_tokens":1024})
+        self.assertEqual(seen[0]["body"]["output_config"],{"effort":"high"})
+
+        runner,client,_=await self._runner([(200,{"role":"assistant","content":[{"type":"text","text":"837"}]})])
+        try: outcome=await runner.case_anthropic_thinking("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+    async def test_responses_stream_semantic_events(self):
+        def sse(events, done=False):
+            body="".join("data: %s\n\n"%json.dumps(e,ensure_ascii=False) for e in events)
+            if done: body+="data: [DONE]\n\n"
+            async def handler(request): return httpx.Response(200,text=body,headers={"content-type":"text/event-stream"})
+            return handler
+        good=[{"type":"response.created","sequence_number":0},
+              {"type":"response.output_text.delta","sequence_number":1,"delta":"OK"},
+              {"type":"response.completed","sequence_number":2,"response":{"usage":{"output_tokens":2}}}]
+        runner,client,_=await self._runner([sse(good)])
+        try: outcome=await runner.case_responses_stream("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+
+        bad=[{"type":"response.output_text.delta","sequence_number":1,"delta":"OK"},
+             {"type":"response.completed","sequence_number":2}]
+        runner,client,_=await self._runner([sse(bad)])
+        try: outcome=await runner.case_responses_stream("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("response.created",outcome[1])
+
+        runner,client,_=await self._runner([sse(good, done=True)])
+        try: outcome=await runner.case_responses_stream("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("[DONE]",outcome[1])
+
+    async def test_responses_ignored_fields_fixed_values(self):
+        body={"id":"resp_1","output":[{"type":"message"}],"store":False,"previous_response_id":None,"parallel_tool_calls":True}
+        runner,client,seen=await self._runner([(200,body)])
+        try: outcome=await runner.case_responses_ignored_fields("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        for key in ("metadata","include","service_tier","stream_options","background","truncation"):
+            self.assertIn(key,seen[0]["body"])
+
+        runner,client,_=await self._runner([(200,{"id":"resp_1","output":[],"store":True,"previous_response_id":"resp_x","parallel_tool_calls":True})])
+        try: outcome=await runner.case_responses_ignored_fields("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+
+    async def test_parallel_tool_calls_single_call_is_warning(self):
+        one={"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_number","arguments":"{}"}}]}}]}
+        runner,client,_=await self._runner([(200,one)])
+        try: outcome=await runner.case_parallel_tool_calls("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+        two={"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_number","arguments":"{}"}},
+                                                              {"id":"c2","type":"function","function":{"name":"get_text","arguments":"{}"}}]}}]}
+        runner,client,_=await self._runner([(200,two)])
+        try: outcome=await runner.case_parallel_tool_calls("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(len(outcome),3)
+
+    async def test_stop_multi_sequences_and_over_limit(self):
+        runner,client,_=await self._runner([(200,self._chat("AB")),(400,{"error":{"message":"at most 16 stop sequences"}})])
+        try: outcome=await runner.case_stop_multi_sequences("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+
+        runner,client,_=await self._runner([(200,self._chat("AB")),(200,self._chat())])
+        try: outcome=await runner.case_stop_multi_sequences("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+        runner,client,_=await self._runner([(200,self._chat("AB<A>Q1"))])
+        try: outcome=await runner.case_stop_multi_sequences("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+
+    async def test_deprecated_penalties(self):
+        runner,client,seen=await self._runner([(200,self._chat()),(200,self._chat())])
+        try: outcome=await runner.case_deprecated_penalties("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(seen[1]["body"]["frequency_penalty"],1.8)
+
+        runner,client,_=await self._runner([(200,self._chat()),(400,{"error":{"message":"frequency_penalty is deprecated"}})])
+        try: outcome=await runner.case_deprecated_penalties("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+    async def test_fim_json_conflict_and_prefix_without_flag(self):
+        runner,client,_=await self._runner([(400,{"error":{"message":"FIM + JSON mode is not supported"}})])
+        try: outcome=await runner.case_fim_json_conflict("deepseek-v4-pro")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+
+        runner,client,seen=await self._runner([(200,self._chat("def add(a, b):\n    return a+b"))])
+        try: outcome=await runner.case_prefix_without_flag("deepseek-v4-pro")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+        self.assertNotIn("prefix",seen[0]["body"]["messages"][1])
+
+    async def test_anthropic_tool_loop(self):
+        first={"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup_order","input":{"order_id":"ORD-731"}}]}
+        second={"role":"assistant","content":[{"type":"text","text":"订单 ORD-731 已发货。"}]}
+        runner,client,seen=await self._runner([(200,first),(200,second)])
+        try: outcome=await runner.case_anthropic_tool_loop("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(seen[0]["body"]["tool_choice"],{"type":"any"})
+        self.assertEqual(seen[1]["body"]["messages"][2]["content"][0]["tool_use_id"],"toolu_1")
+
+        runner,client,_=await self._runner([(200,{"role":"assistant","content":[{"type":"text","text":"我直接回答"}]})])
+        try: outcome=await runner.case_anthropic_tool_loop("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+
+    async def test_responses_tool_matrix(self):
+        call={"id":"resp_1","output":[{"type":"function_call","name":"get_number","arguments":"{}"}]}
+        msg={"id":"resp_1","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}]}
+        bad=(400,{"error":{"message":"Unsupported custom tool: 'not_apply_patch'. Only 'apply_patch' is supported."}})
+        ignored=(200,{"id":"resp_2","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}]})
+        thinking_400=(400,{"error":{"message":"Thinking mode does not support this tool_choice","type":"invalid_request_error"}})
+
+        # 真实批次口径：默认思考模式下 required/指定工具均 4xx（文档承诺），
+        # 关思考（reasoning.effort=none）后 required 触发 function_call → passed
+        runner,client,seen=await self._runner([thinking_400,thinking_400,(200,call),bad,ignored])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[2]["triggered_by"],"required+effort=none")
+        self.assertEqual(seen[2]["body"]["reasoning"],{"effort":"none"})
+        self.assertEqual(seen[2]["body"]["tool_choice"],"required")
+        self.assertNotIn("reasoning",seen[0]["body"])            # 负向探针必须用默认（思考）模式
+        self.assertEqual(seen[1]["body"]["tool_choice"],{"type":"function","name":"get_number"})
+        self.assertNotIn("reasoning",seen[1]["body"])
+        self.assertEqual(len(outcome),3)     # 只返回三元组 → 判定为 passed，不附带 warning 状态
+
+        # 上游放宽：默认模式下 required 直接触发 → 能力具备，但记 warning（与文档不一致）
+        runner,client,_=await self._runner([(200,call),thinking_400,(200,call),bad,ignored])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+        # 默认模式下 required 被静默忽略（200 但没触发）→ warning（文档承诺的 4xx 未执行，不升级 failed）
+        runner,client,_=await self._runner([(200,msg),thinking_400,(200,call),bad,ignored])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+        self.assertIn("强制调用被静默忽略",outcome[1])
+
+        # 文档解法失效 → 兜底到「指定工具+关思考」→ warning
+        runner,client,seen=await self._runner([thinking_400,thinking_400,(200,msg),(200,call),bad,ignored])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+        self.assertEqual(outcome[2]["triggered_by"],"指定工具+effort=none")
+        self.assertEqual(seen[3]["body"]["reasoning"],{"effort":"none"})
+
+        # 强制形态全不可用 → auto + 两轮强提示兜底 → warning
+        runner,client,seen=await self._runner([thinking_400,thinking_400,(200,msg),(200,msg),(200,msg),(200,call),bad,ignored])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+        self.assertEqual(outcome[2]["triggered_by"],"auto+强提示")
+        self.assertNotEqual(seen[4]["body"]["input"],seen[5]["body"]["input"])
+
+        # 任何形态都触发不了 → failed
+        runner,client,_=await self._runner([thinking_400,thinking_400,(200,msg),(200,msg),(200,msg),(200,msg),bad,ignored])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("仍未被触发",outcome[1])
+
+        # custom 非 apply_patch 未被拒（文档承诺 400）→ failed
+        runner,client,_=await self._runner([thinking_400,thinking_400,(200,call),(200,{"id":"resp_3","output":[]}),ignored])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("custom 非 apply_patch 未被拒绝",outcome[1])
+
+        # 内置工具被执行（出现 web_search_call）→ failed
+        runner,client,_=await self._runner([thinking_400,thinking_400,(200,call),bad,(200,{"id":"resp_4","output":[{"type":"web_search_call"}]})])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertIn("web_search",outcome[1])
+
+        # 端点不存在 → blocked，不当作模型行为结论
+        runner,client,_=await self._runner([(404,{})])
+        try: outcome=await runner.case_responses_tool_matrix("deepseek-flash")
+        finally: await client.aclose()
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3],"blocked")
+
+    async def test_model_alias_reports_doc_drift(self):
+        runner,client,seen=await self._runner([(200,self._chat()),(200,self._chat())])
+        try: outcome=await runner.case_model_alias("deepseek-v4-flash-260813")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertTrue(outcome[2]["configured_model_off_doc"])
+        self.assertEqual(seen[1]["body"]["model"],RETIRED_ALIASES[0])
+        self.assertEqual(list(PRIMARY_MODELS),["deepseek-v4-pro","deepseek-flash"])
+
+        runner,client,_=await self._runner([(200,self._chat()),(404,{"error":{"message":"model not found"}})])
+        try: outcome=await runner.case_model_alias("deepseek-flash")
+        finally: await client.aclose()
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3],"warning")
+
+
+class ModelGateTests(unittest.TestCase):
+    """模型门禁：误配其他家族模型必须在发任何请求前被拦截（2026-09-24 gpt-5.6-sol 事故）。"""
+
+    def test_gate_accepts_deepseek_family_names(self):
+        for name in ("deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4", "DeepSeek-V4-Pro"):
+            ok, reason = model_matches_family("deepseek", name)
+            self.assertTrue(ok, f"{name} 应被放行：{reason}")
+
+    def test_gate_rejects_other_family_models(self):
+        for name in ("gpt-5.6-sol", "glm-5.3", "kimi-k3"):
+            ok, reason = model_matches_family("deepseek", name)
+            self.assertFalse(ok, f"{name!r} 不应被放行")
+            self.assertIn("deepseek", reason)
+        for name in ("", "  "):
+            ok, reason = model_matches_family("deepseek", name)
+            self.assertFalse(ok, f"{name!r} 不应被放行")
+            self.assertTrue(reason)
+
+    def test_runner_aborts_with_exit_3_and_no_result_dir(self):
+        import asyncio
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from dsv4.runner import main_async
+
+        keys = ("DS_API_KEY", "DS_BASE_URL", "DS_MODEL", "VOLC_PROTOCOL")
+        saved = {k: os.environ.get(k) for k in keys}
+        root = Path(tempfile.mkdtemp())
+        os.environ.update({"DS_API_KEY": "k", "DS_BASE_URL": "https://api.deepseek.com/v1",
+                           "DS_MODEL": "gpt-5.6-sol", "VOLC_PROTOCOL": "openai"})
+        try:
+            rc = asyncio.run(main_async(["DS_V4_P0", "--output-root", str(root)]))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertEqual(rc, 3)
+        self.assertEqual(list(root.iterdir()), [], "门禁拦截后不应产生任何结果目录")

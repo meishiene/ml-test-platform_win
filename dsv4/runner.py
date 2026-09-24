@@ -7,6 +7,7 @@ import os
 import time
 from pathlib import Path
 from common.suite_runtime import finalize
+from common.model_contracts import model_matches_family
 from volcperf.protocols import api_root
 
 from .cases import CASES
@@ -38,6 +39,12 @@ async def main_async(argv: list[str] | None = None) -> int:
     model = os.getenv("DS_MODEL") or os.getenv("VOLC_MODEL")
     if not model:
         raise ValueError("缺少 DS_MODEL（Web 启动时由界面配置自动注入）")
+    # 模型门禁：误配其他家族的模型（如 gpt-*）会让正向用例被上游 400 拒绝，
+    # 而负向用例的 4xx 断言恰被该 400 满足产生假通过。发请求前直接拦截。
+    allowed, gate_reason = model_matches_family("deepseek", model)
+    if not allowed:
+        print(json.dumps({"error": "model_gate_rejected", "message": gate_reason, "model": model, "case": args.case}, ensure_ascii=False))
+        return 3
     meta = CASES[args.case]
     # 目录必须先于请求创建：runner 会把每个请求的证据实时写入该目录下的 requests.jsonl。
     out = args.output_root / f"{args.case}-{time.strftime('%Y%m%d-%H%M%S')}"

@@ -5,7 +5,7 @@ import argparse, asyncio, json, os, sys, time
 from pathlib import Path
 import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from common.model_contracts import PROFILES, load_profile_data, validate_identity, validate_usage, text, message
+from common.model_contracts import PROFILES, load_profile_data, model_matches_family, validate_identity, validate_usage, text, message
 from common.suite_runtime import finalize
 from common.report_style import case_table_report
 from common.test_framework import HttpExecutor
@@ -18,6 +18,8 @@ async def main():
     a=ap.parse_args(); env={"kvv":("VOLC_BASE_URL","VOLC_API_KEY","VOLC_MODEL"),"deepseek":("DS_BASE_URL","DS_API_KEY","DS_MODEL"),"glm":("GLM_BASE_URL","GLM_API_KEY","GLM_MODEL")}[a.family]
     base=a.base_url or os.getenv(env[0]); key=a.api_key or os.getenv(env[1]); model=a.model or os.getenv(env[2])
     if not base or not key or not model: raise SystemExit(f"缺少 {env[0]}/{env[1]}/{env[2]}")
+    _gok,_greason=model_matches_family(a.family,model)
+    if not _gok: raise SystemExit(_greason)  # 模型门禁：防误配模型产生假通过
     base=api_root(os.getenv("VOLC_PROTOCOL","volcengine"),base)
     profile=PROFILES[a.family]; data=load_profile_data(a.family); results=[]
     out=a.output_root/f"{os.getenv('CONTRACT_CASE') or f'CONTRACT-{a.family.upper()}'}-{time.strftime('%Y%m%d-%H%M%S')}"; out.mkdir(parents=True,exist_ok=True)
