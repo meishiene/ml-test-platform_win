@@ -7,6 +7,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.model_contracts import PROFILES, load_profile_data, validate_identity, validate_usage, text, message
 from common.suite_runtime import finalize
+from common.report_style import case_table_report
 from common.test_framework import HttpExecutor
 from common.audit import AuditLog
 from volcperf.protocols import api_root
@@ -42,17 +43,30 @@ async def main():
           return record.http_status or 0, record.response_body if isinstance(record.response_body,dict) else None, {}
         return record.http_status or 0, None, {"content":record.content,"reasoning_content":record.reasoning,"done":record.done_received,"invalid_events":record.invalid_sse_events,"finish_reasons":record.finish_reasons,"raw_sse_lines":record.raw_sse_lines,"raw_sse_events":record.raw_sse_events}
       def payload(messages, **kw): return {"model":model,"messages":messages,"max_tokens":2048,**kw}
-      st,b,o=await req(payload([{"role":"user","content":f"只回复 {marker}"}],**(thinking_off or {}))); ok,obs=validate_identity(st,b,expected_tokens); results.append({"id":"CONTRACT-01","name":"身份与路由","status":"passed" if ok else "failed","passed":ok,"details":f"HTTP {st}","observations":obs})
-      st,b,o=await req(payload([{"role":"user","content":"只回复 OK"}],**(thinking_off or {}),temperature=2.1)); ok=400<=st<500; results.append({"id":"CONTRACT-02","name":"参数错误契约","status":"passed" if ok else "failed","passed":ok,"details":f"非法 temperature HTTP {st}","observations":{}})
-      st,b,o=await req(payload([{"role":"user","content":"计算 37*83，并简要说明。"}],**(thinking_on or {}),stream=True),True); ok=st==200 and o.get('done') and o.get('invalid_events')==0 and bool(o.get('content')); results.append({"id":"CONTRACT-03","name":"流式协议完整性","status":"passed" if ok else "failed","passed":ok,"details":f"HTTP {st}，DONE={o.get('done')}","observations":o})
+      t0=time.time()
+      st,b,o=await req(payload([{"role":"user","content":f"只回复 {marker}"}],**(thinking_off or {}))); ok,obs=validate_identity(st,b,expected_tokens); results.append({"id":"CONTRACT-01","name":"身份与路由","status":"passed" if ok else "failed","passed":ok,"duration_seconds":time.time()-t0,"details":f"HTTP {st}","observations":obs})
+      t0=time.time()
+      st,b,o=await req(payload([{"role":"user","content":"只回复 OK"}],**(thinking_off or {}),temperature=2.1)); ok=400<=st<500; results.append({"id":"CONTRACT-02","name":"参数错误契约","status":"passed" if ok else "failed","passed":ok,"duration_seconds":time.time()-t0,"details":f"非法 temperature HTTP {st}","observations":{}})
+      t0=time.time()
+      st,b,o=await req(payload([{"role":"user","content":"计算 37*83，并简要说明。"}],**(thinking_on or {}),stream=True),True); ok=st==200 and o.get('done') and o.get('invalid_events')==0 and bool(o.get('content')); results.append({"id":"CONTRACT-03","name":"流式协议完整性","status":"passed" if ok else "failed","passed":ok,"duration_seconds":time.time()-t0,"details":f"HTTP {st}，DONE={o.get('done')}","observations":o})
+      t0=time.time()
       tool={"type":"function","function":{"name":tool_name,"description":"查询订单","parameters":{"type":"object","properties":{"order_id":{"type":"string"}},"required":["order_id"],"additionalProperties":False}}}
-      st,b,o=await req(payload([{"role":"user","content":"查询订单 ORD-000731，必须调用工具。"}],tools=[tool],tool_choice="required",**(thinking_off or {}))); calls=message(b).get('tool_calls') or []; ok=st==200 and bool(calls) and calls[0].get('function',{}).get('name')==tool_name; results.append({"id":"CONTRACT-04","name":"工具调用多轮闭环","status":"passed" if ok else "failed","passed":ok,"details":f"HTTP {st}，tool_calls={len(calls)}","observations":{"tool_calls":calls[:1]}})
+      st,b,o=await req(payload([{"role":"user","content":"查询订单 ORD-000731，必须调用工具。"}],tools=[tool],tool_choice="required",**(thinking_off or {}))); calls=message(b).get('tool_calls') or []; ok=st==200 and bool(calls) and calls[0].get('function',{}).get('name')==tool_name; results.append({"id":"CONTRACT-04","name":"工具调用多轮闭环","status":"passed" if ok else "failed","passed":ok,"duration_seconds":time.time()-t0,"details":f"HTTP {st}，tool_calls={len(calls)}","observations":{"tool_calls":calls[:1]}})
       if a.family in {"deepseek", "kvv", "glm"}:
+        t0=time.time()
         efforts=data.get("reasoning_efforts", ["low", "medium", "high"]); statuses={}; chars={}
         for effort in efforts:
           stx,bx,ox=await req(payload([{"role":"user","content":"请多步推理，计算 918273*817263，并给出结果。"}],thinking={"type":"enabled"},reasoning_effort=effort,max_tokens=2048)); raw=message(bx).get('reasoning_content') or message(bx).get('reasoning') or ''; statuses[effort]=stx; chars[effort]=len(raw)
-        ok=all(v==200 for v in statuses.values()) and all(v>0 for v in chars.values()); results.append({"id":"CONTRACT-05","name":"Thinking 与 reasoning_effort","status":"passed" if ok else "failed","passed":ok,"details":f"档位={efforts}，HTTP={statuses}，reasoning 字符={chars}","observations":{"statuses":statuses,"reasoning_chars":chars}})
+        ok=all(v==200 for v in statuses.values()) and all(v>0 for v in chars.values()); results.append({"id":"CONTRACT-05","name":"Thinking 与 reasoning_effort","status":"passed" if ok else "failed","passed":ok,"duration_seconds":time.time()-t0,"details":f"档位={efforts}，HTTP={statuses}，reasoning 字符={chars}","observations":{"statuses":statuses,"reasoning_chars":chars}})
 
     audit_log.close()
-    summary={"family":a.family,"model":model,"total":len(results),"passed":sum(x['status']=='passed' for x in results),"failed":sum(x['status']=='failed' for x in results),"warning":sum(x['status']=='warning' for x in results),"admission_passed":not any(x['status']=='failed' for x in results),"results":results};(out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n');finalize(out);print(json.dumps(summary,ensure_ascii=False,indent=2));print(f"结果：{out.resolve()}");return 0 if not summary['failed'] else 2
+    summary={"family":a.family,"model":model,"total":len(results),"passed":sum(x['status']=='passed' for x in results),"failed":sum(x['status']=='failed' for x in results),"warning":sum(x['status']=='warning' for x in results),"admission_passed":not any(x['status']=='failed' for x in results),"results":results}
+    (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
+    case_title=os.getenv('CONTRACT_CASE') or f"CONTRACT-{a.family.upper()}"
+    rows=[[f"{x['id']} {x['name']}",model,x['status'],f"{x.get('duration_seconds',0):.2f}",x['details']] for x in results]
+    (out/'report.md').write_text(case_table_report("公共契约探针测试报告",
+        total=summary['total'],passed=summary['passed'],failed=summary['failed'],warning=summary['warning'],blocked=0,
+        extra_stats=[f"模型：`{model}`；Family：`{a.family}`"],
+        rows=rows,status_column=2),encoding='utf-8')
+    finalize(out);print(json.dumps(summary,ensure_ascii=False,indent=2));print(f"结果：{out.resolve()}");return 0 if not summary['failed'] else 2
 if __name__=='__main__': raise SystemExit(asyncio.run(main()))

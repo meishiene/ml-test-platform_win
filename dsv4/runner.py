@@ -39,7 +39,9 @@ async def main_async(argv: list[str] | None = None) -> int:
     if not model:
         raise ValueError("缺少 DS_MODEL（Web 启动时由界面配置自动注入）")
     meta = CASES[args.case]
-    async with DeepSeekV4Runner(config) as runner:
+    # 目录必须先于请求创建：runner 会把每个请求的证据实时写入该目录下的 requests.jsonl。
+    out = args.output_root / f"{args.case}-{time.strftime('%Y%m%d-%H%M%S')}"
+    async with DeepSeekV4Runner(config, audit_dir=out) as runner:
         results = await runner.run((model,), meta.priorities)
     summary = summarize_results(results)
     summary.update({
@@ -50,7 +52,6 @@ async def main_async(argv: list[str] | None = None) -> int:
         "endpoint": config.base_url,
         "admission_passed": summary["all_passed"],
     })
-    out = args.output_root / f"{args.case}-{time.strftime('%Y%m%d-%H%M%S')}"
     write_report(out, summary)
     # write_report 已写入结果；补写 Web 聚合需要的扩展字段。
     (out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

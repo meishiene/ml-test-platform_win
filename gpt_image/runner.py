@@ -16,6 +16,7 @@ import httpx
 
 from common.audit import redact
 from common.finalizer import finalize_result_dir
+from common.report_style import stats_lines
 
 from .cases import LOAD_CASES, Case
 from volcperf.protocols import api_root
@@ -421,16 +422,15 @@ def _write_report(out: Path, summary: dict[str, Any]) -> None:
     lines = [
         f"# {summary['case']} 图片压测报告",
         "",
-        f"- 生成时间（UTC）：{datetime.now(timezone.utc).isoformat()}",
-        f"- 总请求数：{summary['requested']}",
-        f"- 完成：{summary['completed']}；成功：{summary['successful']}；失败：{summary['failed']}；成功率：{summary['success_rate']:.2%}",
-        f"- 请求总超时：{summary['request_timeout_seconds']} 秒",
-        f"- 错误分布：{json.dumps(summary['error_distribution'], ensure_ascii=False)}",
-        f"- 并发数：{summary['concurrency']}",
-        f"- 实际模型分布：{json.dumps(summary['model_distribution'], ensure_ascii=False)}",
-        f"- 尺寸分布：{json.dumps(summary['size_distribution'], ensure_ascii=False)}",
-        f"- 质量分布：{json.dumps(summary['quality_distribution'], ensure_ascii=False)}",
-        "- 执行方式：先生成完整 `generated_requests.jsonl`，再按预生成顺序以配置并发执行。",
+        *stats_lines(summary['requested'], summary['successful'], summary['failed'], 0,
+                     summary['requested'] - summary['completed'], summary['success_rate'],
+                     [f"请求总超时：{summary['request_timeout_seconds']} 秒",
+                      f"错误分布：{json.dumps(summary['error_distribution'], ensure_ascii=False)}",
+                      f"并发数：{summary['concurrency']}",
+                      f"实际模型分布：{json.dumps(summary['model_distribution'], ensure_ascii=False)}",
+                      f"尺寸分布：{json.dumps(summary['size_distribution'], ensure_ascii=False)}",
+                      f"质量分布：{json.dumps(summary['quality_distribution'], ensure_ascii=False)}",
+                      "执行方式：先生成完整 `generated_requests.jsonl`，再按预生成顺序以配置并发执行。"]),
         "",
         "## 延迟指标",
         "",

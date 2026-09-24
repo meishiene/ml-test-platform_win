@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, json, os, shutil, subprocess, time
 from pathlib import Path
 from common.suite_runtime import finalize
+from common.report_style import stats_lines
 from volcperf.protocols import api_root
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -39,7 +40,10 @@ def main()->int:
  passed=sum(1 for x in rows if float(x.get('reward',x.get('pass_rate',0)) or 0)>=1); total=len(rows)
  summary={'schema_version':'deepswe.result.v1','record_id':os.getenv('VOLC_RECORD_ID'),'test_kind':'deepswe','case':'DEEPSWE','dataset':'datacurve-ai/deep-swe/tasks','runner':'Pier','agent':os.getenv('DEEPSWE_AGENT','mini-swe-agent'),'model':full_model,'requested_tasks':args.n_tasks or 'all','scored_tasks':total,'passed_tasks':passed,'pass_rate':passed/total if total else None,'exit_code':proc.returncode,'admission_passed':proc.returncode==0 and total>0,'status':'completed' if proc.returncode==0 else 'failed'}
  (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
- (out/'report.md').write_text(f"# DeepSWE 测试报告\n\n- 数据集：DataCurve 官方开源 `deep-swe/tasks`\n- 运行器：Pier + {summary['agent']}\n- 模型：`{full_model}`\n- 评分任务：{total}\n- 通过任务：{passed}\n- Pass Rate：{summary['pass_rate'] if summary['pass_rate'] is not None else '—'}\n- 说明：任务、环境和 verifier 均来自官方开源项目，本系统不重新实现测试集。\n",encoding='utf8')
+ report=['# DeepSWE 测试报告','',*stats_lines(total,passed,total-passed,0,0,summary['pass_rate'],
+    ["数据集：DataCurve 官方开源 `deep-swe/tasks`",f"运行器：Pier + {summary['agent']}",f"模型：`{full_model}`",
+     '说明：任务、环境和 verifier 均来自官方开源项目，本系统不重新实现测试集。'])]
+ (out/'report.md').write_text('\n'.join(report)+'\n',encoding='utf8')
  finalize(out)
  print(json.dumps(summary,ensure_ascii=False,indent=2)); return proc.returncode
 if __name__=='__main__': raise SystemExit(main())

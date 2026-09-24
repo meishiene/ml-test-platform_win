@@ -60,7 +60,10 @@ DB_PATH = ROOT / "web" / "data" / "runs.db"
 RESULTS = ROOT / "results"
 RUN_SCRIPT = ROOT / "scripts" / "run_test.py"
 KVV_SCRIPT = ROOT / "scripts" / "run_kvv.py"
-DEEPSEEK_SCRIPT = ROOT / "scripts" / "run_deepseek_v4.py"
+# DS_V4_P0/P1/P2 的权威实现是 dsv4 包（dsv4/cases.py 元数据 + dsv4/core.py 用例 + dsv4/runner.py 装配），
+# 入口脚本 scripts/run_dsv4.py 接受位置参数（用例名）并转发到 dsv4.runner。
+# 注意：init 时代的旧副本 k3perf/deepseek_v4.py 与 scripts/run_deepseek_v4.py 已删除，不要再引入。
+DEEPSEEK_SCRIPT = ROOT / "scripts" / "run_dsv4.py"
 GLM_SCRIPT = ROOT / "scripts" / "run_glm53.py"
 CONTRACT_SCRIPT = ROOT / "scripts" / "run_contracts.py"
 AUTH_SCRIPT = ROOT / "scripts" / "run_authenticity.py"
@@ -250,7 +253,7 @@ def awsb_case_payload(spec: Any) -> dict[str, Any]:
 
 def capability_case_payload(name: str, kind: str, case: Any, meta: tuple[str, str, str, str]) -> dict[str, Any]:
     source = "官方 KVV 工具" if kind == "kvv" else "专项自研代码"
-    executor = "scripts/run_kvv.py（官方 pytest）" if kind == "kvv" else ("scripts/run_deepseek_v4.py" if kind == "deepseek" else "scripts/run_glm53.py")
+    executor = "scripts/run_kvv.py（官方 pytest）" if kind == "kvv" else ("scripts/run_dsv4.py" if kind == "deepseek" else "scripts/run_glm53.py")
     return {"id":name,"test_kind":kind,"title":meta[0],"description":meta[1],"source":source,"executor":executor,"title_badge":source,"duration":meta[2],"cost":meta[3],
             "concurrency":case.concurrency,"concurrency_text":str(case.concurrency),"requests":case.request_count,"request_text":str(case.request_count),
             "input_tokens":"按官方/专项用例动态输入","warmup":None,"steady":None,

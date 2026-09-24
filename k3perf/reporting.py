@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from common.report_style import stats_lines
 
 REQUEST_COLUMNS = [
     "case", "phase", "counted", "request_id", "dataset_id", "planned_epoch", "started_epoch",
@@ -62,14 +63,16 @@ def write_artifacts(out: Path, rows: list[dict[str, Any]], summary: dict[str, An
             return f"{value:.6f}"
         return str(value)
 
+    sent = int(summary.get("sent") or 0)
+    successful = int(summary.get("successful") or 0)
+    success_rate = summary.get("success_rate")
+    if success_rate is None and sent:
+        success_rate = successful / sent
     lines = [
         f"# {summary.get('case')} 测试结果",
         "",
-        f"- 生成时间（UTC）：{datetime.now(timezone.utc).isoformat()}",
-        f"- 准入结论：{'通过' if summary.get('admission_passed') else '未通过/数据不足'}",
-        f"- 正式发送数：{summary.get('sent')}",
-        f"- 成功数：{summary.get('successful')}",
-        f"- 成功率：{fmt(summary.get('success_rate'))}",
+        *stats_lines(sent, successful, sent - successful, 0, 0, success_rate,
+                     [f"准入结论：{'通过' if summary.get('admission_passed') else '未通过/数据不足'}"]),
         "",
         "## 核心统计",
         "",

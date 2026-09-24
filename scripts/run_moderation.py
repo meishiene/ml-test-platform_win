@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 from volcperf.protocols import endpoint, headers, payload
 from common.suite_runtime import finalize
+from common.report_style import stats_lines
 
 ROOT=Path(__file__).resolve().parent.parent
 PROJECT=ROOT/'moderation_test_project'
@@ -89,7 +90,10 @@ def main():
   return round(vals[min(len(vals)-1,int((len(vals)-1)*p))],2)
  ok=sum(x['status']=='ok' for x in results); passed=sum(x.get('case_passed',False) for x in results); summary={'schema_version':'moderation.result.v1','record_id':os.getenv('VOLC_RECORD_ID'),'test_kind':'moderation','case':a.case,'model':model,'endpoint':base,'total_cases':len(results),'stream_cases':sum(x.get('mode')=='stream' for x in results),'non_stream_cases':0,'successful_requests':ok,'failed_requests':len(results)-ok,'passed_cases':passed,'failed_cases':len(results)-passed,'concurrency':concurrency,'retry_policy':'最多重试3次，指数退避1/2/4秒（含随机抖动）','max_tokens':2048,'ttft_definition':'本次实际尝试发出后，首个包含 content/reasoning_content token 的 SSE delta 到达时间；非流式为 null','ttft_samples':len(ttfts),'ttft_p50_ms':percentile(ttfts,.5),'ttft_p90_ms':percentile(ttfts,.9),'admission_passed':ok==len(results) and passed==len(results),'status':'completed'}
  (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
- (out/'report.md').write_text(f'# 内容审核测试报告\n\n- 测试集：`{a.case}`\n- 总用例：{len(results)}\n- 成功请求：{ok}\n- 失败请求：{len(results)-ok}\n- 语义校验通过：{passed}\n- 语义校验失败：{len(results)-passed}\n- 说明：模型输出需要结合人工期望或规则引擎进一步评估，不以 HTTP 成功代替审核结论。\n',encoding='utf8')
+ report=['# 内容审核测试报告','',*stats_lines(len(results),passed,len(results)-passed,0,len(results)-ok,None,
+        [f'测试集：`{a.case}`',f'成功请求：{ok}；失败请求：{len(results)-ok}',
+         '说明：模型输出需要结合人工期望或规则引擎进一步评估，不以 HTTP 成功代替审核结论。'])]
+ (out/'report.md').write_text('\n'.join(report)+'\n',encoding='utf8')
  finalize(out)
  print(json.dumps(summary,ensure_ascii=False,indent=2)); return 0 if summary['admission_passed'] else 2
 if __name__=='__main__': raise SystemExit(main())

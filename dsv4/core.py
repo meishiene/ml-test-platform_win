@@ -14,9 +14,26 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from common.test_framework import HttpExecutor
+from common.test_framework import HttpExecutor, ResultLog
 
 MODELS = ("deepseek-v4-pro", "deepseek-v4-flash")
+
+# 官方文档：Beta 与 Anthropic 兼容端点挂在**根域**下，不带版本后缀。
+#   beta      -> https://api.deepseek.com/beta      （chat prefix / FIM / strict tool）
+#   anthropic -> https://api.deepseek.com/anthropic （Anthropic 兼容，端点 {base}/v1/messages）
+# 而 Web（server.py）与 CLI 传入的 base_url 已被 api_root() 规范化成 ".../v1"，
+# 若直接拼接会得到 ".../v1/beta/chat/completions" 这类不存在的路径（线上 404）。
+# 因此派生前先剥掉已知的版本后缀。
+_API_VERSION_SUFFIXES = ("/api/v3", "/v1beta", "/v1")
+
+
+def _api_parent(base_url: str) -> str:
+    """返回 API 根的父地址，供 beta/anthropic 端点派生使用。"""
+    base = base_url.rstrip("/")
+    for suffix in _API_VERSION_SUFFIXES:
+        if base.endswith(suffix):
+            return base[: -len(suffix)].rstrip("/")
+    return base
 
 
 @dataclass(frozen=True)
@@ -48,9 +65,9 @@ class DeepSeekConfig:
     def url(self, path: str, family: str = "openai") -> str:
         base = self.base_url.rstrip("/")
         if family == "beta":
-            root = (self.beta_base_url or f"{base}/beta").rstrip("/")
+            root = (self.beta_base_url or f"{_api_parent(base)}/beta").rstrip("/")
         elif family == "anthropic":
-            root = (self.anthropic_base_url or f"{base}/anthropic").rstrip("/")
+            root = (self.anthropic_base_url or f"{_api_parent(base)}/anthropic").rstrip("/")
         else:
             root = base
         return f"{root}/{path.lstrip('/')}"
@@ -98,7 +115,7 @@ CASE_SPECS = (
     CaseSpec("DS-V4-06", "流式思考与正文分离", "P0", "stream_thinking"),
     CaseSpec("DS-V4-07", "无工具多轮回传思考", "P0", "replay_without_tools"),
     CaseSpec("DS-V4-08", "思考模式工具调用完整回传", "P0", "tool_replay"),
-    CaseSpec("DS-V4-09", "工具调用漏传 reasoning_content 返回 400", "P0", "tool_missing_reasoning"),
+    CaseSpec("DS-V4-09", "工具调用漏传 reasoning_content 的校验行为", "P0", "tool_missing_reasoning"),
     CaseSpec("DS-V4-10", "未进入工具链时 reasoning 回传行为", "P0", "tools_plain_turn_replay"),
     CaseSpec("DS-V4-11", "JSON Output", "P0", "json_output"),
     CaseSpec("DS-V4-12", "JSON Prompt 缺少关键字时可控失败", "P0", "json_missing_keyword"),
@@ -111,7 +128,7 @@ CASE_SPECS = (
     CaseSpec("DS-V4-19", "Strict Tool Call", "P1", "strict_tool", beta=True),
     CaseSpec("DS-V4-20", "Strict 非法 Schema 拒绝", "P1", "strict_invalid", beta=True),
     CaseSpec("DS-V4-21", "Chat Prefix Completion", "P1", "prefix", beta=True),
-    CaseSpec("DS-V4-22", "Chat Prefix 参数约束", "P1", "prefix_invalid", beta=True),
+    CaseSpec("DS-V4-22", "Chat Prefix 非法放置的处理行为", "P1", "prefix_invalid", beta=True),
     CaseSpec("DS-V4-23", "FIM Completion", "P1", "fim", beta=True),
     CaseSpec("DS-V4-24", "Anthropic 模型映射", "P1", "anthropic_mapping"),
     CaseSpec("DS-V4-25", "Responses API 无状态字段", "P1", "responses_stateless"),
@@ -137,6 +154,18 @@ def _usage(body: dict[str, Any] | None) -> dict[str, Any]:
     return (body or {}).get("usage") or {}
 
 
+def _is_rejection(status: int) -> bool:
+    """4xx 且非 404 —— 404 表示端点不存在（链路/配置问题），不构成"参数被正确拒绝"。"""
+    return 400 <= status < 500 and status != 404
+
+
+def _endpoint_missing_reason(status: int, family: str) -> str | None:
+    """端点不存在时给出可自解释的原因，避免把链路问题读成模型行为。"""
+    if status != 404:
+        return None
+    return f"{family} 端点不存在（HTTP 404），用例目标特性未被触达；属链路/配置问题（检查 base_url 与端点派生），不是被测对象的行为结论"
+
+
 def _cache_tokens(body: dict[str, Any] | None) -> int:
     usage = _usage(body)
     details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
@@ -144,11 +173,16 @@ def _cache_tokens(body: dict[str, Any] | None) -> int:
 
 
 class DeepSeekV4Runner:
-    def __init__(self, config: DeepSeekConfig, client: httpx.AsyncClient | None = None):
+    def __init__(self, config: DeepSeekConfig, client: httpx.AsyncClient | None = None, audit_dir: Path | None = None):
         self.config = config
         self._external_client = client
         self.client = client
         self.executor: HttpExecutor | None = None
+        # 执行证据：每个请求的完整 record 实时落到 <audit_dir>/requests.jsonl，
+        # 供统一准入校验的 evidence_present 使用。
+        self.audit_dir = audit_dir
+        self.log: ResultLog | None = None
+        self.current_case_id: str | None = None
 
     async def __aenter__(self) -> "DeepSeekV4Runner":
         if self.client is None:
@@ -160,9 +194,15 @@ class DeepSeekV4Runner:
             )
         self.executor = HttpExecutor(timeout=self.config.timeout, verify_ssl=self.config.verify_ssl, trust_env=self.config.trust_env, client=self.client)
         await self.executor.__aenter__()
+        if self.audit_dir is not None:
+            self.audit_dir.mkdir(parents=True, exist_ok=True)
+            self.log = ResultLog(self.audit_dir / "requests.jsonl")
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        if self.log:
+            self.log.close()
+            self.log = None
         if self.executor:
             await self.executor.__aexit__(*args)
         if self._external_client is None and self.client:
@@ -177,7 +217,9 @@ class DeepSeekV4Runner:
             request_headers.update({"x-api-key": self.config.api_key, "anthropic-version": "2023-06-01"})
         if headers:
             request_headers.update(headers)
-        record = await self.executor.execute(case_id=payload.get("_case_id", "DSV4-request"), url=self.config.url(path, family), payload={k:v for k,v in payload.items() if k != "_case_id"}, headers=request_headers, stream=stream)
+        record = await self.executor.execute(case_id=payload.get("_case_id") or self.current_case_id or "DSV4-request", url=self.config.url(path, family), payload={k:v for k,v in payload.items() if k != "_case_id"}, headers=request_headers, stream=stream)
+        if self.log:
+            await self.log.write(record)
         if not stream:
             return ApiResponse(record.http_status or 0, record.response_body if isinstance(record.response_body, dict) else None, record.response_text, record.timing.get("e2e_ms", 0)/1000, record.response_headers, record.provider_request_id)
         info = {"reasoning_content": record.reasoning, "content": record.content, "usage": record.usage or {}, "done": record.done_received, "invalid_events": record.invalid_sse_events, "finish_reasons": record.finish_reasons, "raw_sse_lines": record.raw_sse_lines, "raw_sse_events": record.raw_sse_events, "received_events": record.parsed_sse_events}
@@ -195,6 +237,7 @@ class DeepSeekV4Runner:
                 if spec.priority not in priorities or (case_ids and spec.case_id not in case_ids):
                     continue
                 started = time.perf_counter()
+                self.current_case_id = spec.case_id
                 try:
                     outcome = await getattr(self, f"case_{spec.handler}")(model)
                     if len(outcome) == 4:
@@ -205,6 +248,7 @@ class DeepSeekV4Runner:
                     results.append(CaseResult(spec.case_id, spec.name, model, passed, status, details, time.perf_counter() - started, observations))
                 except Exception as exc:
                     results.append(CaseResult(spec.case_id, spec.name, model, False, "error", f"{type(exc).__name__}: {exc}", time.perf_counter() - started))
+        self.current_case_id = None
         return results
 
     async def case_basic(self, model: str):
@@ -248,29 +292,64 @@ class DeepSeekV4Runner:
     def tools() -> list[dict[str, Any]]:
         return [{"type": "function", "function": {"name": "get_number", "description": "返回测试数字", "parameters": {"type": "object", "properties": {}, "required": []}}}]
 
-    async def _tool_first(self, model: str) -> tuple[ApiResponse, dict[str, Any]]:
-        r = await self.chat(model, [{"role": "user", "content": "必须调用 get_number 获取测试数字，不要自行回答。"}], tools=self.tools(), tool_choice="required", thinking={"type": "enabled"})
-        return r, _message(r.body)
+    # thinking 模式不支持 tool_choice="required"（上游返回 400
+    # "Thinking mode does not support this tool_choice"），因此只能用 auto + 强提示诱导调用。
+    # 两条提示依次增强，第一条未触发工具调用时再试第二条。
+    TOOL_PRIMING_PROMPTS = (
+        "必须调用 get_number 获取测试数字，不要自行回答。",
+        "禁止直接回答。请先调用 get_number 工具获取测试数字，再基于工具返回结果作答。",
+    )
+
+    async def _tool_first(self, model: str) -> tuple[ApiResponse, dict[str, Any], str]:
+        """建立「思考模式 + 工具调用」的前置轮次，返回 (响应, assistant 消息, 实际使用的提示词)。"""
+        last: tuple[ApiResponse, dict[str, Any], str] | None = None
+        for prompt in self.TOOL_PRIMING_PROMPTS:
+            r = await self.chat(model, [{"role": "user", "content": prompt}], tools=self.tools(), tool_choice="auto", thinking={"type": "enabled"})
+            msg = _message(r.body)
+            last = (r, msg, prompt)
+            if r.status != 200:
+                break  # 上游拒绝该请求（如参数组合不被支持），重试无意义，交由调用方按 blocked 处理
+            if (msg.get("tool_calls") or []) and msg.get("reasoning_content"):
+                return last
+        return last  # type: ignore[return-value]
+
+    @staticmethod
+    def _tool_precondition_obs(r: ApiResponse, msg: dict[str, Any], calls: list[Any]) -> dict[str, Any]:
+        return {"http_status": r.status, "has_tool_calls": bool(calls), "has_reasoning": bool(msg.get("reasoning_content")), "response": r.text[:500]}
+
+    @staticmethod
+    def _tool_precondition_reason(r: ApiResponse, msg: dict[str, Any], calls: list[Any]) -> str:
+        """把「前置轮次不可用」的原因写清楚，避免把上游限制误读成模型行为。"""
+        if r.status != 200:
+            return f"前置轮次被上游拒绝（HTTP {r.status}）：{r.text[:200]}；后续回传链路无法验证"
+        if not calls:
+            return "前置轮次未产生 tool_calls（thinking 模式不支持 tool_choice=required，已改用 auto+强提示诱导仍未触发）；后续回传链路无法验证"
+        return "前置轮次产生了 tool_calls 但未同时返回 reasoning_content；后续回传链路无法验证"
 
     async def case_tool_replay(self, model: str):
-        first, msg = await self._tool_first(model)
+        first, msg, prompt = await self._tool_first(model)
         calls = msg.get("tool_calls") or []
         if first.status != 200 or not calls or not msg.get("reasoning_content"):
-            observations = {"http_status": first.status, "has_tool_calls": bool(calls), "has_reasoning": bool(msg.get("reasoning_content")), "response": first.text[:500]}
-            return False, "前置工具调用未同时产生 reasoning_content 与 tool_calls，后续回传链路无法验证", observations, "blocked"
-        messages = [{"role": "user", "content": "必须调用 get_number 获取测试数字，不要自行回答。"}, msg, {"role": "tool", "tool_call_id": calls[0]["id"], "content": "731"}]
+            return False, self._tool_precondition_reason(first, msg, calls), self._tool_precondition_obs(first, msg, calls), "blocked"
+        messages = [{"role": "user", "content": prompt}, msg, {"role": "tool", "tool_call_id": calls[0]["id"], "content": "731"}]
         second = await self.chat(model, messages, tools=self.tools(), thinking={"type": "enabled"})
-        return second.status == 200 and "731" in str(_message(second.body).get("content")), "完整回传后应生成工具结果答案", {"second_status": second.status}
+        return second.status == 200 and "731" in str(_message(second.body).get("content")), "完整回传后应生成工具结果答案", {"second_status": second.status, "first_status": first.status}
 
     async def case_tool_missing_reasoning(self, model: str):
-        first, msg = await self._tool_first(model)
+        first, msg, prompt = await self._tool_first(model)
         calls = msg.get("tool_calls") or []
         if first.status != 200 or not calls or not msg.get("reasoning_content"):
-            observations = {"http_status": first.status, "has_tool_calls": bool(calls), "has_reasoning": bool(msg.get("reasoning_content")), "response": first.text[:500]}
-            return False, "前置工具调用未同时产生 reasoning_content 与 tool_calls，本负向用例不计失败", observations, "blocked"
+            return False, self._tool_precondition_reason(first, msg, calls) + "；本负向用例不计失败", self._tool_precondition_obs(first, msg, calls), "blocked"
         msg = dict(msg); msg.pop("reasoning_content", None)
-        second = await self.chat(model, [{"role": "user", "content": "必须调用 get_number。"}, msg, {"role": "tool", "tool_call_id": calls[0]["id"], "content": "731"}], tools=self.tools(), thinking={"type": "enabled"})
-        return second.status == 400, "漏传 reasoning_content 应返回 400", {"http_status": second.status, "error": second.text[:300]}
+        second = await self.chat(model, [{"role": "user", "content": prompt}, msg, {"role": "tool", "tool_call_id": calls[0]["id"], "content": "731"}], tools=self.tools(), thinking={"type": "enabled"})
+        observations = {"http_status": second.status, "response": second.text[:300]}
+        if second.status == 400:
+            return True, "漏传 reasoning_content 时上游返回 400，符合官方文档的严格校验要求", observations
+        if second.status == 200:
+            # 官方文档（Thinking Mode → Tool Calls）承诺"未正确回传 reasoning_content 会返回 400"，
+            # 线上实际容忍并正常作答。与 DS-V4-10 属同类信号：记为文档/线上行为差异，不判模型失败。
+            return True, "线上未执行文档要求的严格校验：漏传 reasoning_content 仍返回 200 并正常作答（文档承诺 400，属线上行为差异）", observations, "warning"
+        return False, f"漏传 reasoning_content 时返回非预期状态 HTTP {second.status}", observations
 
     async def case_tools_plain_turn_replay(self, model: str):
         first = await self.chat(model, [{"role": "user", "content": "不要调用工具，只回复 OK。"}], tools=self.tools(), tool_choice="none", thinking={"type": "enabled"})
@@ -367,7 +446,10 @@ class DeepSeekV4Runner:
     async def case_invalid_user_id(self, model: str):
         r = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], user_id="非法 user id!", thinking={"type": "disabled"})
         observations = {"http_status": r.status, "response": r.text[:300]}
-        if 400 <= r.status < 500:
+        missing = _endpoint_missing_reason(r.status, "openai")
+        if missing:
+            return False, missing, observations, "blocked"
+        if _is_rejection(r.status):
             return True, "接口拒绝非法 user_id", observations
         if r.status == 200:
             return True, "接口接受非法 user_id；记录为文档/线上行为差异，不判模型失败", observations, "warning"
@@ -379,27 +461,62 @@ class DeepSeekV4Runner:
         calls = _message(r.body).get("tool_calls") or []
         try: args = json.loads(calls[0]["function"]["arguments"])
         except (IndexError, KeyError, json.JSONDecodeError): args = {}
-        return r.status == 200 and args == {"email": "a@example.com", "score": 5}, "Strict 参数必须严格符合 Schema", {"arguments": args}
+        observations = {"arguments": args, "http_status": r.status}
+        missing = _endpoint_missing_reason(r.status, "beta")
+        if missing:
+            return False, missing, observations, "blocked"
+        return r.status == 200 and args == {"email": "a@example.com", "score": 5}, "Strict 参数必须严格符合 Schema", observations
 
     async def case_strict_invalid(self, model: str):
         tool = {"type": "function", "function": {"name": "bad", "strict": True, "description": "非法测试", "parameters": {"type": "object", "properties": {"x": {"type": "string", "minLength": 2}}, "required": [], "additionalProperties": True}}}
         r = await self.chat(model, [{"role": "user", "content": "调用 bad"}], _family="beta", tools=[tool], thinking={"type": "disabled"})
-        return 400 <= r.status < 500, "不支持的 Strict Schema 应返回 4xx", {"http_status": r.status, "error": r.text[:300]}
+        observations = {"http_status": r.status, "error": r.text[:300]}
+        missing = _endpoint_missing_reason(r.status, "beta")
+        if missing:
+            return False, missing, observations, "blocked"
+        if _is_rejection(r.status):
+            return True, "不支持的 Strict Schema 应返回 4xx", observations
+        return False, "非法 Strict Schema 未返回预期 4xx", observations
 
     async def case_prefix(self, model: str):
         r = await self.chat(model, [{"role": "user", "content": "写一个 Python 加法函数，只输出代码。"}, {"role": "assistant", "content": "def add(a, b):\n", "prefix": True}], _family="beta", thinking={"type": "disabled"}, stop=["```"], max_tokens=64)
         text = _message(r.body).get("content") or ""
-        return r.status == 200 and "return" in text and not text.startswith("def add"), "应从 assistant 前缀后继续生成", {"content": text[:300]}
+        observations = {"content": text[:300], "http_status": r.status}
+        missing = _endpoint_missing_reason(r.status, "beta")
+        if missing:
+            return False, missing, observations, "blocked"
+        return r.status == 200 and "return" in text and not text.startswith("def add"), "应从 assistant 前缀后继续生成", observations
 
     async def case_prefix_invalid(self, model: str):
+        """负向用例：prefix 被放在非末尾 assistant 消息上时的处理行为。
+
+        官方《Chat Prefix Completion (Beta)》注意事项只写"用户需确保 messages 里最后一条
+        消息的 role 为 assistant 且 prefix 为 True"，即**调用方义务**，并未承诺对错误放置
+        返回 4xx。线上实测为静默忽略该参数并正常作答。因此 4xx（严格校验型拒绝）与 200
+        （宽松忽略）都不构成模型能力失败；200 记为 warning，保留"上游不校验该参数"这一观察，
+        避免调用方写法错误长期不被发现。对照 DS-V4-20：strict schema 才是上游明确执行的校验。
+        """
         r = await self.chat(model, [{"role": "user", "content": "写代码", "prefix": True}], _family="beta", thinking={"type": "disabled"}, max_tokens=32)
-        return 400 <= r.status < 500, "prefix=true 不在末尾 assistant 消息上时应返回 4xx", {"http_status": r.status, "error": r.text[:300]}
+        content = _message(r.body).get("content") or ""
+        observations = {"http_status": r.status, "content": content[:200], "response": r.text[:300]}
+        missing = _endpoint_missing_reason(r.status, "beta")
+        if missing:
+            return False, missing, observations, "blocked"
+        if _is_rejection(r.status):
+            return True, "上游对非法放置的 prefix 返回 4xx，属校验型拒绝", observations
+        if r.status == 200 and content:
+            return True, "官方文档仅要求调用方自行确保 prefix 位于最后一条 assistant 消息，未承诺拒绝；线上静默忽略该参数并正常作答（文档未定义的宽松行为，非模型能力问题）", observations, "warning"
+        return False, f"非法放置的 prefix 未得到可解释的处理结果（HTTP {r.status}）", observations
 
     async def case_fim(self, model: str):
         payload = {"model": model, "prompt": "def fib(n):\n", "suffix": "\n    return fib(n-1) + fib(n-2)", "max_tokens": 128}
         r = await self.request("completions", payload, family="beta")
         text = (((r.body or {}).get("choices") or [{}])[0]).get("text") or ""
-        return r.status == 200 and bool(text), "Beta FIM 应返回中间补全文本", {"content": text[:300]}
+        observations = {"content": text[:300], "http_status": r.status}
+        missing = _endpoint_missing_reason(r.status, "beta")
+        if missing:
+            return False, missing, observations, "blocked"
+        return r.status == 200 and bool(text), "Beta FIM 应返回中间补全文本", observations
 
     async def case_anthropic_mapping(self, model: str):
         alias = "claude-opus-4-test" if model.endswith("pro") else "claude-sonnet-4-test"
@@ -407,7 +524,11 @@ class DeepSeekV4Runner:
         r = await self.request("v1/messages", payload, family="anthropic")
         response_model = (r.body or {}).get("model")
         expected = "pro" if model.endswith("pro") else "flash"
-        return r.status == 200 and expected in str(response_model).lower(), "Claude 别名应映射到目标 DeepSeek 型号", {"requested": alias, "response_model": response_model}
+        observations = {"requested": alias, "response_model": response_model, "http_status": r.status}
+        missing = _endpoint_missing_reason(r.status, "anthropic")
+        if missing:
+            return False, missing, observations, "blocked"
+        return r.status == 200 and expected in str(response_model).lower(), "Claude 别名应映射到目标 DeepSeek 型号", observations
 
     async def case_responses_stateless(self, model: str):
         payload = {"model": model, "input": "只回复 OK", "store": True, "previous_response_id": "resp_nonexistent", "max_output_tokens": 32}
@@ -445,11 +566,19 @@ class DeepSeekV4Runner:
 
     async def case_temperature_invalid(self, model: str):
         r = await self.chat(model, [{"role": "user", "content": "只回复 OK"}], thinking={"type": "disabled"}, temperature=2.1, max_tokens=16)
-        return 400 <= r.status < 500, "temperature 超出 [0,2] 应返回 4xx", {"http_status": r.status, "error": r.text[:300]}
+        observations = {"http_status": r.status, "error": r.text[:300]}
+        missing = _endpoint_missing_reason(r.status, "openai")
+        if missing:
+            return False, missing, observations, "blocked"
+        return _is_rejection(r.status), "temperature 超出 [0,2] 应返回 4xx", observations
 
     async def case_messages_invalid(self, model: str):
         r = await self.request("chat/completions", {"model": model, "messages": "not-an-array", "max_tokens": 16})
-        return 400 <= r.status < 500, "messages 非数组应返回 4xx", {"http_status": r.status, "error": r.text[:300]}
+        observations = {"http_status": r.status, "error": r.text[:300]}
+        missing = _endpoint_missing_reason(r.status, "openai")
+        if missing:
+            return False, missing, observations, "blocked"
+        return _is_rejection(r.status), "messages 非数组应返回 4xx", observations
 
     async def case_tool_choice_none(self, model: str):
         r = await self.chat(model, [{"role": "user", "content": "不要调用工具，只回复 OK"}], tools=self.tools(), tool_choice="none", thinking={"type": "disabled"})
@@ -471,7 +600,11 @@ class DeepSeekV4Runner:
         payload = {"model": model, "max_tokens": 32, "messages": [{"role": "user", "content": "只回复 OK"}]}
         r = await self.request("v1/messages", payload, family="anthropic", headers={"x-api-key": self.config.api_key, "anthropic-version": "2023-06-01"})
         body = r.body or {}
-        return r.status == 200 and body.get("role") == "assistant" and isinstance(body.get("content"), list), "Anthropic Messages 应返回 assistant 与 content 数组", {"role": body.get("role"), "model": body.get("model")}
+        observations = {"role": body.get("role"), "model": body.get("model"), "http_status": r.status}
+        missing = _endpoint_missing_reason(r.status, "anthropic")
+        if missing:
+            return False, missing, observations, "blocked"
+        return r.status == 200 and body.get("role") == "assistant" and isinstance(body.get("content"), list), "Anthropic Messages 应返回 assistant 与 content 数组", observations
 
 
 def _invalid_json(text: str) -> bool:

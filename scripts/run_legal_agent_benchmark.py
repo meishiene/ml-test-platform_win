@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, json, os, re, shutil, subprocess, time
 from pathlib import Path
 from common.suite_runtime import finalize
+from common.report_style import stats_lines
 from volcperf.protocols import api_root
 ROOT=Path(__file__).resolve().parent.parent
 REPO=ROOT/'data_cache'/'harvey-labs-official'
@@ -40,7 +41,10 @@ def main()->int:
  (out/'run.log').write_text('\n\n'.join(logs),encoding='utf8'); (out/'requests.jsonl').write_text(''.join(json.dumps(x,ensure_ascii=False)+'\n' for x in records),encoding='utf8')
  passed=sum(x.get('score')==1 or x.get('score')==1.0 for x in records); evaluated=sum(x['evaluated'] for x in records)
  summary={'schema_version':'legal-agent-benchmark.result.v1','record_id':os.getenv('VOLC_RECORD_ID'),'test_kind':'legal-agent-benchmark','case':'LEGAL_AGENT_BENCHMARK','dataset':'harveyai/harvey-labs@v1.0:tasks','runner':'official Harvey Labs harness + evaluator','model':agent_model,'judge_model':judge_model,'requested_tasks':len(tasks),'evaluated_tasks':evaluated,'all_pass_tasks':passed,'all_pass_rate':passed/evaluated if evaluated else None,'admission_passed':evaluated==len(tasks) and evaluated>0,'status':'completed' if evaluated==len(tasks) else 'failed','results':records}
- (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n',encoding='utf8'); (out/'report.md').write_text(f"# Legal Agent Benchmark 测试报告\n\n- 官方项目：`harveyai/harvey-labs@v1.0`\n- 官方 harness/evaluator：是\n- 模型：`{agent_model}`\n- 执行任务：{len(tasks)}\n- 已评分：{evaluated}\n- 全标准通过：{passed}\n- All-pass rate：{summary['all_pass_rate'] if summary['all_pass_rate'] is not None else '—'}\n- 说明：任务材料、rubric、harness 和评分器均直接来自官方开源项目；当前使用被测模型作为单一 LLM judge。\n",encoding='utf8')
+ report=['# Legal Agent Benchmark 测试报告','',*stats_lines(len(tasks),passed,evaluated-passed,0,len(tasks)-evaluated,summary['all_pass_rate'],
+    ['官方项目：`harveyai/harvey-labs@v1.0`（官方 harness/evaluator）',f"模型：`{agent_model}`",f"已评分：{evaluated}",
+     '说明：任务材料、rubric、harness 和评分器均直接来自官方开源项目；当前使用被测模型作为单一 LLM judge。'])]
+ (out/'report.md').write_text('\n'.join(report)+'\n',encoding='utf8')
  finalize(out)
  print(json.dumps(summary,ensure_ascii=False,indent=2)); return 0 if summary['admission_passed'] else 2
 if __name__=='__main__': raise SystemExit(main())

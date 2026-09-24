@@ -7,6 +7,7 @@ import httpx
 from volcperf.protocols import endpoint, headers, payload
 from common.suite_runtime import finalize
 from common.audit import AuditLog
+from common.report_style import stats_lines
 
 BOXED = re.compile(r"\\(?:boxed|fbox)\s*\{((?:[^{}]|\{[^{}]*\})*)\}", re.S)
 def answer_text(text: str) -> str:
@@ -78,7 +79,10 @@ def main() -> int:
     evaluated=[x for x in results if x["status"]=="ok"]; correct=sum(x.get("correct",False) for x in evaluated)
     summary={"schema_version":"arxivmath.result.v1","record_id":os.getenv("VOLC_RECORD_ID"),"test_kind":"arxivmath","case":"ARXIVMATH","dataset":dataset_id,"split":split,"total_problems":len(results),"evaluated":len(evaluated),"correct":correct,"accuracy":correct/len(evaluated) if evaluated else 0,"failed_requests":len(results)-len(evaluated),"admission_passed":len(evaluated)==len(results) and len(evaluated)>0,"answer_policy":"官方 answer 字段；最终答案抽取与规范化仅用于评分，不修改数据集题目/答案","status":"completed"}
     (out/"summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2)+"\n",encoding="utf8")
-    (out/"report.md").write_text(f"# ArXivMath 测试报告\n\n- 数据集：`{dataset_id}`（Hugging Face 官方开源数据集）\n- 题目数：{len(results)}\n- 有效回答：{len(evaluated)}\n- 正确：{correct}\n- 最终答案准确率：{summary['accuracy']:.2%}\n- 说明：本测试只评估 final answer，不代表完整证明能力。\n",encoding="utf8")
+    report=['# ArXivMath 测试报告','',*stats_lines(len(results),correct,len(evaluated)-correct,0,len(results)-len(evaluated),summary['accuracy'],
+        [f'数据集：`{dataset_id}`（Hugging Face 官方开源数据集）',f'有效回答：{len(evaluated)}',
+         '说明：本测试只评估 final answer，不代表完整证明能力。'])]
+    (out/"report.md").write_text('\n'.join(report)+'\n',encoding="utf8")
     finalize(out)
     print(json.dumps(summary,ensure_ascii=False,indent=2)); return 0
 if __name__=='__main__': raise SystemExit(main())

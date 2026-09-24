@@ -13,6 +13,7 @@ from typing import Any
 
 from .cases import CASES
 from common.suite_runtime import finalize
+from common.report_style import stats_lines
 from volcperf.protocols import api_root
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -127,9 +128,11 @@ def execute(case_id: str, output_root: Path) -> tuple[Path, dict[str, Any]]:
 
 
 def write_report(out: Path, summary: dict[str, Any]) -> None:
-    lines=["# 官方 Kimi Vendor Verifier 测试报告","",f"- 官方工具目录：`{summary['kvv_home']}`",
-           f"- 模型：`{summary['model']}`",f"- Base URL：`{summary['base_url']}`",f"- Thinking 格式：`{summary['think_mode']}`",
-           f"- 结论：{'通过' if summary['admission_passed'] else '未通过'}",f"- 用例：{summary['passed']}/{summary['total']} 通过；失败/错误 {summary['failed']}；跳过 {summary['skipped']}",
+    lines=["# 官方 Kimi Vendor Verifier 测试报告","",
+           *stats_lines(summary['total'],summary['passed'],summary['failed'],0,summary['skipped'],summary.get('pass_rate'),
+                        [f"结论：{'通过' if summary['admission_passed'] else '未通过'}",
+                         f"模型：`{summary['model']}`；Base URL：`{summary['base_url']}`；Thinking 格式：`{summary['think_mode']}`",
+                         f"官方工具目录：`{summary['kvv_home']}`"]),
            "","## 官方套件结果","","| 官方 pytest 套件 | 总数 | 通过 | 失败 | 错误 | 跳过 | 耗时(s) |","|---|---:|---:|---:|---:|---:|---:|"]
     for item in summary["suites"]:
         lines.append(f"| `{' + '.join(SUITE_PATHS[item['suite']])}` | {item['total']} | {item['passed']} | {item['failed']} | {item['errors']} | {item['skipped']} | {item['duration_seconds']:.2f} |")

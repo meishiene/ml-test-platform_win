@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
 
 from common.suite import ManifestCase, execute_manifest_case
 from common.temp_suite import TempCase, find_case, load_manifest, manifest_cases, merge_cases
+from common.report_style import stats_lines
 from common.test_framework import HttpExecutor, ResultLog, check, validate_case
 from common.validators import status, status_2xx, status_error, content, usage, sse, json_content, tool_calls
 from volcperf.protocols import api_root
@@ -146,7 +147,12 @@ async def main_async(args):
     executed_requests=sum(1 for _ in (out/'execution.jsonl').open(encoding='utf-8'))
     summary={'schema_version':'volcperf.result.v2','record_id':os.getenv('VOLC_RECORD_ID'),'case':selected_case.id if selected_case else 'K3_TEMP_SUITE','test_kind':'temporary','model':os.environ['VOLC_MODEL'],'base_url':os.environ['VOLC_BASE_URL'],'total':len(results),'merged_cases':len(results),'atomic_requests':atomic_requests,'executed_requests':executed_requests,'manifest_cases':len(atomic_cases),'passed':passed,'failed':sum(x['status']=='failed' for x in results),'not_evaluable':sum(x['status']=='not_evaluable' for x in results),'validator_errors':sum(x['status']=='error' for x in results),'pass_rate':passed/evaluated if evaluated else 0,'admission_passed':bool(results) and all(x['status']=='passed' for x in results),'results':results,'evidence':'execution.jsonl','note':'Transport status and case verdict are separate; not_evaluable never counts as pass. Same category + same request.batch rows are merged into one case; every atomic request is still executed and logged.'}
     (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n')
-    lines=['# Kimi-K3 临时测试报告（v2 校验流水线）','',f'- 结论：{"通过" if summary["admission_passed"] else "未通过/数据不足"}',f'- 用例：{len(results)} 个合并案例（清单原始 {len(atomic_cases)} 条，同类项已合并）',f'- 请求：计划 {atomic_requests} 次，实际发起 {executed_requests} 次（仅场景描述的案例不发请求）',f'- 通过：{passed}/{len(results)}；失败：{summary["failed"]}；不可评估：{summary["not_evaluable"]}', '', '| 用例 | 类别 | 次数 | 状态 | 失败/不可评估原因 |','|---|---|---|---|---|']
+    lines=['# Kimi-K3 临时测试报告（v2 校验流水线）','',
+           *stats_lines(len(results),passed,summary['failed'],0,summary['not_evaluable']+summary['validator_errors'],summary['pass_rate'],
+                        [f"结论：{'通过' if summary['admission_passed'] else '未通过/数据不足'}",
+                         f"用例：{len(results)} 个合并案例（清单原始 {len(atomic_cases)} 条，同类项已合并）",
+                         f"请求：计划 {atomic_requests} 次，实际发起 {executed_requests} 次（仅场景描述的案例不发请求）"]),
+           '', '| 用例 | 类别 | 次数 | 状态 | 失败/不可评估原因 |','|---|---|---|---|---|']
     for x in results: lines.append(f"| `{x['case_id']}` | {x.get('category','') or '—'} | {x['repetitions']} | {x['status']} | {'；'.join(x['failure_reasons']) or '—'} |")
     lines += ['', '> 同类项合并规则：`category` 与 `request.batch`（含档位与次数）相同视为同一逻辑案例；合并只影响案例集与汇总粒度，合并案例下的每个原子请求仍单独发起、单独留证。', '', '## 证据', '', '- `execution.jsonl`：请求、响应、原始 SSE、时间点和校验明细（按原子案例逐条）', '- `summary.json`：结构化汇总和准入判定']
     (out/'report.md').write_text('\n'.join(lines)+'\n',encoding='utf-8'); print(f'结果目录: {out.resolve()}'); return 0 if summary['admission_passed'] else 2

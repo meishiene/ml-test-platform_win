@@ -167,7 +167,7 @@ L1–L4 另需 `TTFC P90 ≤ 同档 B1 基线的 3 倍`，因此**必须先有 B
 .venv/bin/python scripts/run_kvv.py KVV_K3_FEATURES
 
 # 能力专项 / 契约探针
-.venv/bin/python scripts/run_deepseek_v4.py DS_V4_P0
+.venv/bin/python scripts/run_dsv4.py DS_V4_P0
 .venv/bin/python scripts/run_glm53.py GLM_53_CORE
 .venv/bin/python scripts/run_contracts.py GLM_CONTRACT
 
@@ -279,6 +279,7 @@ VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /
 - 敏感头必须在落盘前脱敏，走 `common/audit.py` 的 `AuditLog`，不要绕过它直接写文件。
 - 新增测试项时：结果行必须同时给出布尔 `passed` 与字符串 `status`，并在 `summary` 顶层给出 `admission_passed`，否则会被适配层判成 `not_evaluable` 而阻断准入。
 - 改完请跑 `.venv/bin/python -m pytest tests/ -q`。
+- **DeepSeek V4 能力专项的唯一权威实现是 `dsv4/` 包**：用例定义在 `dsv4/core.py`（`MODELS` / `CASE_SPECS` / handler），展示元数据在 `dsv4/cases.py`，装配与落盘在 `dsv4/runner.py`，CLI 入口固定为 `scripts/run_dsv4.py`。init 时代的旧副本 `k3perf/deepseek_v4.py` + `scripts/run_deepseek_v4.py` 已删除，**不要在 `k3perf/` 下重建同类并行实现**（它缺 DS-V4-18 与整个 P2 段，只接受 `--priority`/`--case`，位置传参直接 argparse 中止）。
 
 ---
 

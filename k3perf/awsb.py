@@ -16,6 +16,7 @@ from typing import Any
 
 import httpx
 from common.test_framework import HttpExecutor
+from common.report_style import case_table_report
 
 MODEL = "claude-opus-5"
 
@@ -191,9 +192,10 @@ def summarize(results):
 def write_report(directory: Path, summary: dict[str, Any]):
     directory.mkdir(parents=True, exist_ok=True)
     (directory/"summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")
-    lines=["# AWSB Claude Opus 5 测试报告", "", f"模型：`{summary['model']}`", f"通过：{summary['passed']}/{summary['total']}", "", "| 用例 | 结果 | 说明 |", "|---|---|---|"]
-    for x in summary["results"]:
-        details = x["details"].replace("|", "\\|")
-        status = "PASS" if x["passed"] else "FAIL"
-        lines.append(f"| {x['case_id']} {x['name']} | {status} | {details} |")
-    (directory/"report.md").write_text("\n".join(lines)+"\n", encoding="utf-8")
+    rows=[[f"{x['case_id']} {x['name']}", x.get('model') or summary.get('model') or '—',
+           'passed' if x['passed'] else 'failed', f"{x.get('duration_seconds',0):.2f}", x['details']]
+          for x in summary["results"]]
+    report=case_table_report("AWSB Claude Opus 5 测试报告",
+        total=summary['total'],passed=summary['passed'],failed=summary['failed'],
+        extra_stats=[f"模型：`{summary.get('model') or '—'}`"],rows=rows,status_column=2)
+    (directory/"report.md").write_text(report, encoding="utf-8")

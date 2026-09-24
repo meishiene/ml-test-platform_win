@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from common.report_style import stats_lines
 
 REQUEST_COLUMNS = [
     "case", "protocol", "phase", "counted", "request_id", "dataset_id", "target_prompt_tokens", "max_tokens", "planned_epoch", "started_epoch", "completed_epoch",
@@ -42,13 +43,16 @@ def write_artifacts(out: Path, rows: list[dict[str, Any]], summary: dict[str, An
         stats.append({"metric": f"data_quality.{key}", "value": value})
     write_csv(out / "statistics.csv", stats, ["metric", "value"])
     f = lambda v: "-" if v is None else (f"{v:.4f}" if isinstance(v, float) else str(v))
-    lines = [f"# {summary['case']} 测试报告", "", f"- 生成时间（UTC）：{datetime.now(timezone.utc).isoformat()}",
-             f"- 本轮结论：{'通过' if summary['admission_passed'] else '未通过/数据不足'}",
-             f"- 正式请求：{summary['sent']}；成功：{summary['successful']}；成功率：{summary['success_rate']:.2%}",
-             f"- 请求上限：{summary.get('attempt_limit') or '按固定阶段/基线执行'}；成功目标：{summary.get('success_target') or '按固定阶段/基线执行'}",
-             f"- 前置连通性：{'通过' if (summary.get('connectivity') or {}).get('passed') else '失败'}",
-             f"- 负载画像：{summary.get('workload_profile', 'mixed-business-v1')}；Thinking：{summary.get('reasoning_effort') or '供应商默认'}",
-             "- 范围：合成业务混合负载的短时准入测试，不能替代真实流量回放和 30～60 分钟稳定性测试。", "", "## 指标", "",
+    sent = int(summary.get("sent") or 0)
+    successful = int(summary.get("successful") or 0)
+    lines = [f"# {summary['case']} 测试报告", "",
+             *stats_lines(sent, successful, sent - successful, 0, 0, summary.get("success_rate"),
+                          [f"本轮结论：{'通过' if summary['admission_passed'] else '未通过/数据不足'}",
+                           f"请求上限：{summary.get('attempt_limit') or '按固定阶段/基线执行'}；成功目标：{summary.get('success_target') or '按固定阶段/基线执行'}",
+                           f"前置连通性：{'通过' if (summary.get('connectivity') or {}).get('passed') else '失败'}",
+                           f"负载画像：{summary.get('workload_profile', 'mixed-business-v1')}；Thinking：{summary.get('reasoning_effort') or '供应商默认'}",
+                           "范围：合成业务混合负载的短时准入测试，不能替代真实流量回放和 30～60 分钟稳定性测试。"]),
+             "", "## 指标", "",
              "| 指标 | 数值 |", "|---|---:|",
              f"| Prompt Token P50 | {f(summary.get('prompt_tokens_p50'))} |",
              f"| TTFT P50/P90/P99（秒） | {f(summary.get('ttft_p50_seconds'))} / {f(summary.get('ttft_p90_seconds'))} / {f(summary.get('ttft_p99_seconds'))} |",

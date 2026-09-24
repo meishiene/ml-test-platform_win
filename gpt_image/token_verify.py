@@ -19,6 +19,7 @@ from PIL import Image
 
 from common.audit import AuditLog, redact
 from common.finalizer import finalize_result_dir
+from common.report_style import stats_lines
 
 from .runner import image_endpoint, request_headers
 
@@ -267,13 +268,14 @@ def _write_report(out: Path, summary: dict[str, Any]) -> None:
     lines = [
         "# GPT Image 4K / n=10 / Token 验真报告",
         "",
-        f"- 固定参数：size={SIZE}，output_format={OUTPUT_FORMAT}，n={IMAGE_COUNT}",
-        f"- 模型/质量：{', '.join(f'{model}/{quality}' for model, quality in MODEL_SPECS)}",
-        f"- 结果：{'通过' if summary['admission_passed'] else '未通过'}",
-        f"- 完成请求：{summary['completed']}/{summary['requested']}；有效图片：{summary['generated_images']}/{len(MODELS) * IMAGE_COUNT}",
-        f"- 输入换算：ceil(提示词 UTF-8 字节数 / {TEXT_BYTES_PER_TOKEN})",
-        f"- 输出换算：sum(ceil(每张图片解码字节数 / {IMAGE_BYTES_PER_TOKEN}))",
-        f"- 单图大小门槛：{MIN_IMAGE_BYTES / 1024 / 1024:g}–{MAX_IMAGE_BYTES / 1024 / 1024:g} MiB",
+        *stats_lines(summary['requested'], summary['successful'], summary['failed'], 0, 0, None,
+                     [f"结果：{'通过' if summary['admission_passed'] else '未通过'}",
+                      f"固定参数：size={SIZE}，output_format={OUTPUT_FORMAT}，n={IMAGE_COUNT}",
+                      f"模型/质量：{', '.join(f'{model}/{quality}' for model, quality in MODEL_SPECS)}",
+                      f"完成请求：{summary['completed']}/{summary['requested']}；有效图片：{summary['generated_images']}/{len(MODELS) * IMAGE_COUNT}",
+                      f"输入换算：ceil(提示词 UTF-8 字节数 / {TEXT_BYTES_PER_TOKEN})",
+                      f"输出换算：sum(ceil(每张图片解码字节数 / {IMAGE_BYTES_PER_TOKEN}))",
+                      f"单图大小门槛：{MIN_IMAGE_BYTES / 1024 / 1024:g}–{MAX_IMAGE_BYTES / 1024 / 1024:g} MiB"]),
         "",
         "| 模型 | 质量 | HTTP | 图片数 | 输入 Token | 输入换算 | 输出 Token | 输出换算 | 单图大小 MiB | 结论 |",
         "|---|---|---:|---:|---:|---:|---:|---:|---|---|",

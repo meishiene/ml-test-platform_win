@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse, json, os, subprocess, time
 from pathlib import Path
 from common.suite_runtime import finalize
+from common.report_style import stats_lines
 from volcperf.protocols import api_root
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -48,7 +49,10 @@ def main()->int:
     passed=sum(reward(x)>=1 for x in rewards)
     summary={'schema_version':'swe-atlas-tw.result.v1','record_id':os.getenv('VOLC_RECORD_ID'),'test_kind':'swe-atlas-tw','case':'SWE_ATLAS_TW','dataset':'scaleapi/SWE-Atlas:data/tw','runner':'Harbor','agent':os.getenv('SWE_ATLAS_TW_AGENT','mini-swe-agent'),'model':harbor_model,'requested_tasks':args.n_tasks or 'official default sample','scored_tasks':len(rewards),'passed_tasks':passed,'pass_rate':passed/len(rewards) if rewards else None,'exit_code':proc.returncode,'admission_passed':proc.returncode==0 and bool(rewards),'status':'completed' if proc.returncode==0 else 'failed'}
     (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
-    (out/'report.md').write_text(f"# SWE-Atlas TW 测试报告\n\n- 数据集：Scale AI 官方开源 `SWE-Atlas/data/tw`\n- 运行器：Harbor + {summary['agent']}\n- 模型：`{harbor_model}`\n- 评分任务：{len(rewards)}\n- 通过任务：{passed}\n- Pass Rate：{summary['pass_rate'] if summary['pass_rate'] is not None else '—'}\n- 说明：任务、环境、提示配置和 verifier 均来自官方开源项目，本系统不重写测试集。\n",encoding='utf8')
+    report=['# SWE-Atlas TW 测试报告','',*stats_lines(len(rewards),passed,len(rewards)-passed,0,0,summary['pass_rate'],
+        ['数据集：Scale AI 官方开源 `SWE-Atlas/data/tw`',f"运行器：Harbor + {summary['agent']}",f"模型：`{harbor_model}`",
+         '说明：任务、环境、提示配置和 verifier 均来自官方开源项目，本系统不重写测试集。'])]
+    (out/'report.md').write_text('\n'.join(report)+'\n',encoding='utf8')
     finalize(out)
     print(json.dumps(summary,ensure_ascii=False,indent=2)); return proc.returncode
 if __name__=='__main__': raise SystemExit(main())

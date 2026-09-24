@@ -3,8 +3,16 @@ from __future__ import annotations
 from typing import Any
 from .artifacts import SCHEMA_VERSION
 
+# 领域套件可以在行内 status/case_status 给出显式裁定。只承认裁定词表内的取值：
+# 传输层的 status（如 ok / completed）不能被当成案例结论，否则会把 warning、blocked
+# 这类非阻断结论压平成 failed，或把传输成功误升级为案例通过。
+VERDICT_STATUSES = {"passed", "failed", "error", "blocked", "warning", "skipped", "not_evaluable", "interrupted"}
+
 def normalize_summary(summary: dict[str, Any]) -> dict[str, Any]:
-    out=dict(summary); out["source_schema_version"] = summary.get("schema_version")
+    out=dict(summary)
+    # 结果可能被收尾两次（套件自身一次、Web 聚合再一次），必须保留首次记录的来源版本，
+    # 否则第二次会把上一轮写入的 mltest schema 当成来源版本，元数据被逐步污染。
+    out["source_schema_version"] = summary.get("source_schema_version") or summary.get("schema_version")
     out["schema_version"] = SCHEMA_VERSION
     results = out.get("results") or out.get("records") or []
     normalized=[]
@@ -12,6 +20,8 @@ def normalize_summary(summary: dict[str, Any]) -> dict[str, Any]:
         row=dict(item) if isinstance(item,dict) else {"value":item}
         legacy_passed=row.get("case_passed", row.get("passed"))
         legacy_status=row.get("case_status")
+        if legacy_status is None and row.get("status") in VERDICT_STATUSES:
+            legacy_status = row["status"]
         # Adapters for common external verifier result shapes.  A raw HTTP/status
         # row is intentionally not upgraded: it still needs a domain verdict.
         if legacy_passed is None and "correct" in row and row.get("status") == "ok":
