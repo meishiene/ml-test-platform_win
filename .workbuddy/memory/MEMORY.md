@@ -10,6 +10,7 @@
 | GLM 5.3 | `glm53/` | `scripts/run_glm53.py` |
 | Kimi K3 | `kvv/` + 官方 `vendor_verifier/` | `scripts/run_kvv.py` |
 | 满血指纹 | `authenticity.py` | `scripts/run_authenticity.py` |
+| GPT-5.6 | `gpt56/`（cases/core/runner） | `scripts/run_gpt56.py`（test_kind=`gpt`，协议仅 openai，effort 六档 none→max，Responses API 主推） |
 
 - `k3perf/deepseek_v4.py` 与 `scripts/run_deepseek_v4.py` 是 init 时代旧副本，**2026-09-24 已按用户指示删除**，不要再重建同类并行实现（旧副本缺 DS-V4-18 与整个 P2 段，且只接受 `--priority/--case`）。
 - 教训：同一个模型出现两套 runner 时，Web 容易长期指向过时那一套，症状是 `unrecognized arguments` 或用例数对不上。
@@ -24,11 +25,16 @@
 - **端点地址派生**：`volcperf/protocols.py:api_root()` 会把 base_url 规范化成 `.../v1`，但 DeepSeek 的 beta / anthropic 端点挂在**根域**下——beta = `https://api.deepseek.com/beta`（chat prefix、FIM、strict tool），anthropic = `https://api.deepseek.com/anthropic`（端点 `{base}/v1/messages`）。派生这类端点前必须剥掉版本后缀（`dsv4/core.py` 的 `_api_parent()`），否则会得到 `.../v1/beta/chat/completions` 这类不存在的路径（线上 404，响应体为空、带 `x-ds-trace-id`）。
 - **负向用例的 4xx 断言必须排除 404**：`400 <= status < 500` 会把"端点不存在"误判成"参数被正确拒绝"（DS-V4-20/22 曾因此假通过）。统一用 `dsv4/core.py` 的 `_is_rejection()`；遇 404 一律按 `blocked` 收口并写清原因（`_endpoint_missing_reason()`）。2026-09-24 已覆盖 beta 域（20/22）与 openai 域（17/30/31）。
 - **负向用例的判定口径必须先查文档用词**：文档写"API 会返回 400"（承诺报错）→ 线上没执行记 `warning`；文档只写"用户需确保 / users must ensure"（调用方义务）→ **不得断言拒绝**，线上宽松容忍也记 `warning`，硬判 failed 等于自造契约。定口径前先拉 `api-docs.deepseek.com` 原文核对。
-- **模拟上游（mock）不得编码"想当然的上游行为"**：mock 是验证工具，写错就等于自我确认。凡"上游对某种异常输入如何响应"的分支，必须先有真实批次证据（`results/<批次>/requests.jsonl`），否则该用例在 mock 下宁可 blocked。2026-09-24 踩过：mock 里假设"非法放置的 prefix → 400"，导致 DS-V4-22 端到端一路显绿，而线上实为 200。
+- **模拟上游（mock）不得编码"想当然的上游行为"**：mock 是验证工具，写错就等于自我确认。凡"上游对某种异常输入如何响应"的分支，必须先有真实批次证据（`results/<批次>/requests.jsonl`），否则该用例在 mock 下宁可 blocked。2026-09-24 踩过两次：mock 里假设"非法放置的 prefix → 400"，导致 DS-V4-22 端到端一路显绿，而线上实为 200；mock 里"只要有 function 工具就返回 function_call"，导致 DS-V4-61 端到端显绿，而线上 `tool_choice=required` 是 400。**反向同样成立**：真实批次暴露的行为必须立刻补进 mock。
+- **"同一参数有多种合法形态"时用探测阶梯，并在两侧都做断言**：文档写了限制**且给出解法**的（典型：`tool_choice=required` 在思考模式下 400，文档说"请先关闭思考模式"），用例应把限制当**负向断言**验证拒绝本身，再按文档解法补**正向断言**验证关思考后能力可用——两侧都成立即 `passed`，不记 warning。**解法因协议面而异**（Chat 用 `thinking.disabled`，Responses 用 `reasoning.effort=none`）。写死单一形态、或把"文档已给解法的限制"当成缺陷，都会误报（DS-V4-61，2026-09-24）。
+- **Responses 端点的 output 断言要给足 `max_output_tokens`**：思考模式的推理内容也占用 output 额度（DS-V4-34 用 32 时 output 只剩一个 `reasoning` 项、`status=incomplete`），额度太小会把"被截断"误判成"能力缺失"。DS-V4-61 已提到 1024。
 
 ## 已知上游真实限制（非平台 bug，复核时别当失败修）
 
-- DeepSeek thinking 模式：`tool_choice=required` 返回 400 `Thinking mode does not support this tool_choice`。
+- **GPT-5.6 批次走的是中转网关**（`https://mux.la/v1`，New API，group `muxla_company`，Codex/ChatGPT 账号通道）。中转硬限制：`previous_response_id` 返回 400 `requires an OpenAI API-key account for HTTP requests`（Responses 多轮链不可用）；`max_output_tokens` 不被透传（要 16 给 207）；Chat→Responses 翻译（`usage.billing_usage.source=oai_responses`）导致 `stop` 等 Chat 专有参数丢失；未知模型返回 503 + `model_not_found`（非 4xx）；缺省 `instructions` 被替换成 Codex 系统提示词（prompt 膨胀 4400+，其中 3840 自带缓存命中）。带 `reasoning` 参数的请求从不产出 reasoning 输出项（疑似剥参），不带参数的偶尔产出。
+  → **结论**：中转下的 GPT-5.6 结果不能作为模型准入结论；判定这类平台级限制应记 `blocked` 而非 `failed`。
+
+- DeepSeek thinking 模式**不支持** `tool_choice=required` 与「指定工具」→ 400 `Thinking mode does not support this tool_choice`。**这是文档承诺的负向行为，不是缺陷**（《Chat Completions API》tool_choice 段：「思考模式下不支持 required 和指定具体 tool 的用法，API 会返回 400 错误。请先关闭思考模式。」）。关思考方式**因协议面而异**：Chat/beta 用 `thinking={"type":"disabled"}`（DS-V4-33 判 passed）；**Responses 用 `reasoning={"effort":"none"}`**（《Thinking Mode》控制参数表，思考默认开启档位 high）。2026-09-24 真实批次 DS_V4_P2-20260924-151006 实测 `required + reasoning.effort=none` → 200 且 `output=['function_call']`。**不要因为这条限制本身给用例记 warning 或 failed**——DS-V4-61 曾误记 warning，当天已纠正。
 - DeepSeek：`response_format.type=json_schema` 返回 400 `This response type is unavailable now`。
 - KVV 契约探针期望令牌 `(kimi, k3)`，实际上游返回 `agnes-2.5-pro` —— 口径未定，暂不改。
 - **DeepSeek 线上不执行文档承诺的 reasoning_content 严格校验**：官方文档（Thinking Mode → Tool Calls）称"携带 tools 的请求，后续未正确回传 reasoning_content 会返回 400"，但线上（`deepseek-flash`，2026-09 实测）返回 **200 并正常作答**。判定口径：这种情况记 `warning`（文档/线上行为差异），**不判模型失败**——先例是 DS-V4-10，DS-V4-09 于 2026-09-24 按同一口径改判。
