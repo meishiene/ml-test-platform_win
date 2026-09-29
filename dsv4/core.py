@@ -17,6 +17,14 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from common.png_fixture import (  # noqa: F401  （再导出，保持 dsv4.core.png_bands 等旧引用可用）
+    IMAGE_BOTTOM_RGB,
+    IMAGE_TOP_RGB,
+    PNG_SIGNATURE,
+    image_part,
+    png_bands,
+    png_data_url,
+)
 from common.test_framework import HttpExecutor, ResultLog
 
 # 官方文档当前主推的模型名（Models & Pricing / Vision / Files API 一致）。
@@ -230,38 +238,8 @@ def _anthropic_block_types(r: "ApiResponse") -> list[str]:
     return [str(b.get("type")) for b in (r.body or {}).get("content") or [] if isinstance(b, dict)]
 
 
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-# 图片识别用例使用固定纯色，避免依赖外部 URL、联网下载与随机图案。
-IMAGE_TOP_RGB = (220, 20, 20)      # 红
-IMAGE_BOTTOM_RGB = (20, 20, 220)   # 蓝
-
-
-def _png_chunk(tag: bytes, payload: bytes) -> bytes:
-    return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
-
-
-def png_bands(top_rgb: tuple[int, int, int] = IMAGE_TOP_RGB, bottom_rgb: tuple[int, int, int] = IMAGE_BOTTOM_RGB,
-              width: int = 64, height: int = 64) -> bytes:
-    """生成上/下两色的 PNG（纯标准库实现，无 Pillow 依赖）。"""
-    raw = b""
-    for y in range(height):
-        rgb = top_rgb if y < height // 2 else bottom_rgb
-        raw += b"\x00" + bytes(rgb) * width
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return PNG_SIGNATURE + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", zlib.compress(raw, 9)) + _png_chunk(b"IEND", b"")
-
-
-def png_data_url(**kwargs: Any) -> str:
-    return "data:image/png;base64," + base64.b64encode(png_bands(**kwargs)).decode("ascii")
-
-
-def image_part(url: str, detail: str | None = None) -> dict[str, Any]:
-    block: dict[str, Any] = {"url": url}
-    if detail:
-        block["detail"] = detail
-    return {"type": "image_url", "image_url": block}
-
-
+# 确定性图片夹具（PNG_SIGNATURE / png_bands / png_data_url / image_part 等）
+# 已抽到 common/png_fixture.py，由本模块顶部 import 再导出，旧引用路径不变。
 class DeepSeekV4Runner:
     def __init__(self, config: DeepSeekConfig, client: httpx.AsyncClient | None = None, audit_dir: Path | None = None):
         self.config = config

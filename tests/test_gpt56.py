@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -26,11 +27,13 @@ from gpt56.runner import config_from_env
 class GPT56StaticTests(unittest.TestCase):
     def test_ui_suites(self):
         self.assertEqual(set(CASES), {"GPT56_P0", "GPT56_P1", "GPT56_P2", "GPT56_FINGERPRINT"})
-        self.assertEqual(CASES["GPT56_P0"].request_count, 16)
-        self.assertEqual(CASES["GPT56_P1"].request_count, 7)
-        self.assertEqual(CASES["GPT56_P2"].request_count, 10)
-        self.assertEqual(CASES["GPT56_FINGERPRINT"].request_count, 6)
+        self.assertEqual(CASES["GPT56_P0"].request_count, 22)
+        self.assertEqual(CASES["GPT56_P1"].request_count, 9)
+        self.assertEqual(CASES["GPT56_P2"].request_count, 15)
+        self.assertEqual(CASES["GPT56_FINGERPRINT"].request_count, 11)
         self.assertEqual({spec.priority for spec in CASE_SPECS}, {"P0", "P1", "P2", "AUTH"})
+        self.assertEqual(len(CASE_SPECS), 57)
+        self.assertEqual(len({spec.case_id for spec in CASE_SPECS}), 57)
 
     def test_config_urls(self):
         # GPT-5.6 无 beta/anthropic 特殊端点，全部挂在 openai 家族根（.../v1）下。
@@ -85,7 +88,8 @@ class GPT56OutcomeTests(unittest.IsolatedAsyncioTestCase):
         requests = []
 
         async def handler(request):
-            requests.append(json.loads(request.content))
+            # GET（raw_request）无请求体；队列按"第 n 次请求"语义弹出，与方法无关。
+            requests.append(json.loads(request.content or b"{}"))
             status, body = queue.pop(0)
             return httpx.Response(status, json=body)
 
@@ -307,6 +311,371 @@ class GPT56OutcomeTests(unittest.IsolatedAsyncioTestCase):
             await client.aclose()
         self.assertFalse(passed)
         self.assertEqual(status, "blocked")
+
+
+# ---------------------------------------------------------------------------
+# 缺口补充用例（2026-09-28 实现，设计见 docs/GPT5.6测试缺口分析与补充用例设计.md）
+# ---------------------------------------------------------------------------
+
+
+def _resp(model: str = "gpt-5.6", *, text: str = "OK", usage: dict | None = None, **extra: Any) -> dict:
+    body = {"id": "resp_" + "a" * 24, "object": "response", "created_at": 1, "model": model,
+            "status": "completed", "output": [{"type": "message", "role": "assistant",
+                                               "content": [{"type": "output_text", "text": text}]}],
+            "usage": usage or {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11}}
+    body.update(extra)
+    return body
+
+
+class GPT56GapTests(unittest.IsolatedAsyncioTestCase):
+    """第一批（34/35/41/54/55/56/57/61 + AUTH-G07/G08/G11/G12）与
+    第二批（36/37/40/49/53/AUTH-G10）新用例的关键分支。"""
+
+    async def _one(self, responses, handler_name, *args):
+        runner, client, _ = await GPT56OutcomeTests._runner(self, responses)
+        try:
+            return GPT56OutcomeTests._normalize(await getattr(runner, handler_name)(*args))
+        finally:
+            await client.aclose()
+
+    # ---- GPT56-34 三档模型 ----
+    async def test_tier_models_pass(self):
+        queue = [(200, _resp(t)) for t in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")]
+        outcome = await self._one(queue, "case_tier_models", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_tier_mismatch_is_failed(self):
+        # 请求 terra 却返回 sol：档位路由错配，能力与计价口径不符
+        queue = [(200, _resp("gpt-5.6-sol")), (200, _resp("gpt-5.6-sol")), (200, _resp("gpt-5.6-luna"))]
+        outcome = await self._one(queue, "case_tier_models", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_tier_unavailable_is_warning(self):
+        queue = [(200, _resp("gpt-5.6-sol")),
+                 (404, {"error": {"code": "model_not_found", "message": "The model `gpt-5.6-terra` does not exist"}}),
+                 (200, _resp("gpt-5.6-luna"))]
+        outcome = await self._one(queue, "case_tier_models", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    # ---- GPT56-35 别名路由 ----
+    async def test_alias_routes_to_flagship(self):
+        outcome = await self._one([(200, _resp("gpt-5.6-sol"))], "case_alias_flagship", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_alias_echo_is_warning(self):
+        outcome = await self._one([(200, _resp("gpt-5.6"))], "case_alias_flagship", "gpt-5.6")
+        self.assertEqual(outcome[3], "warning")
+
+    async def test_alias_to_non_flagship_is_failed(self):
+        outcome = await self._one([(200, _resp("gpt-5.6-luna"))], "case_alias_flagship", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    # ---- GPT56-36 图像识别 ----
+    async def test_image_recognition_passes_with_token_evidence(self):
+        img = _resp(text="上：红，下：蓝", usage={"input_tokens": 900})
+        base = _resp(usage={"input_tokens": 130})
+        outcome = await self._one([(200, img), (200, base)], "case_image_recognition", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_image_silently_dropped_is_failed(self):
+        # 识别"对"但 tokens 与纯文本基线持平 —— 图片被静默丢弃，不可信
+        img = _resp(text="上：红，下：蓝", usage={"input_tokens": 130})
+        base = _resp(usage={"input_tokens": 130})
+        outcome = await self._one([(200, img), (200, base)], "case_image_recognition", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_image_rejection_is_blocked(self):
+        outcome = await self._one([(400, {"error": {"message": "image input not supported"}})], "case_image_recognition", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    # ---- GPT56-37 detail 档位 ----
+    async def test_detail_tiers_pass_with_lenient_invalid(self):
+        ok = (200, _resp(text="上：红，下：蓝"))
+        outcome = await self._one([ok, ok, ok, ok, (200, _resp(text="上：红，下：蓝"))], "case_image_detail_tiers", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")  # 非法 detail=ultra 被静默接受 → 留痕
+
+    async def test_detail_tier_rejected_is_blocked(self):
+        ok = (200, _resp(text="上：红，下：蓝"))
+        queue = [ok, ok, (400, {"error": {"message": "invalid detail"}}), ok, ok]
+        outcome = await self._one(queue, "case_image_detail_tiers", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    # ---- GPT56-40 后台模式 ----
+    async def test_background_poll_to_completed(self):
+        queued = {"id": "resp_" + "b" * 24, "object": "response", "status": "queued", "output": []}
+        completed = {"id": "resp_" + "b" * 24, "object": "response", "status": "completed",
+                     "output": [{"type": "message", "content": [{"type": "output_text", "text": "OK"}]}]}
+        outcome = await self._one([(200, queued), (200, completed)], "case_background_mode", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_background_sync_completed_is_warning(self):
+        outcome = await self._one([(200, {"id": "resp_x", "status": "completed", "output": []})], "case_background_mode", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    async def test_background_rejected_is_blocked(self):
+        outcome = await self._one([(400, {"error": {"message": "background not supported"}})], "case_background_mode", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    # ---- GPT56-41 响应对象结构 ----
+    async def test_response_object_contract_passes(self):
+        outcome = await self._one([(200, _resp())], "case_response_object_contract", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_response_object_wrong_structure_is_failed(self):
+        outcome = await self._one([(200, {"id": "x", "output": []})], "case_response_object_contract", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_response_object_missing_detail_is_warning(self):
+        body = _resp()
+        body.pop("created_at")
+        outcome = await self._one([(200, body)], "case_response_object_contract", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    # ---- GPT56-49 显式缓存断点 ----
+    async def test_explicit_breakpoint_passes_on_delta_or_write(self):
+        first = {"usage": {"input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 800}}}
+        second = {"usage": {"input_tokens_details": {"cached_tokens": 6000, "cache_write_tokens": 0}}}
+        outcome = await self._one([(200, first), (200, second)], "case_explicit_cache_breakpoint", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_explicit_breakpoint_no_cache_fields_is_warning(self):
+        body = {"usage": {"input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0}}}
+        outcome = await self._one([(200, body), (200, body)], "case_explicit_cache_breakpoint", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    async def test_explicit_breakpoint_rejected_is_blocked(self):
+        outcome = await self._one([(400, {"error": {"message": "explicit cache unsupported"}})], "case_explicit_cache_breakpoint", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    # ---- GPT56-53 multi-agent ----
+    async def test_multi_agent_accepted_passes(self):
+        outcome = await self._one([(200, _resp())], "case_multi_agent", "gpt-5.6")
+        self.assertTrue(outcome[0])
+
+    async def test_multi_agent_rejected_is_blocked(self):
+        outcome = await self._one([(403, {"error": {"message": "beta required"}})], "case_multi_agent", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    # ---- GPT56-54 鉴权契约 ----
+    async def test_invalid_key_401_passes(self):
+        outcome = await self._one([(401, {"error": {"message": "Incorrect API key provided", "type": "invalid_request_error"}})], "case_invalid_key_auth", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_invalid_key_200_is_failed(self):
+        # 鉴权完全失效是严重项，必须判 failed
+        outcome = await self._one([(200, _resp())], "case_invalid_key_auth", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_invalid_key_403_is_warning(self):
+        outcome = await self._one([(403, {"error": {"message": "forbidden"}})], "case_invalid_key_auth", "gpt-5.6")
+        self.assertEqual(outcome[3], "warning")
+
+    # ---- GPT56-55 错误对象结构 ----
+    async def test_error_object_four_fields_passes(self):
+        err = {"error": {"message": "Invalid value", "type": "invalid_request_error", "param": "text.verbosity", "code": "invalid_value"}}
+        outcome = await self._one([(400, err)], "case_error_object_contract", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_error_object_missing_param_code_is_warning(self):
+        err = {"error": {"message": "Invalid value", "type": "invalid_request_error"}}
+        outcome = await self._one([(400, err)], "case_error_object_contract", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    async def test_error_object_unstructured_is_failed(self):
+        outcome = await self._one([(400, "plain gateway error")], "case_error_object_contract", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    # ---- GPT56-56 /models ----
+    async def test_models_list_with_tiers_passes(self):
+        body = {"object": "list", "data": [{"id": t} for t in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")]}
+        outcome = await self._one([(200, body)], "case_models_list", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_models_list_missing_tier_is_warning(self):
+        body = {"object": "list", "data": [{"id": "gpt-5.6-sol"}]}
+        outcome = await self._one([(200, body)], "case_models_list", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    async def test_models_list_404_is_blocked(self):
+        outcome = await self._one([(404, {"error": {"message": "unknown path"}})], "case_models_list", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    # ---- GPT56-57 input_tokens 端点 ----
+    async def test_input_tokens_endpoint_cross_validated(self):
+        count = {"input_tokens": 500}
+        real = _resp(usage={"input_tokens": 520, "output_tokens": 1, "total_tokens": 521})
+        outcome = await self._one([(200, count), (200, real)], "case_input_tokens_endpoint", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_input_tokens_endpoint_404_is_blocked(self):
+        outcome = await self._one([(404, {"error": {"message": "not found"}})], "case_input_tokens_endpoint", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    async def test_input_tokens_endpoint_deviation_is_warning(self):
+        count = {"input_tokens": 100}
+        real = _resp(usage={"input_tokens": 500, "output_tokens": 1, "total_tokens": 501})
+        outcome = await self._one([(200, count), (200, real)], "case_input_tokens_endpoint", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    # ---- AUTH-G07 注入识别 ----
+    async def test_auth_injection_clean_passes(self):
+        outcome = await self._one([(200, {"instructions": None, "usage": {"input_tokens": 130}})], "case_auth_injection", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_auth_injection_instructions_filled_is_failed(self):
+        # 真实批次回归：mux.la 注入 Codex 系统提示词
+        body = {"instructions": "You are Codex, a coding agent based on GPT-5...", "usage": {"input_tokens": 4400}}
+        outcome = await self._one([(200, body)], "case_auth_injection", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_auth_injection_inflated_tokens_is_failed(self):
+        outcome = await self._one([(200, {"instructions": None, "usage": {"input_tokens": 5000}})], "case_auth_injection", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_auth_injection_missing_field_is_warning(self):
+        outcome = await self._one([(200, {"usage": {"input_tokens": 130}})], "case_auth_injection", "gpt-5.6")
+        self.assertEqual(outcome[3], "warning")
+
+    # ---- AUTH-G08 非标准字段 ----
+    async def test_auth_fields_clean_passes(self):
+        outcome = await self._one([(200, _resp())], "case_auth_nonstandard_fields", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_auth_fields_relay_markers_fail(self):
+        # 真实批次回归：mux.la 响应顶层出现 billing_usage / access_programs
+        body = _resp()
+        body["billing_usage"] = {"source": "oai_responses"}
+        body["access_programs"] = ["codex"]
+        outcome = await self._one([(200, body)], "case_auth_nonstandard_fields", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    # ---- AUTH-G10 档位梯度 ----
+    async def test_tier_gradient_observable_passes(self):
+        luna = _resp("gpt-5.6-luna", text="7006652", usage={"input_tokens": 10, "output_tokens_details": {"reasoning_tokens": 16}})
+        sol = _resp("gpt-5.6-sol", text="7006652", usage={"input_tokens": 10, "output_tokens_details": {"reasoning_tokens": 48}})
+        outcome = await self._one([(200, luna), (200, sol)], "case_auth_tier_gradient", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_tier_gradient_identical_is_failed(self):
+        # 两档 tokens 逐一相等且输出逐字相同 = 疑似同一后端
+        same = _resp(text="7006652", usage={"input_tokens": 10, "output_tokens_details": {"reasoning_tokens": 16}})
+        outcome = await self._one([(200, same), (200, dict(same))], "case_auth_tier_gradient", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    # ---- AUTH-G11 response id 真实性 ----
+    async def test_response_id_authentic_passes(self):
+        rid = "resp_" + "0123abcd" * 3  # 24 位 hex
+        outcome = await self._one([(200, {"id": rid}), (200, {"id": rid})], "case_auth_response_id_authenticity", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_response_id_chatcmpl_is_failed(self):
+        outcome = await self._one([(200, {"id": "chatcmpl-abc123"})], "case_auth_response_id_authenticity", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_response_id_retrieval_404_is_blocked(self):
+        rid = "resp_" + "0123abcd" * 3
+        outcome = await self._one([(200, {"id": rid}), (404, {"error": {"message": "no response"}})], "case_auth_response_id_authenticity", "gpt-5.6")
+        self.assertEqual(outcome[3], "blocked")
+
+    async def test_response_id_bad_format_is_warning(self):
+        outcome = await self._one([(200, {"id": "resp_short"})], "case_auth_response_id_authenticity", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "warning")
+
+    # ---- AUTH-G12 Chat 未被改写 ----
+    async def test_chat_contract_clean_passes(self):
+        body = {"object": "chat.completion", "id": "chatcmpl-abc", "choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+        outcome = await self._one([(200, body)], "case_auth_chat_not_translated", "gpt-5.6")
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_chat_translated_is_failed(self):
+        # 真实批次回归：mux.la 把 Chat 翻译成 Responses（stop 丢参的根因）
+        body = {"object": "response", "id": "resp_" + "a" * 24, "usage": {"billing_usage": {"source": "oai_responses"}}}
+        outcome = await self._one([(200, body)], "case_auth_chat_not_translated", "gpt-5.6")
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    # ---- GPT56-61 流式语义事件（SSE）----
+    async def _sse_one(self, raw_lines):
+        lines = list(raw_lines)
+        requests = []
+
+        async def handler(request):
+            requests.append(json.loads(request.content or b"{}"))
+            payload = ("\n\n".join(lines) + "\n\n").encode("utf-8")
+            return httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"})
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        runner = GPT56Runner(GPT56Config("key", max_retries=0, retry_backoff_seconds=0.0), client)
+        try:
+            return GPT56OutcomeTests._normalize(await runner.case_stream_semantic_events("gpt-5.6"))
+        finally:
+            await client.aclose()
+
+    async def test_stream_semantic_passes_without_done(self):
+        events = [
+            {"type": "response.created", "sequence_number": 0},
+            {"type": "response.output_text.delta", "delta": "731", "sequence_number": 1},
+            {"type": "response.completed", "sequence_number": 2, "response": {"id": "resp_x", "usage": {"total_tokens": 5}}},
+        ]
+        outcome = await self._sse_one([f"data: {json.dumps(e)}" for e in events])
+        self.assertTrue(outcome[0])
+        self.assertEqual(outcome[3], "passed")
+
+    async def test_stream_with_done_marker_is_failed(self):
+        events = [
+            {"type": "response.created", "sequence_number": 0},
+            {"type": "response.output_text.delta", "delta": "731", "sequence_number": 1},
+            {"type": "response.completed", "sequence_number": 2, "response": {"id": "resp_x"}},
+        ]
+        lines = [f"data: {json.dumps(e)}" for e in events] + ["data: [DONE]"]
+        outcome = await self._sse_one(lines)
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
+
+    async def test_stream_non_monotonic_sequence_is_failed(self):
+        events = [
+            {"type": "response.created", "sequence_number": 2},
+            {"type": "response.output_text.delta", "delta": "731", "sequence_number": 1},
+            {"type": "response.completed", "sequence_number": 3, "response": {"id": "resp_x"}},
+        ]
+        outcome = await self._sse_one([f"data: {json.dumps(e)}" for e in events])
+        self.assertFalse(outcome[0])
+        self.assertEqual(outcome[3], "failed")
 
 
 # 真实批次证据（2026-09-24，results/GPT56_P0-20260924-153058/requests.jsonl）：

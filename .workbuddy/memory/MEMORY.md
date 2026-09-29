@@ -10,7 +10,7 @@
 | GLM 5.3 | `glm53/` | `scripts/run_glm53.py` |
 | Kimi K3 | `kvv/` + 官方 `vendor_verifier/` | `scripts/run_kvv.py` |
 | 满血指纹 | `authenticity.py` | `scripts/run_authenticity.py` |
-| GPT-5.6 | `gpt56/`（cases/core/runner） | `scripts/run_gpt56.py`（test_kind=`gpt`，协议仅 openai，effort 六档 none→max，Responses API 主推） |
+| GPT-5.6 | `gpt56/`（cases/core/runner） | `scripts/run_gpt56.py`（test_kind=`gpt`，协议仅 openai，effort 六档 none→max，Responses API 主推；2026-09-28 补缺口后 57 条：三档/别名路由/多模态/后台/鉴权契约/流式语义/中转注入与协议改写指纹） |
 
 - `k3perf/deepseek_v4.py` 与 `scripts/run_deepseek_v4.py` 是 init 时代旧副本，**2026-09-24 已按用户指示删除**，不要再重建同类并行实现（旧副本缺 DS-V4-18 与整个 P2 段，且只接受 `--priority/--case`）。
 - 教训：同一个模型出现两套 runner 时，Web 容易长期指向过时那一套，症状是 `unrecognized arguments` 或用例数对不上。
