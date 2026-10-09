@@ -16,7 +16,7 @@
   <main>
     <section class="hero">
       <div><span class="eyebrow">STREAMING PERFORMANCE CONSOLE</span><h1>发起一次可靠的<br/><em>模型准入测试</em></h1><p>配置兼容接口，选择测试场景。任务将在后台排队执行；每种测试先发送一个小请求检查连通性，通过后再执行正式测试，原始数据、指标与报告自动归档。</p></div>
-      <div class="hero-stat"><span>覆盖场景</span><strong>24</strong><small>多轮压测 7 · KVV 验真 5 · DeepSeek 专项 4 · GLM 5.3 专项 4 · GPT 图片压测 2 · 满血校验 2</small></div>
+      <div class="hero-stat"><span>覆盖场景</span><strong>25</strong><small>多轮压测 7 · KVV 验真 5 · DeepSeek 专项 4 · GLM 5.3 专项 4 · GPT 图片压测 2 · Gemini 图片测试 1 · 满血校验 2</small></div>
     </section>
 
     <section class="launcher panel">
@@ -34,13 +34,24 @@
 
         <div class="section-heading compact"><div><span class="step">02</span><h2>选择测试</h2><button type="button" id="connectivityBtn" class="connectivity-btn"><i></i><span>测试连通性</span></button></div><div class="mode-toggle"><input id="quick" type="checkbox"/><label for="quick">快速验证模式</label></div></div>
         <div id="connectivityResult" class="connectivity-result" aria-live="polite"></div>
-        <div class="test-kind-tabs"><button type="button" class="kind-tab active" data-kind="load"><b>多轮压测</b><small>并发、延迟、吞吐和容量</small></button><button type="button" class="kind-tab" data-kind="kvv"><b>KVV 测试</b><small>模型 API 能力与契约验真</small></button><button type="button" class="kind-tab" data-kind="deepseek"><b>DeepSeek V4</b><small>Pro / Flash 专属能力验真</small></button><button type="button" class="kind-tab" data-kind="glm"><b>GLM 5.3</b><small>思考、结构化输出与 Agent 能力</small></button><button type="button" class="kind-tab" data-kind="gpt"><b>GPT-5.6</b><small>Responses API · 推理 · 工具与指纹验真</small></button><button type="button" class="kind-tab" data-kind="gpt-image"><b>GPT 图片压测</b><small>gpt-image-2 · gpt-image-2.5</small></button><button type="button" class="kind-tab" data-kind="awsb"><b>AWSB / Claude Opus 5</b><small>AWS Bedrock 上游能力验真</small></button><button type="button" class="kind-tab" data-kind="open-source"><b>开源测试集</b><small>ArXivMath · DeepSWE · SWE-Atlas TW · SWE-Atlas RF · Legal Agent Benchmark</small></button><button type="button" class="kind-tab" data-kind="temporary"><b>临时测试案例集</b><small>接口兼容 · 性能 · 缓存（68 条）</small></button><button type="button" class="kind-tab" data-kind="moderation"><b>内容审核测试</b><small>关键词边界与虚拟伴侣场景</small></button></div>
+        <div class="test-kind-tabs"><button type="button" class="kind-tab active" data-kind="load"><b>多轮压测</b><small>并发、延迟、吞吐和容量</small></button><button type="button" class="kind-tab" data-kind="kvv"><b>KVV 测试</b><small>模型 API 能力与契约验真</small></button><button type="button" class="kind-tab" data-kind="deepseek"><b>DeepSeek V4</b><small>Pro / Flash 专属能力验真</small></button><button type="button" class="kind-tab" data-kind="glm"><b>GLM 5.3</b><small>思考、结构化输出与 Agent 能力</small></button><button type="button" class="kind-tab" data-kind="gpt"><b>GPT-5.6</b><small>Responses API · 推理 · 工具与指纹验真</small></button><button type="button" class="kind-tab" data-kind="fable"><b>Claude 测试</b><small>Messages API · Fable 5 / Opus 5 / Sonnet 5 / Haiku 4.5 / Sonnet 4.6 · 计费探针</small></button><button type="button" class="kind-tab" data-kind="gpt-image"><b>GPT 图片压测</b><small>gpt-image-2 · gpt-image-2.5</small></button><button type="button" class="kind-tab" data-kind="gemini-image"><b>Gemini 图片测试</b><small>Nano Banana Pro · Flash Image</small></button><button type="button" class="kind-tab" data-kind="awsb"><b>AWSB / Claude Opus 5</b><small>AWS Bedrock 上游能力验真</small></button><button type="button" class="kind-tab" data-kind="open-source"><b>开源测试集</b><small>ArXivMath · DeepSWE · SWE-Atlas TW · SWE-Atlas RF · Legal Agent Benchmark</small></button><button type="button" class="kind-tab" data-kind="temporary"><b>临时测试案例集</b><small>接口兼容 · 性能 · 缓存（68 条）</small></button><button type="button" class="kind-tab" data-kind="moderation"><b>内容审核测试</b><small>关键词边界与虚拟伴侣场景</small></button></div>
         <div id="caseGrid" class="case-grid"><div class="loading">正在载入测试场景…</div></div>
+        <div class="image-config panel-inline" id="claudeVariantConfig" style="display:none">
+          <div><span>Claude 模型</span><small>切换模型后，下方用例列表会切换为该模型对应用例；MODEL 输入框会填入该模型的默认 ID，可手动覆盖为网关别名。</small></div>
+          <label>模型<select id="claudeVariantSelect" aria-label="Claude 模型选择"><option value="fable5">Fable 5 · claude-fable-5</option><option value="opus5">Opus 5 · claude-opus-5</option><option value="sonnet5">Sonnet 5 · claude-sonnet-5</option><option value="haiku45">Haiku 4.5 · claude-haiku-4-5</option><option value="sonnet46">Sonnet 4.6 · claude-sonnet-4-6</option></select></label>
+        </div>
         <div class="image-config panel-inline" id="imageConfig" style="display:none">
           <div><span>图片随机参数</span><small>下方多选项会在每个请求中随机抽取；未选项不会出现在本轮压测。</small></div>
           <label>QUALITY<select id="imageQuality" multiple aria-label="图片质量"></select></label>
           <label>MODEL<select id="imageModels" multiple aria-label="图片模型"></select></label>
           <label>SIZE<select id="imageSizes" multiple aria-label="图片尺寸"></select></label>
+        </div>
+        <div class="image-config panel-inline" id="geminiImageConfig" style="display:none">
+          <div><span>Gemini 图像随机参数</span><small>下方多选项会在每个请求中随机抽取；未选项不会出现在本轮测试。强度 = 分辨率档位（imageSize），尺寸 = 画面比例（aspectRatio），生成数量 = 单次候选张数（candidateCount）。</small></div>
+          <label>强度<select id="geminiQuality" multiple aria-label="Gemini 图像强度（分辨率）"></select></label>
+          <label>MODEL<select id="geminiModels" multiple aria-label="Gemini 图像模型"></select></label>
+          <label>尺寸<select id="geminiAspects" multiple aria-label="Gemini 画面比例"></select></label>
+          <label>生成数量<select id="geminiCounts" multiple aria-label="Gemini 每次生成张数"></select></label>
         </div>
         <div class="panel-inline" id="moderationConfig" style="display:none"><label>审核测试并发数<input id="moderationConcurrency" type="number" min="1" max="1000" step="1" value="4"></label><small>流式 / 非流式各占约一半；请求报错时自动指数退避，最多重试 5 次</small></div>
         <div class="custom-load panel-inline" id="customLoad">

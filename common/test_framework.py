@@ -156,11 +156,14 @@ class HttpExecutor:
         return rec
     async def execute_raw(self, *, case_id: str, method: str, url: str, headers: dict[str, str],
                           params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None,
-                          files: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> ExecutionRecord:
-        """非 JSON-POST 通道（GET / DELETE / multipart 上传）。
+                          files: dict[str, Any] | None = None, data: dict[str, Any] | None = None,
+                          raw_body: str | bytes | None = None) -> ExecutionRecord:
+        """非 JSON-POST 通道（GET / DELETE / multipart 上传 / 原始请求体）。
 
         与 execute 共享同一套 ExecutionRecord 与证据写入逻辑，便于统一审计：
         GET（模型列表、余额）与 multipart（文件上传）无法走 execute 的 json=payload 路径。
+        ``raw_body`` 逐字节发送原始请求体，用于构造**故意解析失败**的请求（如畸形 JSON），
+        这类用例无法用 ``json=`` 表达（json.dumps 永远产出合法 JSON）。
         """
         assert self.client is not None
         rid = headers.get("X-Request-ID") or headers.get("x-request-id") or f"{case_id}-{uuid.uuid4().hex[:12]}"
@@ -178,10 +181,18 @@ class HttpExecutor:
         rec = ExecutionRecord(case_id, rid, payload, {k:v for k,v in send_headers.items() if k.lower() != "authorization"}, time.strftime("%Y-%m-%dT%H:%M:%S%z"), started_epoch)
         rec.request["_method"] = method.upper()
         rec.request["_url"] = url
+        if raw_body is not None:
+            rec.request["_raw_body"] = raw_body if isinstance(raw_body, str) else raw_body.decode("utf-8", "replace")
         if params:
             rec.request["_params"] = dict(params)
         try:
-            response = await self.client.request(method, url, params=params, json=json_body, files=files, data=data, headers=send_headers)
+            send_kwargs: dict[str, Any] = {"params": params, "files": files, "headers": send_headers}
+            if raw_body is not None:
+                send_kwargs["content"] = raw_body
+            else:
+                send_kwargs["json"] = json_body
+                send_kwargs["data"] = data
+            response = await self.client.request(method, url, **send_kwargs)
             rec.http_status, rec.response_headers = response.status_code, dict(response.headers)
             rec.timing["content_type"] = response.headers.get("content-type")
             rec.response_text = response.text

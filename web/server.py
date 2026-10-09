@@ -11,7 +11,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import io
 import zipfile
 import httpx
 import threading
@@ -41,8 +40,10 @@ from kvv.cases import CASES as KVV_CASES
 from dsv4.cases import CASES as DEEPSEEK_CASES
 from glm53.cases import CASES as GLM_CASES
 from gpt56.cases import CASES as GPT56_CASES
+from fable5.cases import CASES as FABLE5_CASES, Fable5Case
 from authenticity import CASES as AUTH_CASES
 from gpt_image import CASES as GPT_IMAGE_CASES
+from gemini_image import CASES as GEMINI_IMAGE_CASES
 from awsb import CASE_SPECS as AWSB_CASE_SPECS, CACHE_CASE_SPECS as AWSB_CACHE_CASE_SPECS
 from arxivmath_cases import CASE as ARXIVMATH_CASE
 from deepswe_cases import CASE as DEEPSWE_CASE
@@ -50,12 +51,17 @@ from sweatlas_cases import CASE as SWE_ATLAS_TW_CASE
 from sweatlas_rf_cases import CASE as SWE_ATLAS_RF_CASE
 from legal_agent_benchmark_cases import CASE as LEGAL_AGENT_BENCHMARK_CASE
 
-from web.aggregation import aggregate_batch, enrich_summary
+from web.aggregation import aggregate_batch, enrich_summary, ensure_batch_metrics
 from common.finalizer import finalize_result_dir
 from common.temp_suite import TempCase, find_case, load_manifest, manifest_cases, merge_cases
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMP_CASES_PATH = ROOT / "test_cases" / "kimi_k3_temp_cases.json"
+# 中转计费临时探针：与 K3 临时清单同构（无 request.batch → 每条各自成一个可选项）。
+# 它现在是「Claude 测试」（test_kind=fable）模块下的一个**常驻**案例组，与各模型变体
+# （Fable 5 / Opus 5 / Sonnet 5 / Haiku 4.5 / Sonnet 4.6）的五套件并列、不随模型变体切换；
+# 执行器走 Anthropic Messages 面。
+BILLING_CASES_PATH = ROOT / "test_cases" / "relay_billing_cases.json"
 STATIC = ROOT / "web" / "static"
 DB_PATH = ROOT / "web" / "data" / "runs.db"
 RESULTS = ROOT / "results"
@@ -67,12 +73,22 @@ KVV_SCRIPT = ROOT / "scripts" / "run_kvv.py"
 DEEPSEEK_SCRIPT = ROOT / "scripts" / "run_dsv4.py"
 GLM_SCRIPT = ROOT / "scripts" / "run_glm53.py"
 GPT56_SCRIPT = ROOT / "scripts" / "run_gpt56.py"
+# Fable 5（Anthropic Mythos 级）专项：权威实现是 fable5 包，入口脚本只做参数转发。
+FABLE5_SCRIPT = ROOT / "scripts" / "run_fable5.py"
 CONTRACT_SCRIPT = ROOT / "scripts" / "run_contracts.py"
 AUTH_SCRIPT = ROOT / "scripts" / "run_authenticity.py"
 GPT_IMAGE_SCRIPT = ROOT / "scripts" / "run_gpt_image.py"
+GEMINI_IMAGE_SCRIPT = ROOT / "scripts" / "run_gemini_image.py"
 GPT_IMAGE_TOKEN_SCRIPT = ROOT / "scripts" / "run_gpt_image_4k_token.py"
 GPT_IMAGE_TOKEN_CASE = "GPT_IMAGE_4K_TOKEN_VERIFY"
 TEMP_SCRIPT = ROOT / "scripts" / "run_temp_cases.py"
+BILLING_PROBE_SCRIPT = ROOT / "scripts" / "run_relay_billing_probe.py"
+BILLING_PROBE_ALL = "BILLING-ALL"
+# Claude 测试模块下的计费探针案例 id（结果目录别名同为 RELAY-BILLING-PROBE）。
+BILLING_PROBE_CASE_ID = "RELAY_BILLING_PROBE"
+# 计费探针只在 Anthropic Messages 面取证；Claude 测试模块整体即 anthropic 面。
+BILLING_PROBE_PROTOCOLS = ("anthropic",)
+BILLING_PROBE_GROUPS = {"k3": "K3 供应商自测基线", "billing": "中转计费探针"}
 AWSB_SCRIPT = ROOT / "scripts" / "run_awsb.py"
 MODERATION_SCRIPT = ROOT / "scripts" / "run_moderation.py"
 CONTRACT_CASES = {
@@ -148,6 +164,40 @@ def temporary_merged_cases() -> list[TempCase]:
         raise ValueError(f"临时案例清单不可用: {exc}") from exc
 
 
+def billing_probe_cases() -> list[TempCase]:
+    """中转计费临时探针：与 K3 清单同构加载，每条探针各自成一个可选案例。"""
+    try:
+        return merge_cases(manifest_cases(load_manifest(BILLING_CASES_PATH)))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"中转计费探针清单不可用: {exc}") from exc
+
+
+def billing_probe_ids() -> tuple[str, ...]:
+    return tuple(case.id for case in billing_probe_cases())
+
+
+def billing_probe_selection(selected: str | None) -> tuple[str, ...] | None:
+    """把下拉选择翻译成实际要跑的探针清单；不是计费项时返回 None。
+
+    ``BILLING-ALL`` 表示整组探针（执行器按「空 = 全部」处理），单条则只跑该条。
+    """
+    value = str(selected or "").strip()
+    if not value:
+        return None
+    if value == BILLING_PROBE_ALL:
+        return billing_probe_ids()
+    return (value,) if value in billing_probe_ids() else None
+
+
+def is_billing_probe(selected: str | None) -> bool:
+    return billing_probe_selection(selected) is not None
+
+
+def temporary_all_cases() -> list[TempCase]:
+    """临时案例集全集：K3 合并案例（中转计费探针已迁至「Claude 测试」模块）。"""
+    return temporary_merged_cases()
+
+
 def temporary_case_payload() -> dict[str, Any]:
     """Return the temporary suite with same-kind cases merged into one logical case.
 
@@ -159,28 +209,78 @@ def temporary_case_payload() -> dict[str, Any]:
         merged = merge_cases(manifest_cases(data))
     except (OSError, json.JSONDecodeError):
         data, merged = {}, []
-    atomic_count = len(manifest_cases(data)) or 68
-    count = len(merged) or atomic_count
-    title = data.get("title", "Kimi-K3 临时测试案例集")
-    scope = data.get("scope", "接口兼容性、性能与缓存")
-    options = [case.payload() for case in merged]
-    return {"id": "K3_TEMP_SUITE", "test_kind": "temporary", "source": "供应商自测基线标准 0828.md + 临时案例集",
-            "executor": "test_cases/kimi_k3_temp_cases.md（展示清单）", "title": title,
-            "description": scope, "duration": "按合并案例执行", "cost": "中",
+    k3_atomic = len(manifest_cases(data)) or 68
+    k3_title = str(data.get("title") or "Kimi-K3 供应商临时自测案例集")
+    k3_group = BILLING_PROBE_GROUPS["k3"]
+    options = [{**case.payload(), "group": k3_group} for case in merged]
+    count = len(options)
+    return {"id": "K3_TEMP_SUITE", "test_kind": "temporary",
+            "source": "供应商自测基线标准 0828.md + 临时案例集",
+            "executor": "scripts/run_temp_cases.py",
+            "title": k3_title, "description": "接口兼容性、性能与缓存（同类项已合并）",
+            "duration": "按合并案例执行", "cost": "中",
             "protocols": ["openai", "volcengine"], "concurrency": 10,
             "concurrency_text": "按合并案例", "requests": count, "case_count": count,
-            "case_count_text": f"{count} 个合并案例（{atomic_count} 条原子请求）", "request_text": f"{atomic_count} 条原子请求",
+            "case_count_text": f"{count} 个可选案例（K3 同类项已合并）",
+            "request_text": f"{k3_atomic} 条原子请求",
             "input_tokens": "短请求 + 16K/64K/100K/200K + 70K 缓存前缀", "warmup": None,
-            "steady": None, "admission": "可选择其中一个合并案例执行；不选择时运行全部合并案例。",
-            "display_only": True, "atomic_case_count": atomic_count, "case_options": options}
+            "steady": None,
+            "admission": "K3 要求所选合并案例全部通过。",
+            "display_only": True, "atomic_case_count": k3_atomic, "case_options": options}
+
+
+def billing_probe_payload() -> dict[str, Any]:
+    """「Claude 测试」模块下的中转计费探针案例组（常驻，不随模型变体切换）。
+
+    与 K3 临时案例集同构：一个整组入口 + 每条探针各自一个可选项。选中后由
+    ``scripts/run_relay_billing_probe.py`` 执行，走 Anthropic Messages 面；
+    具体跑哪个模型由 MODEL 输入框决定，与计费探针的取证结论无关。
+    """
+    billing = billing_probe_cases()
+    atomic = len(billing) or 11
+    group = BILLING_PROBE_GROUPS["billing"]
+    options = [{
+        "id": BILLING_PROBE_ALL, "name": f"中转计费探针 · 全部 {atomic} 条", "category": "中转计费",
+        "priority": "P0", "batch": None, "repetitions": atomic, "request_count": atomic,
+        "merged": True, "case_ids": [case.id for case in billing], "group": group, "aggregate": True,
+    }]
+    options.extend({**case.payload(), "group": group} for case in billing)
+    count = len(options)
+    return {"id": BILLING_PROBE_CASE_ID, "test_kind": "fable", "title": "中转计费探针",
+            "description": "中转计费可信性：预扣是否退回、usage 是否真实、计费驱动因子、关思考能否省钱",
+            "source": "中转计费临时探针", "title_badge": "临时探针",
+            "executor": "scripts/run_relay_billing_probe.py",
+            "duration": "约 1–3 分钟", "cost": "中",
+            "protocols": list(BILLING_PROBE_PROTOCOLS),
+            "concurrency": 1, "concurrency_text": "1（串行）",
+            "requests": count, "request_text": f"{atomic} 条探针请求",
+            "case_count": count, "case_count_text": f"{count} 个可选案例（整组 + {atomic} 条）",
+            "input_tokens": "按上限阶梯（64 / 256 / 1024 / 8192）", "warmup": None, "steady": None,
+            "admission": "计费探针要求无 failed/blocked（无可用余额读数时计费类收口 blocked，缺取证能力不等于通道有问题）。",
+            # always_visible：Claude tab 下常驻，不受模型变体（Fable 5 / Opus 5 / Sonnet 5 / Haiku 4.5 / Sonnet 4.6）过滤影响。
+            "always_visible": True, "billing_probe": True,
+            "options_label": "执行范围（整组 / 单条）", "case_options": options}
 
 
 def temporary_case_title(case_id: str) -> str | None:
     """Return the merged temporary case name for a persisted single-case run."""
     if not case_id or case_id == "K3_TEMP_SUITE":
         return None
-    case = find_case(temporary_merged_cases(), case_id)
+    case = find_case(temporary_all_cases(), case_id)
     return case.name if case else None
+
+
+def billing_probe_title(case_id: str) -> str | None:
+    """「Claude 测试」模块下计费探针的展示名（含整组入口）。"""
+    if not case_id:
+        return None
+    if case_id == BILLING_PROBE_ALL:
+        return f"中转计费探针 · 全部 {len(billing_probe_cases())} 条"
+    if case_id == BILLING_PROBE_CASE_ID:
+        return "中转计费探针"
+    case = find_case(billing_probe_cases(), case_id)
+    return case.name if case else None
+
 
 def moderation_case_payload(name: str) -> dict[str, Any]:
     title, desc, duration, cost, dataset = MODERATION_CASES[name]
@@ -256,11 +356,11 @@ def awsb_case_payload(spec: Any) -> dict[str, Any]:
 def capability_case_payload(name: str, kind: str, case: Any, meta: tuple[str, str, str, str]) -> dict[str, Any]:
     source = "官方 KVV 工具" if kind == "kvv" else "专项自研代码"
     executor = ("scripts/run_kvv.py（官方 pytest）" if kind == "kvv" else "scripts/run_dsv4.py" if kind == "deepseek" else
-                "scripts/run_glm53.py" if kind == "glm" else "scripts/run_gpt56.py")
+                "scripts/run_glm53.py" if kind == "glm" else "scripts/run_fable5.py" if kind == "fable" else "scripts/run_gpt56.py")
     return {"id":name,"test_kind":kind,"title":meta[0],"description":meta[1],"source":source,"executor":executor,"title_badge":source,"duration":meta[2],"cost":meta[3],
             "concurrency":case.concurrency,"concurrency_text":str(case.concurrency),"requests":case.request_count,"request_text":str(case.request_count),
             "input_tokens":"按官方/专项用例动态输入","warmup":None,"steady":None,
-            "admission":(("官方 pytest 所选扩展套件退出码为0且无失败/错误；仅在供应商承诺动态工具与 Thinking Effort 时作为硬门槛。" if name=="KVV_K3_EXTENSIONS" else "官方 pytest 所选核心套件退出码为0，且失败数和错误数均为0；跳过项单独记录。") if kind=="kvv" else ("3组数据共6次探测均返回缓存usage；平均命中率目标80%，允许±10个百分点（最低70%），单组不得低于50%。" if name=="GLM_53_CACHE" else "所有 GLM 5.3 已评估用例无 failed/error；工具、深度思考和结构化输出按接口实际声明能力判定。" if kind=="glm" else "所有 GPT-5.6 已评估用例无 failed/error/blocked（warning 仅留痕）；判定口径详见 docs/GPT5.6专项测试用例设计.md。" if kind=="gpt" else "所有已评估用例无 failed/error；warning 与 blocked 仅记录，不否决准入。")),
+            "admission":(("官方 pytest 所选扩展套件退出码为0且无失败/错误；仅在供应商承诺动态工具与 Thinking Effort 时作为硬门槛。" if name=="KVV_K3_EXTENSIONS" else "官方 pytest 所选核心套件退出码为0，且失败数和错误数均为0；跳过项单独记录。") if kind=="kvv" else ("3组数据共6次探测均返回缓存usage；平均命中率目标80%，允许±10个百分点（最低70%），单组不得低于50%。" if name=="GLM_53_CACHE" else "所有 GLM 5.3 已评估用例无 failed/error；工具、深度思考和结构化输出按接口实际声明能力判定。" if kind=="glm" else "所有 GPT-5.6 已评估用例无 failed/error/blocked（warning 仅留痕）；判定口径详见 docs/GPT5.6专项测试用例设计.md。" if kind=="gpt" else "所有 Claude 已评估用例无 failed/error/blocked（warning 仅留痕）；判定口径详见 docs/Fable5专项测试用例设计.md。" if kind=="fable" else "所有已评估用例无 failed/error；warning 与 blocked 仅记录，不否决准入。")),
             "protocols":list(case.protocols)}
 
 def auth_case_payload(name: str) -> dict[str, Any]:
@@ -318,10 +418,106 @@ def gpt_image_case_payload(name: str) -> dict[str, Any]:
     }
 
 
+def _choice_list(value: Any, allowed: tuple[str, ...], label: str) -> list[str]:
+    """校验前端传来的多选字符串数组；None 表示沿用该用例的全量取值。"""
+    if value is None:
+        return list(allowed)
+    if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{label}必须是非空字符串数组")
+    values = list(dict.fromkeys(item.strip() for item in value if item.strip()))
+    invalid = [item for item in values if item not in allowed]
+    if not values or invalid:
+        raise ValueError(f"{label}包含不支持的值: {', '.join(invalid) or '空值'}")
+    return values
+
+
+def _int_choice_list(value: Any, allowed: tuple[int, ...], label: str) -> list[int]:
+    """同上，用于整数型多选（如 Gemini 的每次生成张数 candidateCount）。"""
+    if value is None:
+        return list(allowed)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label}必须是非空数组")
+    values: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(f"{label}必须全部是整数")
+        if item not in allowed:
+            raise ValueError(f"{label}包含不支持的值: {item}")
+        if item not in values:
+            values.append(item)
+    return values
+
+
+def gemini_image_case_payload(name: str) -> dict[str, Any]:
+    case = GEMINI_IMAGE_CASES[name]
+    return {
+        "id": name,
+        "test_kind": "gemini-image",
+        "source": "Google 官方 Gemini 图像生成接口",
+        "executor": "scripts/run_gemini_image.py",
+        "title": case.title,
+        "description": case.description,
+        "duration": "按请求数执行",
+        "cost": case.cost,
+        "concurrency": 10,
+        "concurrency_text": "手动输入",
+        "requests": 100,
+        "request_text": "手动输入总请求数",
+        "input_tokens": "图片提示词（内置安全提示词池）",
+        "warmup": None,
+        "steady": None,
+        "image_qualities": list(case.qualities),
+        "image_aspect_ratios": list(case.aspect_ratios),
+        "image_counts": list(case.counts),
+        "image_models": list(case.models),
+        "admission": (
+            "严格发送用户填写的总请求数；HTTP 成功且候选响应包含至少一张 inlineData 图片才计为成功。"
+            "强度（imageSize）、尺寸（aspectRatio）、每次生成张数（candidateCount）与模型从所选集合中逐请求随机抽取。"
+            "张数兑现率仅作观察指标，不参与准入判定。"
+        ),
+        "protocols": list(case.protocols),
+    }
+
+
 KVV_META = {name: (case.title, case.description, "按检查项执行", case.cost) for name, case in KVV_CASES.items()}
 DEEPSEEK_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in DEEPSEEK_CASES.items()}
 GLM_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in GLM_CASES.items()}
 GPT56_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in GPT56_CASES.items()}
+FABLE5_META = {name: (case.title, case.description, "按专项用例执行", case.cost) for name, case in FABLE5_CASES.items()}
+# Claude 测试：fable5 五个套件按模型变体复用（Fable 5 / Opus 5 / Sonnet 5 / Haiku 4.5 / Sonnet 4.6
+# 同走 Anthropic Messages 协议；runner 把模型当参数，模型不支持的子能力在运行时以 warning/blocked 留痕）。
+# 变体用例 ID（OPUS5_BASIC 等）只用于展示与归档归属，派发/查结果时映射回真实套件名 FABLE5_*。
+CLAUDE_VARIANTS = {
+    "fable5": ("Fable 5", "claude-fable-5"),
+    "opus5": ("Opus 5", "claude-opus-5"),
+    "sonnet5": ("Sonnet 5", "claude-sonnet-5"),
+    "haiku45": ("Haiku 4.5", "claude-haiku-4-5"),
+    "sonnet46": ("Sonnet 4.6", "claude-sonnet-4-6"),
+}
+CLAUDE_CASE_ALIASES = {
+    f"{variant_id.upper()}_{name.split('_', 1)[1]}": name
+    for variant_id in CLAUDE_VARIANTS if variant_id != "fable5"
+    for name in FABLE5_CASES
+}
+
+
+def claude_suite_name(case_id: str) -> str:
+    """变体用例 ID（OPUS5_* / SONNET5_*）→ fable5 真实套件名；FABLE5_* 原样返回。"""
+    return CLAUDE_CASE_ALIASES.get(case_id, case_id)
+
+
+CLAUDE_AVAILABLE_CASES: dict[str, Any] = {
+    **FABLE5_CASES,
+    **{alias: FABLE5_CASES[suite] for alias, suite in CLAUDE_CASE_ALIASES.items()},
+}
+# 计费探针在 Claude 模块下复用 Fable5Case 承载「可选案例」所需元字段（protocols 等）。
+BILLING_PROBE_SPEC = Fable5Case(
+    BILLING_PROBE_CASE_ID, "中转计费探针",
+    "中转计费可信性：预扣是否退回、usage 是否真实、计费驱动因子、关思考能否省钱",
+    "中", ("P0",), 11, 1, tuple(BILLING_PROBE_PROTOCOLS),
+)
+# 可提交运行的 Claude 模块用例集合（含常驻的中转计费探针）。
+CLAUDE_RUNNABLE_CASES: dict[str, Any] = {**CLAUDE_AVAILABLE_CASES, BILLING_PROBE_CASE_ID: BILLING_PROBE_SPEC}
 AUTH_META = {
     "DS_AUTH_FINGERPRINT": ("DeepSeek 满血能力指纹", "随机挑战、Thinking、工具、结构化输出、流式和静默吞参检查", "按随机挑战执行", "中"),
     "K3_AUTH_FINGERPRINT": ("Kimi K3 满血能力指纹", "随机挑战、工具、结构化输出、上下文、流式和参数行为检查", "按随机挑战执行", "中"),
@@ -428,6 +624,12 @@ def interrupted_request_summary(
     requested = int(job.get("requests") or len(rows))
     completed = len(rows)
     successful = sum(bool(row.get("success")) for row in rows)
+    image_rows = [
+        image
+        for row in rows
+        for image in (row.get("images") or [])
+        if isinstance(image, dict) and image.get("saved")
+    ]
     error_distribution = dict(
         Counter(
             str(row.get("error_type") or "unknown_error")
@@ -436,7 +638,7 @@ def interrupted_request_summary(
         )
     )
     return {
-        "schema_version": "mltest.gpt-image.v1",
+        "schema_version": "mltest.gemini-image.v1" if job["test_kind"] == "gemini-image" else "mltest.gpt-image.v1",
         "record_id": run_id,
         "batch_id": job.get("batch_id"),
         "test_kind": job["test_kind"],
@@ -454,6 +656,9 @@ def interrupted_request_summary(
         "successful": successful,
         "failed": completed - successful,
         "unfinished": max(0, requested - completed),
+        "images_dir": "images" if image_rows else None,
+        "images_saved": len(image_rows),
+        "image_bytes_saved": sum(int(image.get("bytes") or 0) for image in image_rows),
         "error_distribution": error_distribution,
         "admission_passed": False,
         "error": "用户主动停止测试",
@@ -461,18 +666,72 @@ def interrupted_request_summary(
     }
 
 
+def _portable_path(path: Path) -> str:
+    """落库的相对路径统一用正斜杠。
+
+    结果记录既可能由 macOS 生成、也可能由 Windows 生成：统一成正斜杠后，
+    读取端 `ROOT / relative` 在两个平台都能解析，结果库跨平台拷贝也不会失效。
+    """
+    try:
+        return path.relative_to(ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _child_popen_kwargs() -> dict[str, Any]:
+    """让子进程可被整组终止；Windows 下顺带隐藏控制台窗口。"""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """终止子进程及其后代进程。
+
+    POSIX 下子进程自成进程组，killpg 能连 pytest-xdist worker 一起收掉；
+    Windows 没有进程组语义（os.killpg 也不存在），必须用 taskkill /T，
+    否则 worker 会变成孤儿进程继续打上游。
+    """
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                       capture_output=True, text=True, timeout=20, errors="replace")
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
 def _execute_child(job: dict[str, Any]) -> None:
     run_id = job["id"]
     started_epoch = time.time()
     log_path = RESULTS / f"web-{run_id}.log"
-    update(run_id, status="running", started_at=now_iso(), log_path=str(log_path.relative_to(ROOT)))
+    update(run_id, status="running", started_at=now_iso(), log_path=_portable_path(log_path))
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    # 子进程的 stdout 直接写进上面以 UTF-8 打开的日志文件；Windows 默认会按本地代码页
+    # （cp936 / cp1252）编码，中文日志会变成乱码，故显式固定为 UTF-8。
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     resolved_base_url = api_root(job["protocol"], job["base_url"])
     env.update({"VOLC_RECORD_ID": run_id, "VOLC_BATCH_ID": job.get("batch_id") or "", "VOLC_API_KEY": job["api_key"],
                 "VOLC_BASE_URL": resolved_base_url, "VOLC_MODEL": job["model"], "VOLC_PROTOCOL": job["protocol"]})
     if job["test_kind"] == "temporary":
         env["VOLC_TEMP_CASE"] = job.get("temporary_case") or ""
+    # 中转计费探针（现挂在「Claude 测试」模块下）：选中计费项时换执行器与协议面。
+    # 探针脚本自行按 --protocol 拼 /v1 前缀，故这里给原始域名而不是 api_root 结果。
+    billing_probes = billing_probe_selection(job.get("billing_probe"))
+    if billing_probes:
+        env.update({
+            "BILLING_BASE_URL": job["base_url"],
+            "BILLING_API_KEY": job["api_key"],
+            "BILLING_MODEL": job["model"],
+            "BILLING_PROTOCOL": "anthropic" if job["protocol"] == "anthropic" else "openai",
+            # 空 = 全部探针；单条/子集时按 id 列出（执行器会自动补依赖前置）。
+            "BILLING_PROBES": "" if job.get("billing_probe") == BILLING_PROBE_ALL else ",".join(billing_probes),
+        })
     if job["test_kind"] == "deepseek":
         env.update({"DS_API_KEY": job["api_key"], "DS_BASE_URL": resolved_base_url, "DS_MODEL": job["model"]})
     if job["test_kind"] in {"glm", "glm_stream_retest"}:
@@ -484,6 +743,8 @@ def _execute_child(job: dict[str, Any]) -> None:
         env.update({"VOLC_API_KEY": job["api_key"], "VOLC_BASE_URL": resolved_base_url, "VOLC_MODEL": job["model"]})
     if job["test_kind"] == "gpt":
         env.update({"GPT_API_KEY": job["api_key"], "GPT_BASE_URL": resolved_base_url, "GPT_MODEL": job["model"], "GPT_PROTOCOL": job["protocol"]})
+    if job["test_kind"] == "fable":
+        env.update({"FABLE_API_KEY": job["api_key"], "FABLE_BASE_URL": resolved_base_url, "FABLE_MODEL": job["model"], "FABLE_PROTOCOL": job["protocol"]})
     if job["test_kind"] == "gpt-image":
         env.update({
             "GPT_IMAGE_API_KEY": job["api_key"],
@@ -493,21 +754,33 @@ def _execute_child(job: dict[str, Any]) -> None:
             "GPT_IMAGE_MODELS": ",".join(job.get("image_models") or []),
             "GPT_IMAGE_SIZES": ",".join(job.get("image_sizes") or []),
         })
+    if job["test_kind"] == "gemini-image":
+        env.update({
+            "GEMINI_IMAGE_API_KEY": job["api_key"],
+            "GEMINI_IMAGE_BASE_URL": resolved_base_url,
+            "GEMINI_IMAGE_QUALITIES": ",".join(job.get("gemini_quality") or []),
+            "GEMINI_IMAGE_MODELS": ",".join(job.get("gemini_models") or []),
+            "GEMINI_IMAGE_ASPECTS": ",".join(job.get("gemini_aspects") or []),
+            "GEMINI_IMAGE_COUNTS": ",".join(str(item) for item in (job.get("gemini_counts") or [])),
+        })
     if job["test_kind"] == "awsb":
         env.update({"AWSB_API_KEY": job["api_key"], "AWSB_BASE_URL": job["base_url"], "AWSB_MODEL": job["model"], "AWSB_MESSAGES_PATH": "/v1/messages"})
-    script = TEMP_SCRIPT if job["test_kind"] == "temporary" else GPT_IMAGE_TOKEN_SCRIPT if job["case"] == GPT_IMAGE_TOKEN_CASE else GPT_IMAGE_SCRIPT if job["test_kind"] == "gpt-image" else LEGAL_AGENT_BENCHMARK_SCRIPT if job["test_kind"] == "legal-agent-benchmark" else SWE_ATLAS_RF_SCRIPT if job["test_kind"] == "swe-atlas-rf" else SWE_ATLAS_TW_SCRIPT if job["test_kind"] == "swe-atlas-tw" else DEEPSWE_SCRIPT if job["test_kind"] == "deepswe" else ARXIVMATH_SCRIPT if job["test_kind"] == "arxivmath" else AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else GPT56_SCRIPT if job["test_kind"] == "gpt" else RUN_SCRIPT
+    script = BILLING_PROBE_SCRIPT if billing_probes else TEMP_SCRIPT if job["test_kind"] == "temporary" else GPT_IMAGE_TOKEN_SCRIPT if job["case"] == GPT_IMAGE_TOKEN_CASE else GPT_IMAGE_SCRIPT if job["test_kind"] == "gpt-image" else GEMINI_IMAGE_SCRIPT if job["test_kind"] == "gemini-image" else LEGAL_AGENT_BENCHMARK_SCRIPT if job["test_kind"] == "legal-agent-benchmark" else SWE_ATLAS_RF_SCRIPT if job["test_kind"] == "swe-atlas-rf" else SWE_ATLAS_TW_SCRIPT if job["test_kind"] == "swe-atlas-tw" else DEEPSWE_SCRIPT if job["test_kind"] == "deepswe" else ARXIVMATH_SCRIPT if job["test_kind"] == "arxivmath" else AWSB_SCRIPT if job["test_kind"] == "awsb" else MODERATION_SCRIPT if job["test_kind"] == "moderation" else AUTH_SCRIPT if job["case"] in {"DS_V4_FINGERPRINT"} else CONTRACT_SCRIPT if job["case"] in CONTRACT_CASES else KVV_SCRIPT if job["test_kind"] == "kvv" else DEEPSEEK_SCRIPT if job["test_kind"] == "deepseek" else GLM_SCRIPT if job["test_kind"] == "glm" else GLM_STREAM_RETEST_SCRIPT if job["test_kind"] == "glm_stream_retest" else FABLE5_SCRIPT if job["test_kind"] == "fable" else GPT56_SCRIPT if job["test_kind"] == "gpt" else RUN_SCRIPT
     # Most runners historically accept the case as a positional argument, but
     # the AWSB runner intentionally exposes it as a repeatable --case option.
     # Passing an AWSB case positionally makes argparse abort before any request
     # reaches the upstream endpoint (the original batch failure mode).
-    if job["test_kind"] == "temporary":
+    if job["test_kind"] == "temporary" or billing_probes:
+        # K3 临时案例集与计费探针都由环境变量驱动，不接受位置参数。
         command = [sys.executable, str(script)]
     elif job["test_kind"] in {"arxivmath", "deepswe", "swe-atlas-tw", "swe-atlas-rf", "legal-agent-benchmark"}:
         command = [sys.executable, str(script), "--case", job["case"]]
     elif job["test_kind"] == "awsb":
         command = [sys.executable, str(script), "--case", job["case"]]
     else:
-        command = [sys.executable, str(script), CONTRACT_CASES[job["case"]]["family"] if job["case"] in CONTRACT_CASES else job["case"]]
+        # Claude 变体用例（OPUS5_* 等）派发前映射回 fable5 真实套件名。
+        case_arg = claude_suite_name(job["case"]) if job["test_kind"] == "fable" else job["case"]
+        command = [sys.executable, str(script), CONTRACT_CASES[case_arg]["family"] if case_arg in CONTRACT_CASES else case_arg]
     command += ["--output-root", str(RESULTS)]
     if job["quick"] and job["test_kind"] == "load": command.append("--quick")
     if job["test_kind"] == "moderation":
@@ -518,16 +791,19 @@ def _execute_child(job: dict[str, Any]) -> None:
         if job.get("warmup_seconds") is not None: command.extend(["--warmup-seconds", str(job["warmup_seconds"])])
     if job["test_kind"] == "gpt-image" and job["case"] != GPT_IMAGE_TOKEN_CASE:
         command.extend(["--requests", str(job["requests"]), "--concurrency", str(job["concurrency"])])
+    if job["test_kind"] == "gemini-image":
+        command.extend(["--requests", str(job["requests"]), "--concurrency", str(job["concurrency"])])
     try:
         with log_path.open("w", encoding="utf-8", buffering=1) as stream:
             stream.write(f"[{now_iso()}] 启动 {job['case']} 测试；记录 ID={run_id}; 批次 ID={job.get('batch_id') or '-'}\n")
-            process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+            process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT,
+                                       **_child_popen_kwargs())
             with ACTIVE_LOCK:
                 ACTIVE_PROCESSES[run_id] = process
             returncode = process.wait()
             with ACTIVE_LOCK:
                 ACTIVE_PROCESSES.pop(run_id, None)
-        result_aliases = ("K3_TEMP_SUITE",) if job["test_kind"] == "temporary" else ()
+        result_aliases = ("K3_TEMP_SUITE",) if job["test_kind"] == "temporary" and not billing_probes else ("RELAY-BILLING-PROBE",) if billing_probes else ((claude_suite_name(job["case"]),) if job["test_kind"] == "fable" else ())
         result = latest_result(job["case"], started_epoch, aliases=result_aliases)
         summary_path = result / "summary.json" if result else None
         report_path = result / "report.md" if result else None
@@ -544,7 +820,7 @@ def _execute_child(job: dict[str, Any]) -> None:
             except OSError:
                 failure_detail = f"测试未生成 summary.json，退出码 {returncode}"
         if cancelled and not summary:
-            if job["test_kind"] == "gpt-image":
+            if job["test_kind"] in {"gpt-image", "gemini-image"}:
                 summary = interrupted_request_summary(job, run_id, result)
             else:
                 summary = {
@@ -566,9 +842,9 @@ def _execute_child(job: dict[str, Any]) -> None:
             summary_path = result_dir / "summary.json"; report_path = result_dir / "report.md"
             summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             request_detail = result_dir / "requests.jsonl" if (result_dir / "requests.jsonl").exists() else None
-            detail_line = f"- 请求级明细：`{request_detail.relative_to(ROOT)}`\n" if request_detail else f"- 请求明细未找到；执行日志：`{log_path.relative_to(ROOT)}`\n"
+            detail_line = f"- 请求级明细：`{_portable_path(request_detail)}`\n" if request_detail else f"- 请求明细未找到；执行日志：`{_portable_path(log_path)}`\n"
             count_lines = ""
-            if job["test_kind"] == "gpt-image":
+            if job["test_kind"] in {"gpt-image", "gemini-image"}:
                 count_lines = (
                     f"- 计划请求：{summary['requested']}\n"
                     f"- 已完成：{summary['completed']}\n"
@@ -577,6 +853,8 @@ def _execute_child(job: dict[str, Any]) -> None:
                     f"- 未完成：{summary['unfinished']}\n"
                     f"- 错误分布：`{json.dumps(summary['error_distribution'], ensure_ascii=False)}`\n"
                 )
+                if summary.get("images_saved"):
+                    count_lines += f"- 已保存图片：{summary['images_saved']} 张（`images/`）\n"
             report_path.write_text(
                 f"# 测试中断报告\n\n"
                 f"- 用例：`{job['case']}`\n"
@@ -590,9 +868,9 @@ def _execute_child(job: dict[str, Any]) -> None:
             )
             result = result_dir
         update(run_id, status=status, finished_at=now_iso(), exit_code=returncode,
-               result_dir=str(result.relative_to(ROOT)) if result else None,
-               report_path=str(report_path.relative_to(ROOT)) if report_path and report_path.exists() else None,
-               summary_path=str(summary_path.relative_to(ROOT)) if summary_path and summary_path.exists() else None,
+               result_dir=_portable_path(result) if result else None,
+               report_path=_portable_path(report_path) if report_path and report_path.exists() else None,
+               summary_path=_portable_path(summary_path) if summary_path and summary_path.exists() else None,
                passed=int(passed) if summary else None, error=None if summary else failure_detail)
     except Exception as exc:
         update(run_id, status="failed", finished_at=now_iso(), exit_code=-1, error=str(exc))
@@ -610,8 +888,8 @@ def _finalize_batch(job: dict[str, Any]) -> None:
     child_statuses = {child.get("status") for child in children}
     batch_status = "interrupted" if "interrupted" in child_statuses else ("failed" if "failed" in child_statuses else "completed")
     update(batch_id,status=batch_status,finished_at=now_iso(),exit_code=0 if aggregate["admission_passed"] else 2,
-           result_dir=str(out.relative_to(ROOT)),report_path=str((out/"report.md").relative_to(ROOT)),
-           summary_path=str((out/"summary.json").relative_to(ROOT)),manifest_path=str((out/"aggregation_manifest.json").relative_to(ROOT)),
+           result_dir=_portable_path(out),report_path=_portable_path(out/"report.md"),
+           summary_path=_portable_path(out/"summary.json"),manifest_path=_portable_path(out/"aggregation_manifest.json"),
            passed=int(aggregate["admission_passed"]))
 
 
@@ -650,7 +928,13 @@ def public_run(row: sqlite3.Row) -> dict[str, Any]:
     data["quick"] = bool(data["quick"])
     data["is_batch"] = bool(data.get("is_batch"))
     data["case_ids"] = json.loads(data["case_ids"]) if data.get("case_ids") else [data["case_name"]]
-    data["case_title"] = temporary_case_title(data["case_name"]) if data.get("test_kind") == "temporary" else None
+    if data.get("test_kind") == "temporary":
+        data["case_title"] = temporary_case_title(data["case_name"])
+    elif data.get("test_kind") == "fable":
+        # 只有计费探针有子项标题；普通 Claude 套件返回 None。
+        data["case_title"] = billing_probe_title(data["case_name"])
+    else:
+        data["case_title"] = None
     data["passed"] = None if data["passed"] is None else bool(data["passed"])
     data["report_url"] = f"/api/runs/{data['id']}/report" if data.get("report_path") else None
     data["summary_url"] = f"/api/runs/{data['id']}/summary" if data.get("summary_path") else None
@@ -710,6 +994,18 @@ class Handler(BaseHTTPRequestHandler):
             deepseek_cases = [auth_case_payload(name) if name == "DS_V4_FINGERPRINT" else capability_case_payload(name, "deepseek", DEEPSEEK_CASES[name], DEEPSEEK_META[name]) for name in DEEPSEEK_CASES]
             glm_cases = [capability_case_payload(name, "glm", GLM_CASES[name], GLM_META[name]) for name in GLM_CASES]
             gpt56_cases = [capability_case_payload(name, "gpt", GPT56_CASES[name], GPT56_META[name]) for name in GPT56_CASES]
+            fable5_cases = []
+            for variant_id, (variant_label, variant_model) in CLAUDE_VARIANTS.items():
+                for name, case in FABLE5_CASES.items():
+                    item = capability_case_payload(name, "fable", case, FABLE5_META[name])
+                    if variant_id != "fable5":
+                        item["id"] = f"{variant_id.upper()}_{name.split('_', 1)[1]}"
+                        item["title"] = case.title.replace("Fable 5", variant_label)
+                    item["claude_variant"] = variant_id
+                    item["default_model"] = variant_model
+                    fable5_cases.append(item)
+            # 计费探针常驻 Claude 模块（不随模型变体切换，故不带 claude_variant）。
+            fable5_cases.append(billing_probe_payload())
             contract_cases = [contract_case_payload(name) for name in CONTRACT_CASES]
             kvv_cases += [x for x in contract_cases if x["test_kind"] == "kvv"]
             deepseek_cases += [x for x in contract_cases if x["test_kind"] == "deepseek"]
@@ -717,13 +1013,14 @@ class Handler(BaseHTTPRequestHandler):
             awsb_cases = [awsb_case_payload(spec) for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)]
             moderation_cases = [moderation_case_payload(name) for name in MODERATION_CASES]
             gpt_image_cases = [gpt_image_case_payload(name) for name in GPT_IMAGE_CASES]
+            gemini_image_cases = [gemini_image_case_payload(name) for name in GEMINI_IMAGE_CASES]
             temporary_cases = [temporary_case_payload()]
             arxivmath_case = {"id": "ARXIVMATH", "test_kind": "arxivmath", "source": "MathArena 官方开源数据集", "executor": "scripts/run_arxivmath.py（Hugging Face）", "title": ARXIVMATH_CASE.title, "description": ARXIVMATH_CASE.description, "duration": "按题目数量执行", "cost": ARXIVMATH_CASE.cost, "protocols": list(ARXIVMATH_CASE.protocols), "concurrency": 1, "concurrency_text": "1（按题目串行）", "requests": None, "request_text": "数据集全量题目", "case_count": None, "case_count_text": "全量题目（运行时确定）", "input_tokens": "研究级数学问题", "warmup": None, "steady": None, "admission": "使用官方 answer 字段评分；题目和答案不在本项目中改写。"}
             deepswe_case = {"id": "DEEPSWE", "test_kind": "deepswe", "source": "DataCurve 官方开源数据集", "executor": "scripts/run_deepswe.py（Pier）", "title": DEEPSWE_CASE.title, "description": DEEPSWE_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": DEEPSWE_CASE.cost, "protocols": list(DEEPSWE_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Pier 管理隔离任务", "requests": None, "request_text": "官方任务集（默认全量）", "case_count": 113, "case_count_text": "113 个官方任务", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
             sweatlas_case = {"id": "SWE_ATLAS_TW", "test_kind": "swe-atlas-tw", "source": "Scale AI 官方开源数据集", "executor": "scripts/run_sweatlas_tw.py（Harbor）", "title": SWE_ATLAS_TW_CASE.title, "description": SWE_ATLAS_TW_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": SWE_ATLAS_TW_CASE.cost, "protocols": list(SWE_ATLAS_TW_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Harbor 管理隔离任务", "requests": None, "request_text": "官方 TW 任务集", "case_count": 66, "case_count_text": "66 个官方任务（默认）", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
             sweatlas_rf_case = {"id": "SWE_ATLAS_RF", "test_kind": "swe-atlas-rf", "source": "Scale AI 官方开源数据集", "executor": "scripts/run_sweatlas_rf.py（Harbor）", "title": SWE_ATLAS_RF_CASE.title, "description": SWE_ATLAS_RF_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": SWE_ATLAS_RF_CASE.cost, "protocols": list(SWE_ATLAS_RF_CASE.protocols), "concurrency": 1, "concurrency_text": "由 Harbor 管理隔离任务", "requests": None, "request_text": "官方 RF 任务集", "case_count": 66, "case_count_text": "66 个官方任务（默认）", "input_tokens": "代码仓库 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 verifier 通过；使用官方任务、环境和测试，不在本项目重写。"}
             legal_case = {"id": "LEGAL_AGENT_BENCHMARK", "test_kind": "legal-agent-benchmark", "source": "Harvey Labs v1.0 官方开源数据集", "executor": "scripts/run_legal_agent_benchmark.py（官方 harness + evaluator）", "title": LEGAL_AGENT_BENCHMARK_CASE.title, "description": LEGAL_AGENT_BENCHMARK_CASE.description, "duration": "单任务约数分钟至数十分钟", "cost": LEGAL_AGENT_BENCHMARK_CASE.cost, "protocols": list(LEGAL_AGENT_BENCHMARK_CASE.protocols), "concurrency": 1, "concurrency_text": "由官方 harness 管理 Agent 工具循环", "requests": None, "request_text": "官方 v1.0 Legal Agent 任务集", "case_count": 1, "case_count_text": "1 个任务（默认抽样）", "input_tokens": "法律材料 + Agent 轨迹", "warmup": None, "steady": None, "admission": "官方 evaluator 完成评分；使用官方任务、材料、rubric 和 harness，不在本项目重写。"}
-            return self.json_response(load_cases + kvv_cases + deepseek_cases + glm_cases + gpt56_cases + gpt_image_cases + awsb_cases + moderation_cases + temporary_cases + [arxivmath_case, deepswe_case, sweatlas_case, sweatlas_rf_case, legal_case])
+            return self.json_response(load_cases + kvv_cases + deepseek_cases + glm_cases + gpt56_cases + fable5_cases + gpt_image_cases + gemini_image_cases + awsb_cases + moderation_cases + temporary_cases + [arxivmath_case, deepswe_case, sweatlas_case, sweatlas_rf_case, legal_case])
         if path == "/api/runs":
             query = parse_qs(urlparse(self.path).query)
             try:
@@ -782,43 +1079,18 @@ class Handler(BaseHTTPRequestHandler):
                     rows_to_pack = [row]
                     if row["is_batch"]:
                         rows_to_pack += connection.execute("SELECT * FROM runs WHERE batch_id=? ORDER BY created_at", (run_id,)).fetchall()
-                archive = io.BytesIO()
-                seen_dirs: set[str] = set()
-                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-                    metadata = {
+                return self.send_result_archive(
+                    {
                         "run_id": run_id,
                         "is_batch": bool(row["is_batch"]),
                         "test_kind": row["test_kind"],
                         "model": row["model"],
                         "created_at": row["created_at"],
                         "included_records": [r["id"] for r in rows_to_pack],
-                    }
-                    bundle.writestr("package-metadata.json", json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
-                    for packed_row in rows_to_pack:
-                        result_dir = packed_row["result_dir"]
-                        if not result_dir:
-                            continue
-                        target_dir = (ROOT / result_dir).resolve()
-                        if RESULTS.resolve() not in target_dir.parents or not target_dir.is_dir():
-                            continue
-                        folder = target_dir.name
-                        if folder in seen_dirs:
-                            continue
-                        seen_dirs.add(folder)
-                        for source in target_dir.rglob("*"):
-                            if source.is_file():
-                                bundle.write(source, f"{folder}/{source.relative_to(target_dir)}")
-                archive.seek(0)
-                payload = archive.read()
-                filename = f"test-data-{run_id}.zip"
-                self.send_response(200)
-                self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-                self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Cache-Control", "no-store")
-                self.end_headers()
-                self.wfile.write(payload)
-                return
+                    },
+                    rows_to_pack,
+                    f"test-data-{run_id}.zip",
+                )
             if kind == "requests":
                 if not row["result_dir"]:
                     return self.json_response({"error": "文件尚未生成"}, 404)
@@ -835,6 +1107,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response({"error": "文件不存在"}, 404)
             if kind == "summary":
                 return self.text_response(target.read_text(encoding="utf-8", errors="replace"), "application/json; charset=utf-8")
+            if kind == "manifest":
+                # 批量聚合 manifest 附带每项 metrics；旧批次落盘时还没有该字段，读取时即时补齐，
+                # 保证前端聚合报告的指标列对历史记录同样有数据。
+                try:
+                    payload = json.loads(target.read_text(encoding="utf-8"))
+                except ValueError:
+                    return self.text_response(target.read_text(encoding="utf-8", errors="replace"), "text/plain; charset=utf-8")
+                if isinstance(payload, dict):
+                    ensure_batch_metrics(payload, ROOT)
+                    return self.json_response(payload)
             return self.text_response(target.read_text(encoding="utf-8", errors="replace"), "text/plain; charset=utf-8")
         if path in {"/", "/index.html"}:
             return self.serve_file(STATIC / "index.html")
@@ -897,23 +1179,15 @@ class Handler(BaseHTTPRequestHandler):
                         rows_to_pack += connection.execute(f"SELECT * FROM runs WHERE batch_id IN ({placeholders}) ORDER BY created_at", batch_ids).fetchall()
                 if len(selected) != len(ids):
                     raise ValueError("部分测试记录不存在")
-                archive = io.BytesIO(); seen_dirs: set[str] = set()
-                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
-                    bundle.writestr("package-metadata.json", json.dumps({"type":"selected-runs","selected_run_ids":ids,"included_records":[r["id"] for r in rows_to_pack]}, ensure_ascii=False, indent=2) + "\n")
-                    for packed_row in rows_to_pack:
-                        result_dir = packed_row["result_dir"]
-                        if not result_dir: continue
-                        target_dir = (ROOT / result_dir).resolve()
-                        if RESULTS.resolve() not in target_dir.parents or not target_dir.is_dir(): continue
-                        folder = target_dir.name
-                        if folder in seen_dirs: continue
-                        seen_dirs.add(folder)
-                        for source in target_dir.rglob("*"):
-                            if source.is_file(): bundle.write(source, f"{folder}/{source.relative_to(target_dir)}")
-                archive.seek(0); data = archive.read()
-                self.send_response(200); self.send_header("Content-Type", "application/zip")
-                self.send_header("Content-Disposition", 'attachment; filename="test-data-selected.zip"')
-                self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(data); return
+                return self.send_result_archive(
+                    {
+                        "type": "selected-runs",
+                        "selected_run_ids": ids,
+                        "included_records": [r["id"] for r in rows_to_pack],
+                    },
+                    rows_to_pack,
+                    "test-data-selected.zip",
+                )
             except (ValueError, json.JSONDecodeError) as exc:
                 return self.json_response({"error": str(exc)}, 400)
         if request_path.startswith("/api/runs/") and request_path.endswith("/cancel"):
@@ -929,8 +1203,8 @@ class Handler(BaseHTTPRequestHandler):
                 procs = [ACTIVE_PROCESSES.get(x) for x in ids]
             for proc in procs:
                 if proc and proc.poll() is None:
-                    try: os.killpg(proc.pid, signal.SIGTERM)
-                    except ProcessLookupError: pass
+                    try: _terminate_process_tree(proc)
+                    except (ProcessLookupError, OSError, subprocess.SubprocessError): pass
             with db() as connection:
                 connection.execute("UPDATE runs SET status='interrupted', finished_at=COALESCE(finished_at,?), error=COALESCE(error,'用户主动停止测试') WHERE id IN (%s) AND status IN ('queued','running')" % ",".join("?"*len(ids)), [now_iso(), *ids])
             return self.json_response({"id": run_id, "status": "interrupted", "message": "已发送停止信号；执行过的子任务将生成中断报告"})
@@ -993,12 +1267,17 @@ class Handler(BaseHTTPRequestHandler):
             test_kind = str(payload.get("test_kind", "load")).strip().lower()
             protocol = str(payload.get("protocol", "volcengine")).strip().lower()
             temporary_case = str(payload.get("temporary_case") or "").strip() or None
+            billing_probe = str(payload.get("billing_probe") or "").strip() or None
             quick = bool(payload.get("quick", False))
             custom_requests = payload.get("requests")
             custom_concurrency = payload.get("concurrency")
             image_quality = payload.get("image_quality")
             image_models = payload.get("image_models")
             image_sizes = payload.get("image_sizes")
+            gemini_quality = payload.get("gemini_quality")
+            gemini_models = payload.get("gemini_models")
+            gemini_aspects = payload.get("gemini_aspects")
+            gemini_counts = payload.get("gemini_counts")
             if custom_requests is not None and (not isinstance(custom_requests, int) or not 1 <= custom_requests <= 100000): raise ValueError("发送请求数必须是 1～100000 的整数")
             if custom_concurrency is not None and (not isinstance(custom_concurrency, int) or not 1 <= custom_concurrency <= 1000): raise ValueError("并发数必须是 1～1000 的整数")
             if test_kind == "moderation" and custom_concurrency is None: custom_concurrency = 4
@@ -1010,6 +1289,11 @@ class Handler(BaseHTTPRequestHandler):
                     image_quality, image_models, image_sizes = None, None, None
                 elif custom_requests is None or custom_concurrency is None:
                     raise ValueError("图片压测必须填写总请求数和并发数")
+            if test_kind == "gemini-image":
+                if len(case_names) != 1:
+                    raise ValueError("Gemini 图片测试一次只能选择一个子项目")
+                if custom_requests is None or custom_concurrency is None:
+                    raise ValueError("Gemini 图片测试必须填写总请求数和并发数")
             if test_kind == "load" and "RANDOM_LOAD" in case_names:
                 if len(case_names) != 1:
                     raise ValueError("随机输入压测一次只能单独运行")
@@ -1022,10 +1306,22 @@ class Handler(BaseHTTPRequestHandler):
             if not model:
                 raise ValueError("model 不能为空")
             if test_kind == "temporary" and temporary_case is not None:
-                # 选择项是合并案例 id（batch 名），原子案例 id 继续兼容。
-                if find_case(temporary_merged_cases(), temporary_case) is None:
+                # 选择项是合并案例 id（batch 名）；原子案例 id 继续兼容。
+                if find_case(temporary_all_cases(), temporary_case) is None:
                     raise ValueError("未知临时测试案例")
-            available = {"LEGAL_AGENT_BENCHMARK": LEGAL_AGENT_BENCHMARK_CASE} if test_kind == "legal-agent-benchmark" else {"SWE_ATLAS_RF": SWE_ATLAS_RF_CASE} if test_kind == "swe-atlas-rf" else {"SWE_ATLAS_TW": SWE_ATLAS_TW_CASE} if test_kind == "swe-atlas-tw" else {"DEEPSWE": DEEPSWE_CASE} if test_kind == "deepswe" else {"ARXIVMATH": ARXIVMATH_CASE} if test_kind == "arxivmath" else {"K3_TEMP_SUITE": temporary_case_payload()} if test_kind == "temporary" else CASES if test_kind == "load" else MODERATION_CASES if test_kind == "moderation" else KVV_CASES if test_kind == "kvv" else DEEPSEEK_CASES if test_kind == "deepseek" else GLM_CASES if test_kind == "glm" else GPT56_CASES if test_kind == "gpt" else GPT_IMAGE_CASES if test_kind == "gpt-image" else AUTH_CASES if test_kind == "authenticity" else {spec.case_id: spec for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)} if test_kind == "awsb" else {}
+            # 中转计费探针：只要本次提交包含计费探针，子选项须是 BILLING-ALL 或某条探针 id。
+            # 不能要求 case_names 恰好只有探针一条——探针在 Claude tab 下常与各套件**同批**
+            # 提交（批量场景），旧的等值判断会把整批的 billing_probe 置空，探针子任务于是
+            # 落到 run_fable5.py 报 "invalid choice"（历史批次因此整批不准入）。
+            # 未选中探针时一律置空，避免把上一条选择的残留带进普通 Claude 用例。
+            billing_probe_requested = test_kind == "fable" and BILLING_PROBE_CASE_ID in case_names
+            if billing_probe_requested:
+                billing_probe = billing_probe or BILLING_PROBE_ALL
+                if not is_billing_probe(billing_probe):
+                    raise ValueError("未知的中转计费探针选择")
+            else:
+                billing_probe = None
+            available = {"LEGAL_AGENT_BENCHMARK": LEGAL_AGENT_BENCHMARK_CASE} if test_kind == "legal-agent-benchmark" else {"SWE_ATLAS_RF": SWE_ATLAS_RF_CASE} if test_kind == "swe-atlas-rf" else {"SWE_ATLAS_TW": SWE_ATLAS_TW_CASE} if test_kind == "swe-atlas-tw" else {"DEEPSWE": DEEPSWE_CASE} if test_kind == "deepswe" else {"ARXIVMATH": ARXIVMATH_CASE} if test_kind == "arxivmath" else {"K3_TEMP_SUITE": temporary_case_payload()} if test_kind == "temporary" else CASES if test_kind == "load" else MODERATION_CASES if test_kind == "moderation" else KVV_CASES if test_kind == "kvv" else DEEPSEEK_CASES if test_kind == "deepseek" else GLM_CASES if test_kind == "glm" else GPT56_CASES if test_kind == "gpt" else CLAUDE_RUNNABLE_CASES if test_kind == "fable" else GPT_IMAGE_CASES if test_kind == "gpt-image" else GEMINI_IMAGE_CASES if test_kind == "gemini-image" else AUTH_CASES if test_kind == "authenticity" else {spec.case_id: spec for spec in (*AWSB_CASE_SPECS, *AWSB_CACHE_CASE_SPECS)} if test_kind == "awsb" else {}
             if test_kind in {"kvv", "deepseek", "glm"}:
                 available = dict(available)
                 available.update({name: item for name, item in CONTRACT_CASES.items() if item["test_kind"] == test_kind})
@@ -1035,24 +1331,24 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("临时测试案例集只能选择测试集入口")
             if test_kind == "gpt-image":
                 image_case = GPT_IMAGE_CASES[case_names[0]]
-                def image_choices(value: Any, allowed: tuple[str, ...], label: str) -> list[str]:
-                    if value is None:
-                        return list(allowed)
-                    if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
-                        raise ValueError(f"{label}必须是非空字符串数组")
-                    values = list(dict.fromkeys(item.strip() for item in value if item.strip()))
-                    invalid = [item for item in values if item not in allowed]
-                    if not values or invalid:
-                        raise ValueError(f"{label}包含不支持的值: {', '.join(invalid) or '空值'}")
-                    return values
-                image_quality = image_choices(image_quality, image_case.qualities, "quality")
-                image_models = image_choices(image_models, image_case.model_choices, "模型")
-                image_sizes = image_choices(image_sizes, image_case.sizes, "尺寸")
+                image_quality = _choice_list(image_quality, image_case.qualities, "quality")
+                image_models = _choice_list(image_models, image_case.model_choices, "模型")
+                image_sizes = _choice_list(image_sizes, image_case.sizes, "尺寸")
+            if test_kind == "gemini-image":
+                gemini_case = GEMINI_IMAGE_CASES[case_names[0]]
+                gemini_quality = _choice_list(gemini_quality, gemini_case.qualities, "强度(imageSize)")
+                gemini_models = _choice_list(gemini_models, gemini_case.models, "模型")
+                gemini_aspects = _choice_list(gemini_aspects, gemini_case.aspect_ratios, "尺寸(aspectRatio)")
+                gemini_counts = _int_choice_list(gemini_counts, gemini_case.counts, "生成数量")
             if protocol not in PROTOCOLS:
                 raise ValueError("未知模型协议")
             def protocols_for(name: str) -> tuple[str, ...]:
                 if test_kind == "temporary":
+                    # K3 案例走 Chat Completions 面。
                     return ("openai", "volcengine")
+                if test_kind == "fable" and name == BILLING_PROBE_CASE_ID:
+                    # 计费探针只在 Anthropic Messages 面取证。
+                    return BILLING_PROBE_PROTOCOLS
                 if test_kind == "legal-agent-benchmark":
                     return LEGAL_AGENT_BENCHMARK_CASE.protocols
                 if test_kind == "swe-atlas-rf":
@@ -1065,9 +1361,15 @@ class Handler(BaseHTTPRequestHandler):
                     return ARXIVMATH_CASE.protocols
                 if test_kind == "gpt-image":
                     return GPT_IMAGE_CASES[name].protocols
+                if test_kind == "gemini-image":
+                    return GEMINI_IMAGE_CASES[name].protocols
                 if name in CONTRACT_CASES:
                     return CONTRACT_CASES[name]["protocols"]
-                return KVV_CASES[name].protocols if test_kind == "kvv" else DEEPSEEK_CASES[name].protocols if test_kind == "deepseek" else GLM_CASES[name].protocols if test_kind == "glm" else GPT56_CASES[name].protocols if test_kind == "gpt" else ("openai", "volcengine") if test_kind == "authenticity" else ("openai", "volcengine") if test_kind == "moderation" else ("anthropic",) if test_kind == "awsb" else tuple(PROTOCOLS)
+                return KVV_CASES[name].protocols if test_kind == "kvv" else DEEPSEEK_CASES[name].protocols if test_kind == "deepseek" else GLM_CASES[name].protocols if test_kind == "glm" else FABLE5_CASES[claude_suite_name(name)].protocols if test_kind == "fable" else GPT56_CASES[name].protocols if test_kind == "gpt" else ("openai", "volcengine") if test_kind == "authenticity" else ("openai", "volcengine") if test_kind == "moderation" else ("anthropic",) if test_kind == "awsb" else tuple(PROTOCOLS)
+            if test_kind == "temporary" and protocol == "anthropic":
+                raise ValueError("K3 临时案例集只支持 openai / volcengine 协议")
+            if billing_probe_requested and protocol != "anthropic":
+                raise ValueError("中转计费探针只支持 Anthropic Messages 协议面")
             unsupported = [name for name in case_names if not supports_test_kind(protocol, test_kind, protocols_for(name))]
             if unsupported:
                 raise ValueError(f"{', '.join(unsupported)} 不支持 {protocol} 协议")
@@ -1101,20 +1403,31 @@ class Handler(BaseHTTPRequestHandler):
                                        (run_id,test_kind,case_names[0] if len(case_names) == 1 else "MULTI",protocol,base_url,model,"queued",int(quick),created,1,json.dumps(case_names)))
                     for index,execution in enumerate(execution_cases):
                         name = execution["name"]
+                        # 计费探针是同批里的**一条**子任务：只有它携带 billing_probe
+                        # （执行器/协议面/结果别名都据此切换），同批其它套件必须保持空值。
+                        child_billing_probe = billing_probe if name == BILLING_PROBE_CASE_ID else None
+                        # 探针子记录按所选子项归档（BILLING-ALL / BILLING-xx），与单条运行口径一致。
+                        stored_name = child_billing_probe or name
                         child_id=uuid.uuid4().hex[:16]; child_created=f"{created}.{index:03d}"
                         connection.execute("INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,batch_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                           (child_id,test_kind,name,protocol,base_url,model,"queued",int(quick),child_created,run_id))
-                        children.append({"id":child_id,"batch_id":run_id,"test_kind":test_kind,"case":name,"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"temporary_case":temporary_case})
+                                           (child_id,test_kind,stored_name,protocol,base_url,model,"queued",int(quick),child_created,run_id))
+                        children.append({"id":child_id,"batch_id":run_id,"test_kind":test_kind,"case":name,"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"gemini_quality":gemini_quality,"gemini_models":gemini_models,"gemini_aspects":gemini_aspects,"gemini_counts":gemini_counts,"temporary_case":temporary_case,"billing_probe":child_billing_probe})
                 start_worker()
                 JOB_QUEUE.put({"id":run_id,"is_batch":True,"test_kind":test_kind,"api_key":api_key,"children":children})
             else:
                 execution = execution_cases[0]
-                stored_case_name = temporary_case or case_name if test_kind == "temporary" and temporary_case else case_name
+                if test_kind == "temporary" and temporary_case:
+                    stored_case_name = temporary_case
+                elif test_kind == "fable" and billing_probe:
+                    # 计费探针按所选子项归档（BILLING-ALL / BILLING-xx），便于记录页显示。
+                    stored_case_name = billing_probe
+                else:
+                    stored_case_name = case_name
                 with db() as connection:
                     connection.execute("INSERT INTO runs(id,test_kind,case_name,protocol,base_url,model,status,quick,created_at,case_ids) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                        (run_id,test_kind,stored_case_name,protocol,base_url,model,"queued",int(quick),created,json.dumps(case_names)))
                 start_worker()
-                JOB_QUEUE.put({"id":run_id,"test_kind":test_kind,"case":execution["name"],"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"temporary_case":temporary_case})
+                JOB_QUEUE.put({"id":run_id,"test_kind":test_kind,"case":execution["name"],"protocol":protocol,"base_url":base_url,"api_key":api_key,"model":model,"quick":quick,"requests":execution["requests"],"concurrency":execution["concurrency"],"warmup_seconds":execution["warmup_seconds"],"image_quality":image_quality,"image_models":image_models,"image_sizes":image_sizes,"gemini_quality":gemini_quality,"gemini_models":gemini_models,"gemini_aspects":gemini_aspects,"gemini_counts":gemini_counts,"temporary_case":temporary_case,"billing_probe":billing_probe})
             with db() as connection:
                 row = connection.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
             return self.json_response(public_run(row), HTTPStatus.ACCEPTED)
@@ -1130,15 +1443,64 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_result_archive(
+        self, metadata: dict[str, Any], rows_to_pack: list[Any], filename: str
+    ) -> None:
+        """把结果目录打包成 zip 发给客户端。
 
-def main() -> None:
+        图片套件会把生成的图片原文件保存在结果目录的 images/ 下，整包体积可能达到
+        数 GB，因此先归档到结果目录里的临时文件，再分块写出，避免把整个包读进内存。
+        """
+        allowed_root = RESULTS.resolve()
+        archive_path = RESULTS / f".download-{uuid.uuid4().hex}.zip"
+        headers_sent = False
+        try:
+            with archive_path.open("w+b") as stream, zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+                bundle.writestr("package-metadata.json", json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+                seen_dirs: set[str] = set()
+                for packed_row in rows_to_pack:
+                    result_dir = packed_row["result_dir"]
+                    if not result_dir:
+                        continue
+                    target_dir = (ROOT / result_dir).resolve()
+                    if allowed_root not in target_dir.parents or not target_dir.is_dir():
+                        continue
+                    folder = target_dir.name
+                    if folder in seen_dirs:
+                        continue
+                    seen_dirs.add(folder)
+                    for source in sorted(target_dir.rglob("*")):
+                        if source.is_file():
+                            bundle.write(source, f"{folder}/{source.relative_to(target_dir).as_posix()}")
+            size = archive_path.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            headers_sent = True
+            with archive_path.open("rb") as payload:
+                shutil.copyfileobj(payload, self.wfile, length=1024 * 1024)
+        except OSError as exc:
+            # 断连（BrokenPipe）与磁盘错误都不能让服务端无声无息；响应头已发出时只能记日志。
+            print(f"打包下载失败: {exc}", file=sys.stderr)
+            if not headers_sent:
+                self.json_response({"error": f"打包失败: {exc}"}, 500)
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Volcengine K3 测试管理页面")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8085)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     initialize(); start_worker()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"测试管理页面：http://{args.host}:{args.port}")
+    # 0.0.0.0 / :: 不可路由，浏览器会把它交给系统代理并报 502，展示时统一换成回环地址。
+    display = "127.0.0.1" if args.host in {"", "0.0.0.0", "::"} else args.host
+    print(f"测试管理页面：http://{display}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

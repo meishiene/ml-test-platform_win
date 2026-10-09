@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import hashlib
 import io
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -119,6 +121,104 @@ def test_image_request_uses_generation_endpoint_and_does_not_store_base64():
     assert image_endpoint("https://ark.example", "volcengine") == "https://ark.example/api/v3/images/generations"
 
 
+def _png_bytes(size: tuple[int, int] = (8, 8)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, (30, 90, 160)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _image_plan(index: int = 1) -> dict:
+    return {
+        "case": "GPT_IMAGE_2",
+        "index": index,
+        "model": "gpt-image-2",
+        "quality": "high",
+        "size": "1024x1024",
+        "prompt": "test prompt",
+        "payload": {
+            "model": "gpt-image-2",
+            "prompt": "test prompt",
+            "size": "1024x1024",
+            "quality": "high",
+            "n": 1,
+        },
+    }
+
+
+def _run_image_request(handler, image_dir=None, plan=None, **kwargs):
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await _request_one(
+                client,
+                request_plan=plan or _image_plan(),
+                protocol="openai",
+                base_url="https://example.test/v1",
+                api_key="secret",
+                image_dir=image_dir,
+                **kwargs,
+            )
+
+    return asyncio.run(run())
+
+
+def test_b64_image_result_is_saved_and_evidence_keeps_paths_only(tmp_path):
+    raw = _png_bytes()
+    encoded = base64.b64encode(raw).decode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"created": 1, "data": [{"b64_json": encoded}]})
+
+    row = _run_image_request(handler, image_dir=tmp_path / "images")
+
+    assert row["success"] is True
+    assert row["image_save_error"] is None
+    entry = row["images"][0]
+    assert entry["file"] == "images/req-0001-01.png"
+    assert entry["saved"] is True
+    assert entry["source"] == "b64_json"
+    assert entry["format"] == "PNG" and (entry["width"], entry["height"]) == (8, 8)
+    assert entry["bytes"] == len(raw)
+    assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert (tmp_path / "images" / "req-0001-01.png").read_bytes() == raw
+    # base64 内容绝不进入证据文件。
+    assert encoded not in json.dumps(row)
+
+
+def test_url_image_result_is_downloaded_into_images_dir(tmp_path):
+    raw = _png_bytes((4, 6))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cdn.test":
+            return httpx.Response(200, content=raw, headers={"content-type": "image/png"})
+        return httpx.Response(200, json={"created": 1, "data": [{"url": "https://cdn.test/a.png"}]})
+
+    row = _run_image_request(handler, image_dir=tmp_path / "images")
+
+    entry = row["images"][0]
+    assert entry["saved"] is True and entry["source"] == "url"
+    assert entry["url"] == "https://cdn.test/a.png"
+    assert (entry["width"], entry["height"]) == (4, 6)
+    assert (tmp_path / "images" / "req-0001-01.png").read_bytes() == raw
+
+
+def test_image_write_failure_never_changes_the_request_verdict(tmp_path):
+    blocker = tmp_path / "images"
+    blocker.write_text("not a directory", encoding="utf-8")
+    raw = _png_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"created": 1, "data": [{"b64_json": base64.b64encode(raw).decode()}]},
+        )
+
+    row = _run_image_request(handler, image_dir=blocker)
+
+    assert row["success"] is True
+    assert row["images"] == []
+    assert "image_save_error" in row and row["image_save_error"]
+
+
 def test_request_plan_is_complete_and_reproducible_before_execution():
     case = CASES["GPT_IMAGE_25"]
     first = build_request_plan(
@@ -185,7 +285,10 @@ def test_absolute_timeout_does_not_block_following_requests_and_flushes_rows():
         for index in range(1, 4)
     ]
 
-    async def fake_request(client, *, request_plan, protocol, base_url, api_key):
+    async def fake_request(
+        client, *, request_plan, protocol, base_url, api_key,
+        image_dir=None, keep_images=True, budget=None,
+    ):
         if request_plan["index"] == 1:
             await asyncio.sleep(0.05)
         row = _failed_request_row(
@@ -297,6 +400,70 @@ def test_4k_token_verifier_sends_one_n10_request_and_saves_images(tmp_path):
     assert row["checks"]["all_dimensions_4k"]["passed"] is False
     assert row["checks"]["all_images_around_10m"]["passed"] is False
     assert row["case_passed"] is False
+
+
+def _patch_runner_transport(handler):
+    """把 runner 内部创建的 AsyncClient 换成 MockTransport。"""
+    real_client = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs.pop("verify", None)
+        kwargs.pop("trust_env", None)
+        return real_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    return patch("gpt_image.runner.httpx.AsyncClient", side_effect=factory)
+
+
+def test_end_to_end_keeps_images_and_writes_evidence():
+    from gpt_image.runner import main_async as gpt_main_async
+
+    encoded = base64.b64encode(_png_bytes((6, 6))).decode()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={"created": 1, "model": "gpt-image-2.5-flare", "data": [{"b64_json": encoded}]},
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        env = {
+            "GPT_IMAGE_API_KEY": "secret",
+            "GPT_IMAGE_BASE_URL": "https://example.test/v1",
+            "GPT_IMAGE_QUALITIES": "low",
+            "GPT_IMAGE_MODELS": "gpt-image-2.5-flare",
+            "GPT_IMAGE_SIZES": "1024x1024",
+        }
+        with patch.dict(os.environ, env, clear=False), _patch_runner_transport(handler):
+            code = asyncio.run(
+                gpt_main_async(
+                    [
+                        "GPT_IMAGE_25",
+                        "--output-root", str(root),
+                        "--requests", "3",
+                        "--concurrency", "2",
+                        "--seed", "11",
+                    ]
+                )
+            )
+        result = next(p for p in root.iterdir() if p.is_dir())
+        summary = json.loads((result / "summary.json").read_text(encoding="utf-8"))
+        report = (result / "report.md").read_text(encoding="utf-8")
+        requests_text = (result / "requests.jsonl").read_text(encoding="utf-8")
+        image_files = sorted((result / "images").glob("*.png"))
+
+    assert code == 0
+    assert seen == ["/v1/images/generations"] * 3
+    assert summary["successful"] == 3
+    assert summary["images_dir"] == "images"
+    assert summary["images_saved"] == 3
+    assert summary["images_skipped"] == 0
+    assert summary["image_save_errors"] == 0
+    assert len(image_files) == 3
+    assert encoded not in requests_text
+    assert "图片保留：3 张" in report
 
 
 def _probe_png_b64() -> str:

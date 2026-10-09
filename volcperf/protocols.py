@@ -38,13 +38,21 @@ PROTOCOLS = {
     "anthropic": Protocol(
         "anthropic", "Claude", "Messages", "https://api.anthropic.com", "/v1/messages",
         "文字、视觉输入、Thinking、工具调用与 SSE", "例如 claude-sonnet-4-5", "anthropic",
-        ("load", "awsb"),
+        # 中转计费探针现挂在 fable（Claude 测试）模块下，Anthropic 面不再需要 temporary。
+        ("load", "awsb", "fable"),
     ),
     "gemini": Protocol(
         "gemini", "Gemini", "streamGenerateContent", "https://generativelanguage.googleapis.com",
         "/v1beta/models/{model}:streamGenerateContent?alt=sse",
         "文字、视觉/文件输入及支持模型的图像输出", "例如 gemini-2.5-flash", "gemini",
         ("load",),
+    ),
+    "gemini_images": Protocol(
+        "gemini_images", "Gemini", "Images · generateContent", "https://generativelanguage.googleapis.com",
+        "/v1beta/models/{model}:generateContent",
+        "原生图像生成：imageConfig 控制分辨率与画面比例，candidateCount 控制每次张数",
+        "例如 gemini-3-pro-image", "gemini",
+        ("gemini-image",),
     ),
     "volcengine": Protocol(
         "volcengine", "火山云", "Chat Completions", "https://ark.cn-beijing.volces.com",

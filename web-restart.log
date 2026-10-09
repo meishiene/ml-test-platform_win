@@ -4,3 +4,8 @@ Traceback (most recent call last):
   File "/Users/yuhu/workspace/ml-test-platform/web/server.py", line 15, in <module>
     import httpx
 ModuleNotFoundError: No module named 'httpx'
+正在加载配置：.env
+端口 0.0.0.0:8085 被进程占用 (PID: 8274)，正在终止……
+测试平台启动中：http://127.0.0.1:8085  （本机访问请用 127.0.0.1 或 localhost，勿用 0.0.0.0）
+正在加载配置：.env
+测试平台启动中：http://127.0.0.1:8085  （本机访问请用 127.0.0.1 或 localhost，勿用 0.0.0.0）

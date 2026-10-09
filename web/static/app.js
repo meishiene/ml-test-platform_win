@@ -1,4 +1,5 @@
-const state = { protocols: [], protocol: 'openai', testKind: 'load', cases: [], selected: [], temporaryCase: '', runs: [], runsTotal: 0, runsPage: 1, runsPageSize: 20, filter: 'all', conclusion: 'all', runsSearch: '', models: [], downloadSelected: new Set() };
+const state = { protocols: [], protocol: 'openai', testKind: 'load', cases: [], selected: [], temporaryCase: '', billingProbe: '', claudeVariant: 'fable5', runs: [], runsTotal: 0, runsPage: 1, runsPageSize: 20, filter: 'all', conclusion: 'all', runsSearch: '', models: [], downloadSelected: new Set() };
+const CLAUDE_VARIANT_MODELS = { fable5: 'claude-fable-5', opus5: 'claude-opus-5', sonnet5: 'claude-sonnet-5', haiku45: 'claude-haiku-4-5', sonnet46: 'claude-sonnet-4-6' };
 const $ = (s) => document.querySelector(s);
 const escapeHtml = (s='') => String(s).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const FORM_STORAGE_KEY = 'ml-test-platform.form.v1';
@@ -19,6 +20,8 @@ function persistForm() {
       testKind: state.testKind,
       selected: state.selected,
       temporaryCase: state.temporaryCase,
+      billingProbe: state.billingProbe,
+      claudeVariant: state.claudeVariant,
       baseUrl: $('#baseUrl').value,
       apiKey: $('#apiKey').value,
       model: $('#model').value,
@@ -29,7 +32,11 @@ function persistForm() {
       moderationConcurrency: $('#moderationConcurrency').value,
       imageQuality: selectedValues('#imageQuality'),
       imageModels: selectedValues('#imageModels'),
-      imageSizes: selectedValues('#imageSizes')
+      imageSizes: selectedValues('#imageSizes'),
+      geminiQuality: selectedValues('#geminiQuality'),
+      geminiModels: selectedValues('#geminiModels'),
+      geminiAspects: selectedValues('#geminiAspects'),
+      geminiCounts: selectedValues('#geminiCounts')
     };
     localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(values));
   } catch (e) {
@@ -73,7 +80,13 @@ async function api(path, options={}) {
 }
 function toast(message) { const el=$('#toast'); el.textContent=message; el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),2600); }
 function caseLabel(id) { return state.cases.find(item=>item.id===id)?.title || id; }
-function kindLabel(kind){return kind==='open-source'?'开源测试集':kind==='kvv'?'KVV':kind==='deepseek'?'DeepSeek V4':kind==='glm'?'GLM 5.3':kind==='gpt-image'?'GPT 图片压测':kind==='glm_stream_retest'?'GLM 流式复测':kind==='awsb'?'AWSB / Opus 5':kind==='moderation'?'内容审核':kind==='authenticity'?'满血真实性校验':kind==='arxivmath'?'ArXivMath':kind==='deepswe'?'DeepSWE':kind==='swe-atlas-tw'?'SWE-Atlas TW':kind==='swe-atlas-rf'?'SWE-Atlas RF':kind==='legal-agent-benchmark'?'Legal Agent Benchmark':kind==='temporary'?'临时测试案例集':kind==='strict'?'多轮压测（严格）':'多轮压测'}
+function kindLabel(kind){return kind==='open-source'?'开源测试集':kind==='kvv'?'KVV':kind==='deepseek'?'DeepSeek V4':kind==='glm'?'GLM 5.3':kind==='gpt-image'?'GPT 图片压测':kind==='fable'?'Claude 测试':kind==='gemini-image'?'Gemini 图片测试':kind==='glm_stream_retest'?'GLM 流式复测':kind==='awsb'?'AWSB / Opus 5':kind==='moderation'?'内容审核':kind==='authenticity'?'满血真实性校验':kind==='arxivmath'?'ArXivMath':kind==='deepswe'?'DeepSWE':kind==='swe-atlas-tw'?'SWE-Atlas TW':kind==='swe-atlas-rf'?'SWE-Atlas RF':kind==='legal-agent-benchmark'?'Legal Agent Benchmark':kind==='temporary'?'临时测试案例集':kind==='strict'?'多轮压测（严格）':'多轮压测'}
+function kindMatches(item){
+  if(state.testKind==='open-source')return ['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(item.test_kind);
+  // always_visible：Claude 模块下常驻的案例（如中转计费探针），不随模型变体切换。
+  if(state.testKind==='fable')return item.test_kind==='fable'&&(item.always_visible||(item.claude_variant||'fable5')===state.claudeVariant);
+  return item.test_kind===state.testKind;
+}
 
 
 function renderProtocols() {
@@ -98,7 +111,7 @@ function selectProtocol(id) {
   const previous=state.protocols.find(x=>x.id===state.protocol); const item=state.protocols.find(x=>x.id===id); if(!item)return; state.protocol=id; renderProtocols();
   const base=$('#baseUrl'); if(!base.value || (previous && base.value===previous.default_base_url)) base.value=item.default_base_url;
   $('#protocolDescription').textContent=`${item.provider} · ${item.description}`; updateEndpointPreview();
-  setModelPlaceholder(item); renderCases(); state.selected=state.selected.filter(caseId=>{const selected=state.cases.find(x=>x.id===caseId);return selected&&protocolSupports(selected,id)}); if(!state.selected.length){const first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x,id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint'; persistForm();
+  setModelPlaceholder(item); renderCases(); state.selected=state.selected.filter(caseId=>{const selected=state.cases.find(x=>x.id===caseId);return selected&&protocolSupports(selected,id)}); if(!state.selected.length){const first=state.cases.find(x=>kindMatches(x)&&protocolSupports(x,id));if(first)state.selected=[first.id];} renderCases();updateSelectionUI(); state.models=[];hideModelSuggestions(); $('#modelHint').textContent='可直接输入；查询后支持按名称或 ID 模糊匹配'; $('#modelHint').className='field-hint'; persistForm();
 }
 
 function setModelPlaceholder(protocol){
@@ -106,7 +119,9 @@ function setModelPlaceholder(protocol){
   $('#model').placeholder=state.testKind==='deepseek'?'输入任意 DeepSeek 模型名或网关模型 ID':
     state.testKind==='glm'?'输入 GLM 5.3 模型名或网关模型 ID':
     state.testKind==='gpt'?'输入 GPT 模型名或网关模型 ID':
+    state.testKind==='fable'?`输入 ${CLAUDE_VARIANT_MODELS[state.claudeVariant]} 或网关模型别名`:
     state.testKind==='gpt-image'?'图片模型/接入点 ID（请求模型按下方选项随机）':
+    state.testKind==='gemini-image'?'Gemini 图像模型/接入点 ID（请求模型按下方选项随机）':
     state.testKind==='authenticity'?'输入 DeepSeek 或 Kimi K3 模型名/网关模型 ID':
     state.testKind==='moderation'?'输入审核模型或网关模型 ID':
     state.testKind==='open-source'?'输入用于运行开源测试集的模型或网关模型 ID':
@@ -120,16 +135,40 @@ function caseFacts(item){
   if(item.workload_profile)facts.push(['负载画像',item.workload_profile]);
   return facts;
 }
+function caseScopeSelection(){
+  // 子项选择的存放位置按模块区分：K3 临时案例集 vs Claude 模块下的计费探针。
+  return state.testKind==='temporary' ? state.temporaryCase : state.billingProbe;
+}
+function caseScopeOptions(item){
+  const options=item.case_options||[];
+  const current=caseScopeSelection();
+  const lead=item.test_kind==='temporary'?'<option value="">全部 K3 合并案例</option>':'';
+  const buckets=[];
+  options.forEach(option=>{
+    const label=option.group||'可选案例';
+    let bucket=buckets.find(x=>x.label===label);
+    if(!bucket){bucket={label,items:[]};buckets.push(bucket);}
+    bucket.items.push(option);
+  });
+  // 非临时案例集（计费探针）默认选中整组入口，避免「选了卡片却没选范围」的歧义。
+  const isSelected=option=>current?current===option.id:(item.test_kind!=='temporary'&&option.id===(options[0]||{}).id);
+  return lead+buckets.map(bucket=>`<optgroup label="${escapeHtml(bucket.label)}">${bucket.items.map(option=>`<option value="${escapeHtml(option.id)}" ${isSelected(option)?'selected':''}>${escapeHtml(option.id)} · ${escapeHtml(option.name)}${option.merged?`（${option.repetitions} 次）`:''}</option>`).join('')}</optgroup>`).join('');
+}
 function renderCases() {
-  const cases=state.cases.filter(item=>state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(item.test_kind):item.test_kind===state.testKind);
-  $('#caseGrid').innerHTML = cases.map(item => {const supported=protocolSupports(item);const tempOptions=item.test_kind==='temporary'?(item.case_options||[]).map(option=>`<option value="${escapeHtml(option.id)}" ${state.temporaryCase===option.id?'selected':''}>${escapeHtml(option.id)} · ${escapeHtml(option.name)}${option.merged?`（${option.repetitions} 次）`:''}</option>`).join(''):'';return `<div class="case-item"><button type="button" class="case-card ${state.selected.includes(item.id)?'selected':''} ${supported?'':'unsupported'}" data-case="${item.id}" ${supported?'':'disabled'}>
+  const cases=state.cases.filter(item=>kindMatches(item));
+  $('#caseGrid').innerHTML = cases.map(item => {const supported=protocolSupports(item);const scopeOptions=item.case_options?caseScopeOptions(item):'';return `<div class="case-item"><button type="button" class="case-card ${state.selected.includes(item.id)?'selected':''} ${supported?'':'unsupported'}" data-case="${item.id}" ${supported?'':'disabled'}>
     <div class="case-head"><b>${item.id}</b><span class="cost">${supported?'成本 '+escapeHtml(item.cost):'当前协议不支持'}</span></div><div class="case-source">${escapeHtml(item.source||'专项自研代码')} · ${escapeHtml(item.executor||'')}</div><h3>${escapeHtml(item.title)}</h3>
     <dl class="case-facts">${caseFacts(item).map(([label,value])=>`<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value||'—')}</dd></div>`).join('')}</dl>
     <div class="admission-standard"><strong>准入标准</strong><p>${escapeHtml(item.admission||'以报告中的全部检查项通过为准。')}</p></div>
   </button>
-  ${item.test_kind==='temporary'?`<label class="temporary-case-picker"><span>执行范围（同类项已合并）</span><select id="temporaryCaseSelect"><option value="">全部 ${item.case_count||''} 个合并案例</option>${tempOptions}</select></label>`:''}</div>`}).join('');
+  ${item.case_options?`<label class="temporary-case-picker"><span>${escapeHtml(item.options_label||'执行范围')}</span><select class="case-scope-select">${scopeOptions}</select></label>`:''}</div>`}).join('');
   document.querySelectorAll('.case-card:not(:disabled)').forEach(el => el.onclick = () => selectCase(el.dataset.case));
-  const picker=$('#temporaryCaseSelect'); if(picker) picker.onchange=event=>{state.temporaryCase=event.target.value;persistForm()};
+  const picker=$('.case-scope-select');
+  if(picker) picker.onchange=event=>{
+    if(state.testKind==='temporary')state.temporaryCase=event.target.value;
+    else state.billingProbe=event.target.value;
+    persistForm();
+  };
 }
 function selectedValues(selector){
   return [...document.querySelector(selector).selectedOptions].map(option=>option.value);
@@ -148,10 +187,47 @@ function renderImageConfig(){
   renderSelect('#imageSizes',item.image_sizes,previousSizes.filter(value=>(item.image_sizes||[]).includes(value)).length?previousSizes:item.image_sizes||[]);
   quality.title='按住 Command/Ctrl 可多选';models.title=quality.title;sizes.title=quality.title;
 }
+function renderGeminiImageConfig(){
+  const box=$('#geminiImageConfig'), item=state.cases.find(x=>state.selected.includes(x.id));
+  if(!box) return;
+  const visible=state.testKind==='gemini-image' && item;
+  box.style.display=visible?'flex':'none';
+  if(!visible) return;
+  const allowed=(values)=> (values||[]).map(value=>String(value));
+  const previous=selector=>selectedValues(selector);
+  const keep=(picked, pool)=> picked.filter(value=>pool.includes(value)).length ? picked.filter(value=>pool.includes(value)) : pool;
+  const renderSelect=(selector, pool, selected)=>{
+    const el=$(selector);
+    el.innerHTML=pool.map(value=>`<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join('');
+    [...el.options].forEach(option=>option.selected=selected.includes(option.value));
+    el.title='按住 Command/Ctrl 可多选';
+  };
+  const qualities=allowed(item.image_qualities), models=allowed(item.image_models), aspects=allowed(item.image_aspect_ratios), counts=allowed(item.image_counts);
+  renderSelect('#geminiQuality',qualities,keep(previous('#geminiQuality'),qualities));
+  renderSelect('#geminiModels',models,keep(previous('#geminiModels'),models));
+  renderSelect('#geminiAspects',aspects,keep(previous('#geminiAspects'),aspects));
+  renderSelect('#geminiCounts',counts,keep(previous('#geminiCounts'),counts));
+}
+function renderClaudeVariantConfig(){
+  const box=$('#claudeVariantConfig');
+  if(box) box.style.display=state.testKind==='fable'?'flex':'none';
+  const select=$('#claudeVariantSelect');
+  if(select) select.value=state.claudeVariant;
+}
+$('#claudeVariantSelect').onchange=event=>{
+  state.claudeVariant=event.target.value in CLAUDE_VARIANT_MODELS?event.target.value:'fable5';
+  state.selected=[];
+  const modelInput=$('#model'), current=modelInput.value.trim();
+  if(!current || Object.values(CLAUDE_VARIANT_MODELS).includes(current)) modelInput.value=CLAUDE_VARIANT_MODELS[state.claudeVariant];
+  setModelPlaceholder(); updateEndpointPreview();
+  const first=state.cases.find(x=>kindMatches(x)&&protocolSupports(x));
+  if(first)state.selected=[first.id];
+  renderCases(); updateSelectionUI(); persistForm();
+};
 function updateCustomDefaults(){
   const item=state.cases.find(x=>x.id===state.selected[0]); const box=$('#customLoad');
-  if(!box) return; const fixedLoad=Boolean(item?.fixed_parameters); const manualLoad=Boolean(item?.manual_parameters); const enabled=item && ((state.testKind==='load' && !fixedLoad) || (state.testKind==='gpt-image' && !fixedLoad)); box.style.display=enabled?'flex':'none'; const moderationBox=$('#moderationConfig'); if(moderationBox) moderationBox.style.display=state.testKind==='moderation'?'flex':'none';
-  const isImage=state.testKind==='gpt-image';
+  const isImage=state.testKind==='gpt-image'||state.testKind==='gemini-image';
+  if(!box) return; const fixedLoad=Boolean(item?.fixed_parameters); const manualLoad=Boolean(item?.manual_parameters); const enabled=item && ((state.testKind==='load' && !fixedLoad) || (isImage && !fixedLoad)); box.style.display=enabled?'flex':'none'; const moderationBox=$('#moderationConfig'); if(moderationBox) moderationBox.style.display=state.testKind==='moderation'?'flex':'none';
   const quickToggle=$('#quick').closest('.mode-toggle'); quickToggle.style.display=state.testKind==='load'&&!fixedLoad&&!manualLoad?'flex':'none'; if(fixedLoad||manualLoad)$('#quick').checked=false;
   $('#customEnabled').disabled=isImage||manualLoad;
   if(isImage||manualLoad){ $('#customEnabled').checked=true; $('#customEnabled').closest('.custom-toggle').querySelector('span').textContent=isImage?'图片压测参数':'随机压测参数'; box.querySelector('small').textContent=isImage?'图片压测严格使用下方手动输入的总请求数和并发数。':'随机输入压测严格使用下方手动输入的总请求数和并发数。'; }
@@ -159,6 +235,7 @@ function updateCustomDefaults(){
   if(enabled && !$('#customRequests').dataset.edited){ $('#customRequests').value=item.requests||1; $('#customConcurrency').value=item.concurrency||1; }
   if(enabled){ $('#customRequests').disabled=!$('#customEnabled').checked; $('#customConcurrency').disabled=!$('#customEnabled').checked; }
   renderImageConfig();
+  renderGeminiImageConfig();
 }
 function updateSelectionUI(){
   updateCustomDefaults();
@@ -173,7 +250,7 @@ function selectCase(id) {
   if(state.testKind==='open-source' || state.testKind==='gpt-image' || item?.fixed_parameters || item?.manual_parameters || hasFixedLoad || hasManualLoad) state.selected=[id];
   else state.selected=state.selected.includes(id)?state.selected.filter(x=>x!==id):[...state.selected,id];
   if(state.selected.length!==1){$('#customRequests').dataset.edited='';$('#customConcurrency').dataset.edited='';}
-  renderCases();updateSelectionUI(); if(state.testKind==='gpt-image') renderImageConfig();
+  renderCases();updateSelectionUI(); if(state.testKind==='gpt-image') renderImageConfig(); if(state.testKind==='gemini-image') renderGeminiImageConfig();
 }
 function formatDuration(run) {
   if (!run.started_at) return '—'; const end=run.finished_at ? new Date(run.finished_at) : new Date();
@@ -254,11 +331,87 @@ window.copyRecordId = async id => {
   catch(e) { toast(`记录 ID：${id}`); }
 };
 
+const CASE_STATUS_META = { passed:['passed','通过'], failed:['failed','失败'], error:['failed','错误'], warning:['warning','警告'], blocked:['blocked','阻塞'] };
+function caseBadge(status) {
+  const meta = CASE_STATUS_META[status] || ['unknown', status || '未知'];
+  return `<span class="case-badge ${meta[0]}">${escapeHtml(meta[1])}</span>`;
+}
+function fmtMetricSeconds(v) { return typeof v==='number' && isFinite(v) ? `${v.toFixed(3)}s` : '—'; }
+function fmtMetricRate(v) { return typeof v==='number' && isFinite(v) ? `${(v*100).toFixed(1)}%` : '—'; }
+function batchSuiteTable(manifest) {
+  const items = manifest && Array.isArray(manifest.results) ? manifest.results : [];
+  if (!items.length) return '';
+  const rows = items.map((item) => {
+    const m = item.metrics || {}, s = item.summary || {};
+    const cases = Array.isArray(s.results) ? s.results : [];
+    const caseTotal = m.case_total != null ? m.case_total : (cases.length || null);
+    const casePassed = m.case_passed != null ? m.case_passed : cases.filter(r=>r.status==='passed').length;
+    const extras = (m.case_warning || m.case_blocked) ? ` <small class="case-extras">⚠${m.case_warning||0} · ⏸${m.case_blocked||0}</small>` : '';
+    const caseText = caseTotal ? `${casePassed}/${caseTotal}${extras}` : '—';
+    const detailRows = cases.length ? cases.map(r => `<tr>
+        <td><code>${escapeHtml(r.case_id || '—')}</code></td>
+        <td>${escapeHtml(r.name || '')}</td>
+        <td>${caseBadge(r.status)}</td>
+        <td class="num">${typeof r.duration_seconds==='number' ? r.duration_seconds.toFixed(2) : '—'}</td>
+        <td class="case-detail-text">${escapeHtml(String(r.details || r.error || '—').slice(0, 240))}</td>
+      </tr>`).join('') : `<tr><td colspan="5" class="detail-empty">${escapeHtml(item.error || '无用例级结果（子记录可能未生成 summary）')}</td></tr>`;
+    return `<tr class="suite-row" aria-expanded="false" title="子记录 ${escapeHtml(item.record_id || '')}">
+      <td><span class="chev">▸</span> <b>${escapeHtml(item.case || '')}</b></td>
+      <td><span class="badge ${escapeHtml(item.status || '')}">${escapeHtml(statusLabel(item.status || ''))}</span></td>
+      <td>${item.passed===true?'<b class="pass">通过</b>':item.passed===false?'<b class="fail">未通过</b>':'<span class="pending">待判定</span>'}</td>
+      <td class="num">${typeof m.requests==='number' ? m.requests : '—'}</td>
+      <td class="num">${fmtMetricRate(m.success_rate)}</td>
+      <td class="num">${caseText}</td>
+      <td class="num">${fmtMetricSeconds(m.ttft_p90_seconds)}</td>
+      <td class="num">${fmtMetricSeconds(m.ttfc_p90_seconds)}</td>
+      <td class="num">${fmtMetricSeconds(m.e2e_p90_seconds)}</td>
+      <td class="num">${typeof m.tpot_p90_ms_per_token==='number' ? m.tpot_p90_ms_per_token.toFixed(1) : '—'}</td>
+    </tr>
+    <tr class="suite-detail" hidden><td colspan="10"><div class="case-detail"><p class="case-record">子记录 <code>${escapeHtml(item.record_id || '')}</code></p><table><thead><tr><th>用例</th><th>名称</th><th>状态</th><th>耗时(s)</th><th>结论说明</th></tr></thead><tbody>${detailRows}</tbody></table></div></td></tr>`;
+  }).join('');
+  return `<div class="batch-suites md-table-wrap"><table><thead><tr>
+    <th>轮次</th><th>状态</th><th>结论</th><th>请求</th><th>成功率</th><th>用例通过</th><th>TTFT P90</th><th>TTFC P90</th><th>E2E P90</th><th>TPOT(ms/tok)</th>
+  </tr></thead><tbody>${rows}</tbody></table>
+  <p class="batch-suites-hint">点击套件行展开 / 收起该集合下的用例通过情况。请求数与成功率来自执行证据（requests.jsonl）；TTFT / TTFC P90 仅统计流式请求样本，E2E P90 覆盖全部请求。</p></div>`;
+}
+function renderBatchReport(text, manifest) {
+  // 把报告按 "## " 标题分节；"各轮结果" 一节用可展开/收起的交互表格替代静态 markdown 表格。
+  const lines = String(text).replace(/\r/g,'').split('\n');
+  const sections = []; let current = { heading: null, lines: [] };
+  for (const line of lines) {
+    const h = line.match(/^##\s+(.+)$/);
+    if (h) { sections.push(current); current = { heading: h[1].trim(), lines: [] }; }
+    else current.lines.push(line);
+  }
+  sections.push(current);
+  return sections.map(sec => {
+    const body = sec.lines.join('\n');
+    if (sec.heading === '各轮结果' && manifest) {
+      const table = batchSuiteTable(manifest);
+      if (table) return table;
+    }
+    const content = renderMarkdown(body);
+    return sec.heading ? `<h2>${inlineMarkdown(sec.heading)}</h2>${content}` : content;
+  }).join('');
+}
+
 window.openArtifact = async (id, kind) => {
   try {
     const response=await fetch(`/api/runs/${id}/${kind}`); if(!response.ok) throw new Error('文件尚未生成');
-    const text=await response.text(); const run=state.runs.find(r=>r.id===id);
-    $('#dialogEyebrow').textContent=kind.toUpperCase(); $('#dialogTitle').textContent=`${run.is_batch?'批量聚合':run.case_name} · ${kind==='report'?'测试报告':kind==='summary'?'指标明细':kind==='requests'?'请求明细':'执行日志'}`;
+    const run=state.runs.find(r=>r.id===id);
+    const titleFor=k=>`${run.is_batch?'批量聚合':run.case_name} · ${k==='report'?'测试报告':k==='summary'?'指标明细':k==='requests'?'请求明细':'执行日志'}`;
+    if(kind==='report' && run.is_batch){
+      // 批量报告：manifest 提供每轮指标与用例级结论，前端渲染成可展开/收起的套件表格。
+      const text=await response.text();
+      let manifest=null;
+      try{ manifest=await api(`/api/runs/${id}/manifest`); }catch(e){ manifest=null; }
+      $('#dialogEyebrow').textContent='REPORT'; $('#dialogTitle').textContent=titleFor('report');
+      $('#reportBody').className='report-body markdown-body';
+      $('#reportBody').innerHTML=renderBatchReport(text, manifest && manifest.record_type==='batch' ? manifest : null);
+      $('#reportDialog').showModal(); return;
+    }
+    const text=await response.text();
+    $('#dialogEyebrow').textContent=kind.toUpperCase(); $('#dialogTitle').textContent=titleFor(kind);
     if(kind==='report'){$('#reportBody').className='report-body markdown-body';$('#reportBody').innerHTML=renderMarkdown(text)}else{$('#reportBody').className='report-body code-body';$('#reportBody').textContent=text} $('#reportDialog').showModal();
   } catch(e){toast(e.message)}
 };
@@ -270,11 +423,12 @@ $('#runForm').addEventListener('submit', async event => {
   const selectedItem=state.cases.find(x=>x.id===state.selected[0]);
   const effectiveTestKind=state.testKind==='open-source'?(selectedItem?.test_kind||''):state.testKind;
   const isImage=effectiveTestKind==='gpt-image';
+  const isGeminiImage=effectiveTestKind==='gemini-image';
   if(effectiveTestKind==='load' && !quick && state.selected.some(id=>['C1','SIMPLE_LOAD','FULL_LOAD'].includes(id)) && !confirm(`${state.selected.join('、')} 包含高成本测试，会产生较高 Token 成本，确认立即排队执行？`)) return;
-  if((isImage && !selectedItem?.fixed_parameters || selectedItem?.manual_parameters) && (!Number($('#customRequests').value) || !Number($('#customConcurrency').value))){message.textContent='请填写总请求数和并发数';return}
+  if(((isImage||isGeminiImage) && !selectedItem?.fixed_parameters || selectedItem?.manual_parameters) && (!Number($('#customRequests').value) || !Number($('#customConcurrency').value))){message.textContent='请填写总请求数和并发数';return}
   const button=$('#submitBtn'); button.disabled=true;
   try {
-    const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:effectiveTestKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,temporary_case:effectiveTestKind==='temporary'?state.temporaryCase:null,quick,requests:(effectiveTestKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:effectiveTestKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||isImage)&&$('#customEnabled').checked?Number($('#customConcurrency').value):null),image_quality:isImage?selectedValues('#imageQuality'):null,image_models:isImage?selectedValues('#imageModels'):null,image_sizes:isImage?selectedValues('#imageSizes'):null})});
+    const run=await api('/api/runs',{method:'POST',body:JSON.stringify({protocol:state.protocol,test_kind:effectiveTestKind,base_url:$('#baseUrl').value.trim(),api_key:$('#apiKey').value.trim(),model:$('#model').value.trim(),cases:state.selected,temporary_case:effectiveTestKind==='temporary'?state.temporaryCase:null,billing_probe:(effectiveTestKind==='fable'&&selectedItem?.billing_probe)?(state.billingProbe||'BILLING-ALL'):null,quick,requests:(effectiveTestKind==='load'||isImage||isGeminiImage)&&$('#customEnabled').checked?Number($('#customRequests').value):null,concurrency:effectiveTestKind==='moderation'?Number($('#moderationConcurrency').value):((state.testKind==='load'||isImage||isGeminiImage)&&$('#customEnabled').checked?Number($('#customConcurrency').value):null),image_quality:isImage?selectedValues('#imageQuality'):null,image_models:isImage?selectedValues('#imageModels'):null,image_sizes:isImage?selectedValues('#imageSizes'):null,gemini_quality:isGeminiImage?selectedValues('#geminiQuality'):null,gemini_models:isGeminiImage?selectedValues('#geminiModels'):null,gemini_aspects:isGeminiImage?selectedValues('#geminiAspects'):null,gemini_counts:isGeminiImage?selectedValues('#geminiCounts').map(Number):null})});
     state.runsPage=1; await refreshRuns(); toast(`${state.selected.join('、')} 已加入执行队列`);
     document.querySelector('.history').scrollIntoView({behavior:'smooth'});
   } catch(e){message.textContent=e.message} finally {button.disabled=false}
@@ -340,16 +494,25 @@ $('#resetCustom').onclick=()=>{delete $('#customRequests').dataset.edited; delet
 $('#refreshBtn').onclick=()=>refreshRuns(false);
 $('#closeDialog').onclick=()=>$('#reportDialog').close();
 $('#reportDialog').addEventListener('click',e=>{if(e.target===$('#reportDialog')) $('#reportDialog').close()});
+// 批量报告：点击套件行展开 / 收起该集合下的用例级结果（事件委托，表格由 renderBatchReport 注入）。
+$('#reportBody').addEventListener('click',event=>{
+  const row=event.target.closest('.suite-row'); if(!row) return;
+  const detail=row.nextElementSibling;
+  if(!detail || !detail.classList.contains('suite-detail')) return;
+  const open=detail.hidden;
+  detail.hidden=!open; row.classList.toggle('open',open); row.setAttribute('aria-expanded',String(open));
+});
 document.querySelectorAll('#runForm input, #runForm select').forEach(input=>input.addEventListener('change',persistForm));
 document.querySelectorAll('.kind-tab').forEach(button=>button.onclick=()=>{
-  document.querySelectorAll('.kind-tab').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.testKind=button.dataset.kind;state.selected=[];if(state.testKind!=='temporary')state.temporaryCase=''; delete $('#customRequests').dataset.edited; delete $('#customConcurrency').dataset.edited; $('#customEnabled').checked=false;
+  document.querySelectorAll('.kind-tab').forEach(x=>x.classList.remove('active'));button.classList.add('active');state.testKind=button.dataset.kind;state.selected=[];if(state.testKind!=='temporary')state.temporaryCase='';if(state.testKind!=='fable')state.billingProbe=''; delete $('#customRequests').dataset.edited; delete $('#customConcurrency').dataset.edited; $('#customEnabled').checked=false;
   $('#quick').closest('.mode-toggle').style.display=state.testKind==='load'?'flex':'none';
   setModelPlaceholder();
+  renderClaudeVariantConfig();
   renderCases();
-  let first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x));
-  if(!first){const matchingProtocol=state.protocols.find(protocol=>state.cases.some(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x,protocol.id)));if(matchingProtocol){selectProtocol(matchingProtocol.id);first=state.cases.find(x=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(x.test_kind):x.test_kind===state.testKind)&&protocolSupports(x));}}
+  let first=state.cases.find(x=>kindMatches(x)&&protocolSupports(x));
+  if(!first){const matchingProtocol=state.protocols.find(protocol=>state.cases.some(x=>kindMatches(x)&&protocolSupports(x,protocol.id)));if(matchingProtocol){selectProtocol(matchingProtocol.id);first=state.cases.find(x=>kindMatches(x)&&protocolSupports(x));}}
   if(first)state.selected=[first.id];renderCases();updateSelectionUI();updateEndpointPreview();
-  if(state.testKind==='gpt-image' && first && !$('#model').value) $('#model').value=first.image_models?.[0]||first.title;
+  if((state.testKind==='gpt-image'||state.testKind==='gemini-image') && first && !$('#model').value) $('#model').value=first.image_models?.[0]||first.title;
   persistForm();
 });
 document.querySelectorAll('.filter[data-filter]').forEach(button=>button.onclick=()=>{
@@ -370,7 +533,8 @@ $('#runsSearch').oninput=event=>{
 (async function init(){
   try {
     const saved=readPersistedForm();
-    state.testKind=['load','kvv','deepseek','glm','gpt','gpt-image','awsb','open-source','temporary','moderation'].includes(saved.testKind)?saved.testKind:'load';
+    state.testKind=['load','kvv','deepseek','glm','gpt','fable','gpt-image','gemini-image','awsb','open-source','temporary','moderation'].includes(saved.testKind)?saved.testKind:'load';
+    if(saved.claudeVariant in CLAUDE_VARIANT_MODELS)state.claudeVariant=saved.claudeVariant;
     document.querySelectorAll('.kind-tab').forEach(button=>button.classList.toggle('active',button.dataset.kind===state.testKind));
     $('#quick').closest('.mode-toggle').style.display=state.testKind==='load'?'flex':'none';
     state.protocols=await api('/api/protocols');
@@ -381,15 +545,16 @@ $('#runsSearch').oninput=event=>{
     if(saved.apiKey!=null)$('#apiKey').value=String(saved.apiKey);
     if(saved.model!=null)$('#model').value=String(saved.model);
     if(saved.temporaryCase!=null)state.temporaryCase=String(saved.temporaryCase);
+    if(saved.billingProbe!=null)state.billingProbe=String(saved.billingProbe);
     if(typeof saved.quick==='boolean')$('#quick').checked=saved.quick;
     if(typeof saved.customEnabled==='boolean')$('#customEnabled').checked=saved.customEnabled;
     if(saved.customRequests!=null){$('#customRequests').value=String(saved.customRequests);$('#customRequests').dataset.edited='1'}
     if(saved.customConcurrency!=null){$('#customConcurrency').value=String(saved.customConcurrency);$('#customConcurrency').dataset.edited='1'}
     if(saved.moderationConcurrency!=null)$('#moderationConcurrency').value=String(saved.moderationConcurrency);
     state.selected=Array.isArray(saved.selected)?saved.selected.filter(id=>state.cases.some(item=>item.id===id&&protocolSupports(item))):[];
-    if(!state.selected.length){const first=state.cases.find(item=>(state.testKind==='open-source'?['arxivmath','deepswe','swe-atlas-tw','swe-atlas-rf','legal-agent-benchmark'].includes(item.test_kind):item.test_kind===state.testKind)&&protocolSupports(item));if(first)state.selected=[first.id];}
-    renderCases(); updateSelectionUI();
-    [['#imageQuality',saved.imageQuality],['#imageModels',saved.imageModels],['#imageSizes',saved.imageSizes]].forEach(([selector,values])=>{
+    if(!state.selected.length){const first=state.cases.find(item=>kindMatches(item)&&protocolSupports(item));if(first)state.selected=[first.id];}
+    renderCases(); updateSelectionUI(); renderClaudeVariantConfig();
+    [['#imageQuality',saved.imageQuality],['#imageModels',saved.imageModels],['#imageSizes',saved.imageSizes],['#geminiQuality',saved.geminiQuality],['#geminiModels',saved.geminiModels],['#geminiAspects',saved.geminiAspects],['#geminiCounts',saved.geminiCounts]].forEach(([selector,values])=>{
       if(!Array.isArray(values))return;
       const element=$(selector); if(!element)return;
       [...element.options].forEach(option=>option.selected=values.includes(option.value));

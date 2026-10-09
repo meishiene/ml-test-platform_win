@@ -41,10 +41,12 @@
 
 ### 环境要求
 
-- Python 3.12+（开发环境使用 3.14）
+- Python 3.10+（推荐 3.12+，开发环境使用 3.14）
 - 能访问目标模型网关
 
 ### 启动 Web 平台
+
+macOS / Linux：
 
 ```bash
 bash start.sh
@@ -52,16 +54,36 @@ bash start.sh
 bash start.sh --host 127.0.0.1 --port 8085
 ```
 
-`start.sh` 会自动完成：创建 `.venv` → 按 `requirements.txt` 补齐依赖 → 加载 `.env` → 检测并释放被占用的端口 → 启动 Web 服务。
+Windows：双击 `start.bat` 即可（命令行也一样，参数可透传）。
+
+```bat
+start.bat
+start.bat --port 9000
+start.bat --host 0.0.0.0      :: 允许局域网访问，首次会弹防火墙授权
+start.bat --no-browser        :: 不自动打开浏览器
+```
+
+两个入口都会自动完成：创建 `.venv` → 按 `requirements.txt` 补齐依赖 → 加载 `.env` →
+检测并释放被占用的端口 → 启动 Web 服务；`start.bat` 还会在服务就绪后自动打开浏览器。
+启动逻辑（`.env` 解析、端口释放、开浏览器）只实现在 `scripts/start_web.py` 一处，两个平台的
+包装脚本共用，不会各自漂移。Windows 下若 `.venv` 是用别的 Python 或从 macOS/Linux 拷来的，
+脚本会识别并提示删除后重建；首次运行需要装依赖，国内网络慢可在 `start.bat` 顶部取消
+`PIP_INDEX_URL` 注释改用镜像源。
 
 启动后打开 `http://127.0.0.1:8085`，页面分四块：接口配置、选择测试项、测试记录、报告弹窗。
 
-> 默认监听 `0.0.0.0`。**平台当前没有入站鉴权**，请勿在不可信网络上直接暴露（见[已知问题](#已知问题)）。
+> 监听地址默认值两种平台不同：`start.sh` 为 `0.0.0.0`（保持原有行为），`start.bat` 为
+> `127.0.0.1`（避免 Windows 防火墙弹窗，也避免把无鉴权的页面暴露到局域网）。
+> **平台当前没有入站鉴权**，请勿在不可信网络上直接暴露（见[已知问题](#已知问题)）。
 
 ### 跑单元测试
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
+```
+
+```bat
+.venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
 ---
@@ -99,7 +121,11 @@ https_proxy=http://127.0.0.1:7897
 VOLC_TRUST_ENV=true
 ```
 
-大小写两种写法都要写：httpx 读取环境代理时**小写优先**，只写大写会被环境里残留的小写变量覆盖。改完需重启服务（`start.sh` 只在启动时加载 `.env`）。代理客户端的「TUN / 增强模式」是另一条路——它让直连也被透明代理，无需动 `.env`。
+大小写两种写法都要写：httpx 读取环境代理时**小写优先**，只写大写会被环境里残留的小写变量覆盖。改完需重启服务（启动脚本 `start.sh` / `start.bat` 只在启动时加载一次 `.env`）。代理客户端的「TUN / 增强模式」是另一条路——它让直连也被透明代理，无需动 `.env`。
+
+> **换机器时要核对代理端口**：`.env` 是按本机代理客户端配的（上面示例是 macOS 常见的 `7897`）。
+> 把项目连同 `.env` 一起拷到 Windows 后，代理端口往往不同（Clash for Windows 常见 `7890`），
+> 照抄会让所有请求报连接失败——此时先改 `.env`，或先把 `VOLC_TRUST_ENV` 改回 `false` 试直连。
 
 ---
 
@@ -141,7 +167,7 @@ L1–L4 另需 `TTFC P90 ≤ 同档 B1 基线的 3 倍`，因此**必须先有 B
 | `gpt-image` | `GPT_IMAGE_2` / `GPT_IMAGE_25` / `GPT_IMAGE_4K_TOKEN_VERIFY` | 图像并发压测 + 4K token 验真 |
 | `awsb` | `AWSB-O5-01`–`04` + `AWSB-O5-CACHE` | Anthropic Messages 协议网关自检（身份 / thinking / 边界 / 流式工具 / 缓存） |
 | `open-source` | `ARXIVMATH` / `DEEPSWE` / `SWE_ATLAS_TW` / `SWE_ATLAS_RF` / `LEGAL_AGENT_BENCHMARK` | 5 项开源基准，CLI runner 已实现；Web 侧脚本分发仍有未定义常量，见已知问题 |
-| `temporary` | `K3_TEMP_SUITE`（24 个合并案例 / 68 条原子请求） | 清单驱动用例；同 `category` 且同 `request.batch` 的重复请求合并为一个逻辑案例，执行时逐条发起、分别留证。唯一完整走通四层契约的套件 |
+| `temporary` | `K3_TEMP_SUITE`（24 个 K3 合并案例 / 68 条原子请求 + 11 条中转计费探针） | 清单驱动用例；同 `category` 且同 `request.batch` 的重复请求合并为一个逻辑案例，执行时逐条发起、分别留证。一个入口两个分组：K3 走 `scripts/run_temp_cases.py`（openai / volcengine），「中转计费探针」走 `scripts/run_relay_billing_probe.py`（anthropic / openai），详见 `docs/中转计费临时用例设计.md` |
 | `moderation` | `MOD_GENERAL_COMMON` / `MOD_PARTNER_COMMON` / `MOD_PARTNER_SMOKE` | SillyTavern 上下文劫持 + 关键词变体，含不变性分组 |
 | `authenticity` | `DS_AUTH_FINGERPRINT` / `DS_V4_FINGERPRINT` | 6 探针：动态 required 工具、随机 JSON Schema、多轮记忆、reasoning 字段、SSE 完整性、静默吞参对照 |
 
@@ -293,13 +319,16 @@ VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /
    `web/server.py` 的脚本分发表仍引用了 6 个未定义的常量：`ARXIVMATH_SCRIPT`、`DEEPSWE_SCRIPT`、`SWE_ATLAS_TW_SCRIPT`、`SWE_ATLAS_RF_SCRIPT`、`LEGAL_AGENT_BENCHMARK_SCRIPT`、`GLM_STREAM_RETEST_SCRIPT`。
    触发时会产生 `NameError`；CLI runner（`scripts/run_arxivmath.py` 等）本身已经实现，可直接从命令行运行。Web worker 现在会捕获任务异常并将任务标为 `failed`，提交新任务时也会自动拉起已退出的 worker，不再因为单个任务异常永久卡死队列。
 
-2. **平台无入站鉴权**，且 `start.sh` 默认监听 `0.0.0.0`。
+2. **平台无入站鉴权**，且 `start.sh` 默认监听 `0.0.0.0`（`start.bat` 默认 `127.0.0.1`）。
    同网段任何人都可以提交测试（消耗你的 API 额度）、读取全部报告与 `requests.jsonl`、打包下载。对外暴露前请改为 `127.0.0.1` 或加一层 Bearer 校验。
 
 3. **KVV 依赖独立的官方 Python 环境**。
-   `kvv/runner.py` 默认使用 `vendor_verifier/.venv/bin/python`，也可以通过
+   `kvv/runner.py` 默认使用 `vendor_verifier/.venv` 里的解释器（POSIX 为 `bin/python`，
+   Windows 为 `Scripts/python.exe`，两种布局都会自动探测），也可以通过
    `KVV_HOME` / `KVV_PYTHON` 显式指定官方套件目录和解释器。当前工作区已具备该环境，
    `tests/test_kvv.py` 可通过；在新环境部署时需先按官方套件要求创建该虚拟环境。
+   **虚拟环境不可跨平台拷贝**：Windows 上需重建 `vendor_verifier/.venv`（或直接用
+   `KVV_PYTHON` 指向一个装好官方套件依赖的解释器），否则该套件会报「未找到官方 KVV Python」。
 
 ### P1
 
@@ -313,6 +342,9 @@ VOLC_TEMP_CASE=16K-10 .venv/bin/python scripts/run_temp_cases.py --output-root /
 8. 指标口径跨引擎不一致：`k3perf` 把首个可见内容记为 `ttft`（对思考模型实为 TTFC）；两引擎 TPOT 基准不同（可见 token vs 含 reasoning），数字不可直接比较。
 9. 重试策略不一致：`volcperf` / `strictperf` / `gpt_image` / `dsv4` / `glm53` 均无重试，429 直接计为失败，而 L 档要求成功率 ≥99% —— 一次限流即整体不通过。仅 `k3perf` 有 2 倍尝试预算、`moderation` 有 3 次指数退避。
 10. `moderation_test_project/build_report.py` 用 `len(v)==3` 判定「结构完整」，而生成器每组产 5 条 → 该指标恒为 0。
+11. **Windows 一键启动未经真机验证**：`start.bat` 的平台分支（`taskkill /T`、`netstat -ano` 解析、
+    `creationflags`、`Scripts/python.exe` 布局）都有单元测试覆盖，但整套流程只在 macOS 上跑通过；
+    首次在 Windows 上运行时请留意控制台提示，并注意 `start.bat` 必须保持 CRLF 换行（`.gitattributes` 已固定）。
 11. `vendor_verifier/verify_params.py` 把任意异常（401 / 429 / 超时）都判为「正确拒绝」；`mmmu_pro_vision.py` 解析失败时随机猜选项。
 12. 死代码与重复：`vendor_verifier/utils.py` 整模块无调用；`common/` 下多个模块仅被测试引用；`k3perf/awsb.py` 与根 `awsb.py` 为双分叉；`scripts/run_.py` 文件名残缺；`SUITE_PATHS["k3_features_extensions"]` 无任何用例引用。
 13. 核心路径缺测试：`validate_case` 空断言、`suite.execute_manifest_case`、`runner.Runner`、`audit.redact`。

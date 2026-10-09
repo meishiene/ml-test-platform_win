@@ -16,6 +16,14 @@ import httpx
 
 from common.audit import redact
 from common.finalizer import finalize_result_dir
+from common.image_store import (
+    IMAGE_DIR_NAME,
+    ImageBudget,
+    env_flag,
+    format_budget,
+    persist_images,
+    summarize_images,
+)
 from common.report_style import stats_lines
 
 from .cases import LOAD_CASES, Case
@@ -34,6 +42,10 @@ PROMPTS = (
 )
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 300.0
+# 默认单批保留图片总量上限，避免高请求数 4K 批次撑爆结果目录；超出部分显式跳过并记录。
+DEFAULT_MAX_IMAGE_GIB = 20.0
+KEEP_IMAGES_ENV = "GPT_IMAGE_KEEP_IMAGES"
+MAX_IMAGE_GIB_ENV = "GPT_IMAGE_MAX_IMAGE_GIB"
 
 
 def image_endpoint(base_url: str, protocol: str = "openai") -> str:
@@ -136,6 +148,37 @@ def _response_summary(body: Any) -> dict[str, Any]:
     }
 
 
+def _image_sources(body: Any) -> list[dict[str, Any]]:
+    """列出响应中的图片来源：b64_json（base64）或 url（需下载）。"""
+    items = body.get("data") if isinstance(body, dict) else None
+    sources: list[dict[str, Any]] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        encoded = item.get("b64_json")
+        if isinstance(encoded, str) and encoded:
+            sources.append(
+                {
+                    "sequence": len(sources) + 1,
+                    "b64": encoded,
+                    "mime_type": item.get("mime_type"),
+                    "source": "b64_json",
+                }
+            )
+            continue
+        url = item.get("url")
+        if isinstance(url, str) and url:
+            sources.append(
+                {
+                    "sequence": len(sources) + 1,
+                    "url": url,
+                    "mime_type": item.get("mime_type"),
+                    "source": "url",
+                }
+            )
+    return sources
+
+
 def build_request_plan(
     *,
     case: Case,
@@ -180,6 +223,9 @@ async def _request_one(
     protocol: str,
     base_url: str,
     api_key: str,
+    image_dir: Path | None = None,
+    keep_images: bool = True,
+    budget: ImageBudget | None = None,
 ) -> dict[str, Any]:
     case_name = request_plan["case"]
     index = int(request_plan["index"]) - 1
@@ -222,6 +268,20 @@ async def _request_one(
 
     elapsed = time.perf_counter() - started_mono
     details = _response_summary(body)
+    # 先定格延迟：写盘是本地开销，不能计入被测服务耗时。
+    images: list[dict[str, Any]] = []
+    image_save_error: str | None = None
+    if keep_images and image_dir is not None and body is not None:
+        try:
+            images = await persist_images(
+                client,
+                image_dir,
+                request_key=f"req-{index + 1:04d}",
+                sources=_image_sources(body),
+                budget=budget,
+            )
+        except Exception as exc:  # 落盘失败只记录，不改变请求判定
+            image_save_error = f"{type(exc).__name__}: {exc}"
     return {
         "case": case_name,
         "index": index + 1,
@@ -248,7 +308,9 @@ async def _request_one(
         "created": details["created"],
         "usage": details["usage"],
         "transport_status": "completed" if response is not None else "error",
-        # Do not persist b64_json image payloads in the load-test artifact.
+        # 图片原文件落在 images/；请求行只保留路径与校验信息，base64 永不进入证据。
+        "images": images,
+        "image_save_error": image_save_error,
         "response_body_shape": {
             "keys": sorted(body.keys()) if isinstance(body, dict) else [],
             "image_count": details["image_count"],
@@ -294,6 +356,8 @@ def _failed_request_row(
         "created": None,
         "usage": None,
         "transport_status": "error",
+        "images": [],
+        "image_save_error": None,
         "response_body_shape": {
             "keys": [],
             "image_count": 0,
@@ -311,6 +375,9 @@ async def _run_requests(
     api_key: str,
     request_timeout_seconds: float,
     requests_path: Path,
+    image_dir: Path | None = None,
+    keep_images: bool = True,
+    budget: ImageBudget | None = None,
 ) -> list[dict[str, Any]]:
     queue: asyncio.Queue[int] = asyncio.Queue()
     for index in range(len(request_plan)):
@@ -358,6 +425,9 @@ async def _run_requests(
                                 protocol=protocol,
                                 base_url=base_url,
                                 api_key=api_key,
+                                image_dir=image_dir,
+                                keep_images=keep_images,
+                                budget=budget,
                             )
                     except TimeoutError as exc:
                         row = _failed_request_row(
@@ -419,6 +489,16 @@ def _write_report(out: Path, summary: dict[str, Any]) -> None:
             return f"{value:.3f}"
         return str(value)
 
+    if summary.get("images_dir"):
+        images_line = (
+            f"图片保留：{summary['images_saved']} 张 / "
+            f"{summary['image_bytes_saved'] / 1024 / 1024:.1f} MiB，保存在 `{summary['images_dir']}/`"
+            f"（上限 {format_budget(summary['max_image_bytes'])}）"
+        )
+        if summary.get("images_skipped"):
+            images_line += f"；已达上限跳过 {summary['images_skipped']} 张"
+    else:
+        images_line = "图片保留：本次未开启（--no-keep-images）"
     lines = [
         f"# {summary['case']} 图片压测报告",
         "",
@@ -441,7 +521,8 @@ def _write_report(out: Path, summary: dict[str, Any]) -> None:
         f"| P99 | {fmt(summary['latency_p99_seconds'])} |",
         f"| 平均 | {fmt(summary['latency_avg_seconds'])} |",
         "",
-        "> 请求明细只保存响应结构和元数据，不保存返回的 base64 图片内容，避免结果目录被图片数据放大。",
+        "> 请求明细只保存图片文件路径、字节数、像素尺寸与 SHA-256；base64 图片内容不进入 `requests.jsonl`。",
+        f"> {images_line}",
     ]
     (out / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -456,12 +537,36 @@ async def main_async(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", default="")
     parser.add_argument("--sizes", default="")
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--keep-images",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag(KEEP_IMAGES_ENV, True),
+        help=f"是否把生成的图片原文件保存到结果目录 images/（默认开启；可用 {KEEP_IMAGES_ENV}=0 关闭）",
+    )
+    parser.add_argument(
+        "--max-image-gib",
+        type=float,
+        default=None,
+        help=f"单批保留图片总量上限（GiB，默认 {DEFAULT_MAX_IMAGE_GIB:g}；可用 {MAX_IMAGE_GIB_ENV} 覆盖）",
+    )
     args = parser.parse_args(argv)
 
     if not 1 <= args.requests <= 100000:
         parser.error("--requests 必须在 1～100000 之间")
     if not 1 <= args.concurrency <= 1000:
         parser.error("--concurrency 必须在 1～1000 之间")
+
+    keep_images = bool(args.keep_images)
+    raw_max_gib = args.max_image_gib
+    if raw_max_gib is None:
+        raw_max_gib = os.getenv(MAX_IMAGE_GIB_ENV)
+    try:
+        max_image_gib = DEFAULT_MAX_IMAGE_GIB if raw_max_gib in (None, "") else float(raw_max_gib)
+    except ValueError:
+        parser.error(f"{MAX_IMAGE_GIB_ENV}/--max-image-gib 必须是数字")
+    if max_image_gib < 0:
+        parser.error(f"{MAX_IMAGE_GIB_ENV}/--max-image-gib 不能为负数")
+    max_image_bytes = int(max_image_gib * 1024**3)
 
     case = LOAD_CASES[args.case]
     qualities = _parse_positive_list(
@@ -527,6 +632,9 @@ async def main_async(argv: list[str] | None = None) -> int:
         "qualities": qualities,
         "sizes": sizes,
         "models": models,
+        "keep_images": keep_images,
+        "images_dir": IMAGE_DIR_NAME if keep_images else None,
+        "max_image_bytes": max_image_bytes if keep_images else None,
         "seed": resolved_seed,
         "prompt_count": len(PROMPTS),
         "spec_source": "OpenAI official image generation model definitions",
@@ -543,6 +651,8 @@ async def main_async(argv: list[str] | None = None) -> int:
         + "\n",
         encoding="utf-8",
     )
+    image_dir = (out / IMAGE_DIR_NAME) if keep_images else None
+    budget = ImageBudget(max_image_bytes) if keep_images else None
 
     rows = await _run_requests(
         request_plan=request_plan,
@@ -552,6 +662,9 @@ async def main_async(argv: list[str] | None = None) -> int:
         api_key=api_key,
         request_timeout_seconds=request_timeout_seconds,
         requests_path=out / "requests.jsonl",
+        image_dir=image_dir,
+        keep_images=keep_images,
+        budget=budget,
     )
 
     successful = [row for row in rows if row["success"]]
@@ -560,6 +673,8 @@ async def main_async(argv: list[str] | None = None) -> int:
     error_distribution = dict(
         Counter(row["error_type"] for row in rows if row["error_type"])
     )
+    image_totals = summarize_images(rows)
+    save_errors = sum(1 for row in rows if row.get("image_save_error"))
     summary = {
         "schema_version": "mltest.gpt-image.v1",
         "record_id": run_id,
@@ -586,6 +701,12 @@ async def main_async(argv: list[str] | None = None) -> int:
         "model_distribution": dict(Counter(row["model"] for row in rows)),
         "quality_distribution": dict(Counter(row["quality"] for row in rows)),
         "size_distribution": dict(Counter(row["size"] for row in rows)),
+        "images_dir": IMAGE_DIR_NAME if keep_images else None,
+        "images_saved": image_totals["images_saved"],
+        "image_bytes_saved": image_totals["image_bytes_saved"],
+        "images_skipped": image_totals["images_skipped"],
+        "image_save_errors": save_errors,
+        "max_image_bytes": max_image_bytes if keep_images else None,
         "error_distribution": error_distribution,
         "checks": {
             "exact_request_count": {
@@ -600,7 +721,10 @@ async def main_async(argv: list[str] | None = None) -> int:
             },
         },
         "admission_passed": len(rows) == args.requests and len(successful) == args.requests,
-        "scope_note": "图片生成压测按请求完成时间统计；每次 n=1，不下载或保存 base64 图片内容。",
+        "scope_note": (
+            "图片生成压测按请求完成时间统计；每次 n=1。返回图片的原文件保存在结果目录 images/，"
+            "请求明细只记录路径、字节数、尺寸与 SHA-256。"
+        ),
     }
     (out / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",

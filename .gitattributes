@@ -1,0 +1,5 @@
+# Windows 启动脚本必须保持 CRLF：cmd.exe 解析 LF-only 批处理时 goto/标签会失效。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Shell 脚本必须保持 LF：CRLF 会让解释器报 "bad interpreter"。
+*.sh text eol=lf

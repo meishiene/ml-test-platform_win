@@ -10,6 +10,115 @@ from common.result_adapter import normalize_summary
 SCHEMA_VERSION = "volcperf.result.v1"
 
 
+def _p90(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, int(len(ordered) * 0.9 + 0.999) - 1)]
+
+
+def suite_request_metrics(result_dir: str | Path | None) -> dict[str, Any] | None:
+    """从子记录的 requests.jsonl（执行证据）统计请求级指标。
+
+    能力专项/专项套件（fable、kvv、deepseek 等）的 summary 只有用例级结论，没有
+    压测字段；但每个请求都会落盘 `timing`（ttft_ms / ttfc_ms / e2e_ms），足以还原
+    正式请求数、HTTP 成功率与延迟 P90，不再在聚合报告里显示一排 "-"。
+    """
+    if not result_dir:
+        return None
+    path = Path(result_dir)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    evidence = path / "requests.jsonl"
+    if not evidence.is_file():
+        return None
+    total = http_ok = 0
+    ttft: list[float] = []
+    ttfc: list[float] = []
+    e2e: list[float] = []
+    for line in evidence.open(encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        total += 1
+        status = row.get("http_status")
+        if isinstance(status, int) and 200 <= status < 300 and not row.get("transport_error"):
+            http_ok += 1
+        timing = row.get("timing") or {}
+        for key, bucket in (("ttft_ms", ttft), ("ttfc_ms", ttfc), ("e2e_ms", e2e)):
+            value = timing.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                bucket.append(float(value))
+    if not total:
+        return None
+    return {
+        "requests": total,
+        "http_success": http_ok,
+        "success_rate": http_ok / total,
+        "ttft_p90_seconds": _p90(ttft) / 1000 if ttft else None,
+        "ttfc_p90_seconds": _p90(ttfc) / 1000 if ttfc else None,
+        "e2e_p90_seconds": _p90(e2e) / 1000 if e2e else None,
+        "ttft_samples": len(ttft),
+        "ttfc_samples": len(ttfc),
+        "source": "requests.jsonl",
+    }
+
+
+def _num(value: Any) -> float | None:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def build_item_metrics(summary: dict[str, Any], result_dir: str | Path | None) -> dict[str, Any]:
+    """汇总一个子记录的指标：优先取 summary 自带的压测字段，缺口用执行证据补齐。"""
+    summary = summary or {}
+    metrics: dict[str, Any] = {
+        "requests": _num(summary.get("sent")),
+        "success_rate": _num(summary.get("success_rate")),
+        "ttft_p90_seconds": _num(summary.get("ttft_p90_seconds")),
+        "ttfc_p90_seconds": _num(summary.get("ttfc_p90_seconds")),
+        "tpot_p90_ms_per_token": _num(summary.get("tpot_p90_ms_per_token")),
+        "e2e_p90_seconds": _num(summary.get("e2e_p90_seconds")),
+        "source": "summary",
+    }
+    computed = suite_request_metrics(result_dir)
+    if computed:
+        for key in ("requests", "success_rate", "ttft_p90_seconds", "ttfc_p90_seconds", "e2e_p90_seconds"):
+            if metrics[key] is None and computed.get(key) is not None:
+                metrics[key] = computed[key]
+        if metrics["source"] == "summary" and computed.get("e2e_p90_seconds") is not None:
+            metrics["source"] = "summary+requests.jsonl"
+        elif metrics["source"] != "summary+requests.jsonl":
+            metrics["source"] = computed["source"]
+    results = summary.get("results") or []
+    if results:
+        statuses = [str(r.get("status") or ("passed" if r.get("passed") is True else "failed")) for r in results if isinstance(r, dict)]
+        metrics["case_total"] = len(statuses)
+        metrics["case_passed"] = sum(1 for s in statuses if s == "passed")
+        metrics["case_warning"] = sum(1 for s in statuses if s == "warning")
+        metrics["case_blocked"] = sum(1 for s in statuses if s == "blocked")
+        metrics["case_failed"] = sum(1 for s in statuses if s in {"failed", "error"})
+    return metrics
+
+
+def ensure_batch_metrics(payload: dict[str, Any], root: Path | None = None) -> dict[str, Any]:
+    """给批量聚合 manifest 补齐每项 metrics（旧批次落盘时还没有该字段）。"""
+    if not isinstance(payload, dict) or payload.get("record_type") != "batch":
+        return payload
+    base = root or Path.cwd()
+    for item in payload.get("results") or []:
+        if not isinstance(item, dict) or item.get("metrics"):
+            continue
+        result_dir = item.get("result_dir")
+        if result_dir and not Path(result_dir).is_absolute():
+            result_dir = base / result_dir
+        item["metrics"] = build_item_metrics(item.get("summary") or {}, result_dir)
+    return payload
+
+
 def enrich_summary(summary_path: Path, *, record_id: str, batch_id: str | None, test_kind: str,
                    case_name: str, protocol: str, base_url: str, model: str) -> dict[str, Any]:
     summary = normalize_summary(json.loads(summary_path.read_text(encoding="utf-8")))
@@ -65,7 +174,8 @@ def aggregate_batch(out: Path, batch: dict[str, Any], children: list[dict[str, A
         items.append({"record_id":child["id"],"case":child["case_name"],"status":child["status"],
                       "passed":None if child.get("passed") is None else bool(child["passed"]),
                       "result_dir":portable(child.get("result_dir")),"report_path":portable(child.get("report_path")),
-                      "summary_path":portable(child.get("summary_path")),"summary":summary,"error":child.get("error")})
+                      "summary_path":portable(child.get("summary_path")),"summary":summary,"error":child.get("error"),
+                      "metrics":build_item_metrics(summary, child.get("result_dir"))})
     completed=[x for x in items if x["status"]=="completed"]
     passed=sum(x["passed"] is True for x in items)
     aggregate={"schema_version":SCHEMA_VERSION,"record_id":batch["id"],"record_type":"batch",
@@ -101,12 +211,24 @@ def aggregate_batch(out: Path, batch: dict[str, Any], children: list[dict[str, A
     else:
         lines=["# 批量测试聚合报告","",f"- 记录 ID：`{batch['id']}`",f"- 子记录 ID：{', '.join(f'`{x}' for x in aggregate['child_record_ids'])}",
            f"- 协议：{batch['protocol']}",f"- 模型：{batch['model']}",f"- 总结论：{'通过' if aggregate['admission_passed'] else '未通过'}",
-           f"- 通过：{passed}/{len(items)}","","## 各轮结果","","| 轮次 | 子记录 ID | 状态 | 结论 | 正式请求 | 成功率 | TTFT P90(s) | TTFC P90(s) | TPOT P90(ms/token) |",
-           "|---|---|---|---|---:|---:|---:|---:|---:|"]
+           f"- 通过：{passed}/{len(items)}","","## 各轮结果","",
+           "正式请求 / 成功率 / TTFT·TTFC·E2E P90 来自子记录执行证据（`requests.jsonl` 的请求级 `timing`）；"
+           "带压测字段的套件（多轮压测）直接取 summary；能力专项的 TTFT/TTFC 仅统计流式请求样本，样本数为 0 时显示 `-`。","",
+           "| 轮次 | 子记录 ID | 状态 | 结论 | 正式请求 | 成功率 | 用例通过 | TTFT P90(s) | TTFC P90(s) | E2E P90(s) | TPOT P90(ms/token) |",
+           "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+        def metric_text(item: dict[str, Any]) -> list[str]:
+            m=item.get("metrics") or {}
+            rate=m.get("success_rate")
+            rate_text=f"{rate:.2%}" if isinstance(rate,(int,float)) else "-"
+            cases=m.get("case_total")
+            case_text=f"{m.get('case_passed',0)}/{cases}" if isinstance(cases,int) and cases else "-"
+            def f3(v): return f"{v:.3f}" if isinstance(v,(int,float)) else "-"
+            return [str(m["requests"]) if isinstance(m.get("requests"),int) else "-", rate_text, case_text,
+                    f3(m.get("ttft_p90_seconds")), f3(m.get("ttfc_p90_seconds")), f3(m.get("e2e_p90_seconds")),
+                    f3(m.get("tpot_p90_ms_per_token"))]
         for item in items:
-            s=item["summary"]; rate=s.get('success_rate'); rate_text=f"{rate:.2%}" if isinstance(rate,(int,float)) else "-"
-            def f(v): return f"{v:.3f}" if isinstance(v,(int,float)) else "-"
-            lines.append(f"| {item['case']} | `{item['record_id']}` | {item['status']} | {'通过' if item['passed'] else '未通过'} | {s.get('sent','-')} | {rate_text} | {f(s.get('ttft_p90_seconds'))} | {f(s.get('ttfc_p90_seconds'))} | {f(s.get('tpot_p90_ms_per_token'))} |")
+            lines.append(f"| {item['case']} | `{item['record_id']}` | {item['status']} | {'通过' if item['passed'] else '未通过'} | "
+                         + " | ".join(metric_text(item)) + " |")
     lines += ["","## 聚合数据说明","",f"机器可读数据：`aggregation_manifest.json`（schema `{SCHEMA_VERSION}`）。"]
     (out/"report.md").write_text("\n".join(lines)+"\n",encoding="utf-8")
     if is_capability:

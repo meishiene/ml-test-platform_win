@@ -14,3 +14,4 @@ docs/
 rollback-checkpoints/
 
 .DS_Store
+.pytest-tmp/

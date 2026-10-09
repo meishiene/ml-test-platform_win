@@ -34,8 +34,13 @@ def official_python(home: Path) -> Path:
     override = os.getenv("KVV_PYTHON")
     if override:
         return Path(override).expanduser().resolve()
-    bundled = home / ".venv" / "bin" / "python"
-    return bundled
+    # 虚拟环境的解释器布局随平台不同：POSIX 在 bin/python，Windows 在 Scripts/python.exe。
+    # Windows 上从别处拷来的 .venv 本身也不可用（路径已写死），此时请用 KVV_PYTHON 显式指定。
+    for relative in (Path(".venv") / "bin" / "python", Path(".venv") / "Scripts" / "python.exe"):
+        candidate = home / relative
+        if candidate.is_file():
+            return candidate
+    return home / ".venv" / "bin" / "python"
 
 
 def think_mode() -> str:
@@ -47,9 +52,13 @@ def think_mode() -> str:
 
 def validate_runtime(home: Path, python: Path) -> None:
     if not (home / "tests" / "k3_features").is_dir() or not (home / "tests" / "params").is_dir():
-        raise ValueError(f"未找到官方 KVV 测试目录：{home}")
+        raise ValueError(f"未找到官方 KVV 测试目录：{home}（可用 KVV_HOME 指定官方套件目录）")
     if not python.is_file():
-        raise ValueError(f"未找到官方 KVV Python：{python}")
+        raise ValueError(
+            f"未找到官方 KVV Python：{python}。"
+            "该套件使用自带的 vendor_verifier/.venv，若未随项目分发（例如在 Windows 上），"
+            "请用 KVV_PYTHON 指向一个已安装官方套件依赖的解释器。"
+        )
 
 
 def build_command(home: Path, python: Path, suite: str, junit_path: Path, tool_report: Path) -> list[str]:
